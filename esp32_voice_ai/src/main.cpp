@@ -10,7 +10,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 
-const char* WS_HOST = "voice-companion-nloh.onrender.com";
+const char* WS_HOST = "https://espaimochibot.onrender.com";
 const int WS_PORT = 443;
 const char* WS_PATH = "/ws/audio";
 
@@ -122,8 +122,8 @@ void initServos() {
   ledcSetup(SERVO_PWM_CHANNEL_PAN, SERVO_PWM_FREQ, SERVO_PWM_RES);
   ledcSetup(SERVO_PWM_CHANNEL_TILT, SERVO_PWM_FREQ, SERVO_PWM_RES);
   
-  ledcAttachPin(SERVO_PAN_PIN, SERVO_PWM_CHANNEL_PAN);
-  ledcAttachPin(SERVO_TILT_PIN, SERVO_PWM_CHANNEL_TILT);
+  ledcAttach(SERVO_PAN_PIN, SERVO_PWM_FREQ, SERVO_PWM_RES);
+  ledcAttach(SERVO_TILT_PIN, SERVO_PWM_FREQ, SERVO_PWM_RES);
   
   servoWrite(SERVO_PAN_PIN, 90);
   servoWrite(SERVO_TILT_PIN, 45);
