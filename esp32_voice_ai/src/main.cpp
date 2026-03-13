@@ -8,14 +8,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 
-// Default to local development. Change to your laptop's IP (e.g., 192.168.137.1)
-// Or set via Web Portal when WiFiManager starts
-const char* DEFAULT_WS_HOST = "192.168.137.1";
-const int DEFAULT_WS_PORT   = 5000;
+const char* WS_HOST = "voice-companion-nloh.onrender.com";
+const int WS_PORT   = 443;
 const char* WS_PATH = "/ws/audio";
-
-char WS_HOST[64];
-int WS_PORT;
 
 #define LED_PIN        48
 #define MIC_BCK        16
@@ -395,12 +390,6 @@ void setup() {
 
   prefs.begin("alexatron", false);
   currentVolume = prefs.getFloat("volume", 0.32f);
-  
-  // Load server config from preferences, or use defaults for local development
-  prefs.getString("ws_host", WS_HOST, DEFAULT_WS_HOST, sizeof(WS_HOST));
-  WS_PORT = prefs.getInt("ws_port", DEFAULT_WS_PORT);
-  
-  Serial.printf("[CONFIG] WS_HOST: %s, WS_PORT: %d\n", WS_HOST, WS_PORT);
 
   record_buffer = (uint8_t*)ps_malloc(RECORD_BUFFER_SIZE);
 
@@ -449,12 +438,7 @@ void setup() {
   i2s_driver_install(I2S_NUM_0, &dac_cfg, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &dac_p);
 
-  // Use SSL only if port is 443, otherwise plain connection for local dev
-  if (WS_PORT == 443) {
-    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-  } else {
-    webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
-  }
+  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(3000);
   webSocket.enableHeartbeat(15000, 3000, 2);
