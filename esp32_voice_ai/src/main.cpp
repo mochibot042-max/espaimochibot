@@ -78,10 +78,10 @@ unsigned long blinkTimer = 0, eyeMoveTimer = 0, animUpdateTimer = 0;
 bool blink = false;
 
 // SERVO VARIABLES
-int current_pan  = 90;
-int current_tilt = 45;
+float current_pan  = 90;
+float current_tilt = 70;
 int target_pan   = 90;
-int target_tilt  = 45;
+int target_tilt  = 70;
 unsigned long lastServoUpdate = 0;
 unsigned long headMoveTimer = 0;
 
@@ -112,6 +112,13 @@ int angleToUs(int angle) {
 
 // Write angle to servo using hardware PWM (Core 3.x API)
 void servoWrite(int pin, int angle) {
+
+  // Limit tilt para hindi sumobra ang yuko
+  if (pin == SERVO_TILT_PIN) {
+    if (angle < 65) angle = 65;   // tingala limit
+    if (angle > 90) angle = 90;   // yuko limit
+  }
+
   int us = angleToUs(angle);
   uint32_t duty = usToDuty(us);
   ledcWrite(pin, duty);  // BAGONG API: pin-based, hindi channel-based
@@ -119,7 +126,6 @@ void servoWrite(int pin, int angle) {
 
 // Initialize servo PWM channels (Core 3.x API)
 void initServos() {
-  // BAGONG API: ledcAttach(pin, freq, resolution) - combined setup + attach
   if (!ledcAttach(SERVO_PAN_PIN, SERVO_PWM_FREQ, SERVO_PWM_RES)) {
     Serial.println("[SERVO] Failed to attach PAN servo!");
     return;
@@ -132,12 +138,18 @@ void initServos() {
   }
   delay(50);
 
-  // Set initial positions
-  servoWrite(SERVO_PAN_PIN, current_pan);
-  servoWrite(SERVO_TILT_PIN, current_tilt);
+  // Start current positions at center but DON'T snap - let smooth code ease to target
+  target_pan  = 90;
+  target_tilt = 70;
+  current_pan  = 90.0f;
+  current_tilt = 70.0f;
+
+  servoWrite(SERVO_PAN_PIN, 90);
+  servoWrite(SERVO_TILT_PIN, 70);
 
   servoInitialized = true;
   servosEnabled = true;
+  headMoveTimer = millis() + 5000; // Wait 5s before random idle starts
   Serial.println("[SERVO] Hardware PWM initialized (Core 3.x)!");
 }
 
@@ -276,6 +288,20 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         currentVolume = msg.substring(7).toFloat();
         prefs.putFloat("volume", currentVolume);
         Serial.printf("Volume set to: %.2f\n", currentVolume);
+      }
+      else if (msg.startsWith("SERVO:")) {
+        // Format: SERVO:pan,tilt  (-1 means no change for that axis)
+        String payload = msg.substring(6);
+        int commaIdx = payload.indexOf(',');
+        if (commaIdx > 0) {
+          int cmdPan  = payload.substring(0, commaIdx).toInt();
+          int cmdTilt = payload.substring(commaIdx + 1).toInt();
+          if (cmdPan >= 0)  target_pan  = constrain(cmdPan, 0, 180);
+          if (cmdTilt >= 0) target_tilt = constrain(cmdTilt, 0, 90);
+          // Pause idle random movement for 8 seconds after AI moves
+          headMoveTimer = millis() + 8000;
+          Serial.printf("[SERVO] AI command -> pan=%d tilt=%d\n", target_pan, target_tilt);
+        }
       }
       break;
     }
@@ -461,21 +487,21 @@ void loop() {
   if (servoInitialized && servosEnabled && millis() - lastServoUpdate > 20) {
     lastServoUpdate = millis();
 
+    // Random idle movement (only when not overridden by AI command)
     if (millis() > headMoveTimer) {
-      target_pan = random(30, 150);
-      target_tilt = random(30, 70);
-      headMoveTimer = millis() + random(2000, 4000);
+      target_pan  = random(65, 115);   // gentle idle range
+      target_tilt = random(65, 80);    // gentle tilt range
+      headMoveTimer = millis() + random(3000, 7000);
     }
 
-    // Smooth movement
-    if (current_pan < target_pan) current_pan++;
-    if (current_pan > target_pan) current_pan--;
-    if (current_tilt < target_tilt) current_tilt++;
-    if (current_tilt > target_tilt) current_tilt--;
+    // Smooth easing - float current position eases toward target
+    // ~8% per frame = feels natural, not too slow/fast
+    const float SERVO_EASE = 0.08f;
+    current_pan  += (target_pan  - current_pan)  * SERVO_EASE;
+    current_tilt += (target_tilt - current_tilt) * SERVO_EASE;
 
-    // Write to hardware PWM (pin-based)
-    servoWrite(SERVO_PAN_PIN, current_pan);
-    servoWrite(SERVO_TILT_PIN, current_tilt);
+    servoWrite(SERVO_PAN_PIN,  (int)round(current_pan));
+    servoWrite(SERVO_TILT_PIN, (int)round(current_tilt));
   }
 
   if (!isWSConnected) return;
