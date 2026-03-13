@@ -24,6 +24,15 @@ const char* WS_PATH = "/ws/audio";
 #define OLED_SDA 20
 #define OLED_SCL 21
 
+#define SERVO_TILT_PIN 13
+#define SERVO_PAN_PIN 14
+#define SERVO_PWM_FREQ 50
+#define SERVO_PWM_RES 14
+#define SERVO_PWM_CHANNEL_PAN 0
+#define SERVO_PWM_CHANNEL_TILT 1
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2400
+
 Adafruit_NeoPixel pixels(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire, -1);
 
@@ -74,9 +83,55 @@ unsigned long animUpdateTimer = 0;
 bool blink = false;
 bool mouthOpen = false;
 
+int current_pan = 90;
+int current_tilt = 45;
+int target_pan = 90;
+int target_tilt = 45;
+unsigned long lastServoUpdate = 0;
+unsigned long headMoveTimer = 0;
+
+bool servoInitialized = false;
+bool servosEnabled = false;
+
 void setColor(uint32_t color){
   pixels.setPixelColor(0,color);
   pixels.show();
+}
+
+uint32_t usToDuty(int microseconds) {
+  uint32_t max_duty = (1 << SERVO_PWM_RES) - 1;
+  uint32_t period_us = 1000000 / SERVO_PWM_FREQ;
+  return (microseconds * max_duty) / period_us;
+}
+
+void servoWrite(int pin, int degrees) {
+  degrees = constrain(degrees, 0, 180);
+  int microseconds = map(degrees, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+  uint32_t duty = usToDuty(microseconds);
+  
+  if (pin == SERVO_PAN_PIN) {
+    ledcWrite(SERVO_PWM_CHANNEL_PAN, duty);
+  } else if (pin == SERVO_TILT_PIN) {
+    ledcWrite(SERVO_PWM_CHANNEL_TILT, duty);
+  }
+}
+
+void initServos() {
+  Serial.println("[SERVO] Initializing hardware PWM...");
+  
+  ledcSetup(SERVO_PWM_CHANNEL_PAN, SERVO_PWM_FREQ, SERVO_PWM_RES);
+  ledcSetup(SERVO_PWM_CHANNEL_TILT, SERVO_PWM_FREQ, SERVO_PWM_RES);
+  
+  ledcAttachPin(SERVO_PAN_PIN, SERVO_PWM_CHANNEL_PAN);
+  ledcAttachPin(SERVO_TILT_PIN, SERVO_PWM_CHANNEL_TILT);
+  
+  servoWrite(SERVO_PAN_PIN, 90);
+  servoWrite(SERVO_TILT_PIN, 45);
+  
+  servoInitialized = true;
+  servosEnabled = true;
+  
+  Serial.println("[SERVO] Init complete!");
 }
 
 void showStatus(const char* msg,bool clear=true){
@@ -319,6 +374,29 @@ void setup(){
 
 void loop(){
   webSocket.loop();
+
+  if (!servoInitialized && millis() > 10000) {
+    initServos();
+  }
+
+  if (servoInitialized && servosEnabled && millis() - lastServoUpdate > 20) {
+    lastServoUpdate = millis();
+
+    if (millis() > headMoveTimer) {
+      target_pan = random(30, 150);
+      target_tilt = random(30, 70);
+      headMoveTimer = millis() + random(2000, 4000);
+    }
+
+    if (current_pan < target_pan) current_pan++;
+    if (current_pan > target_pan) current_pan--;
+    if (current_tilt < target_tilt) current_tilt++;
+    if (current_tilt > target_tilt) current_tilt--;
+
+    servoWrite(SERVO_PAN_PIN, current_pan);
+    servoWrite(SERVO_TILT_PIN, current_tilt);
+  }
+
   if(!isWSConnected) return;
   if(isPlaying) return;
   int16_t sample_buffer[BUFFER_SIZE/2];
