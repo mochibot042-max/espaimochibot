@@ -119,9 +119,6 @@ void servoWrite(int pin, int degrees) {
 void initServos() {
   Serial.println("[SERVO] Initializing hardware PWM...");
   
-  ledcSetup(SERVO_PWM_CHANNEL_PAN, SERVO_PWM_FREQ, SERVO_PWM_RES);
-  ledcSetup(SERVO_PWM_CHANNEL_TILT, SERVO_PWM_FREQ, SERVO_PWM_RES);
-  
   ledcAttach(SERVO_PAN_PIN, SERVO_PWM_FREQ, SERVO_PWM_RES);
   ledcAttach(SERVO_TILT_PIN, SERVO_PWM_FREQ, SERVO_PWM_RES);
   
