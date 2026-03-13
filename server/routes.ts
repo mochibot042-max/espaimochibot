@@ -200,15 +200,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.send(JSON.stringify({ volume: currentVolume }));
 
     ws.on("message", async (data: any, isBinary: boolean) => {
-      if (isBinary) {
-        audioChunks.push(Buffer.from(data));
-        return;
-      }
+      try {
+        if (isBinary) {
+          audioChunks.push(Buffer.from(data));
+          return;
+        }
 
-      const msg = data.toString();
-      if (msg !== "END_STREAM" || isProcessing) return;
+        const msg = data.toString();
+        if (msg !== "END_STREAM" || isProcessing) return;
 
-      isProcessing = true;
+        isProcessing = true;
       let inputWavPath = "";
 
       try {
@@ -329,14 +330,29 @@ Remember that you are Alicia, the Red Queen AI managing Umbrella Corporation sys
 
       } catch (err) {
         console.error("Processing error:", err);
-        ws.send("ERROR");
+        if (ws.readyState === ws.OPEN) {
+          ws.send("ERROR");
+        }
       } finally {
         isProcessing = false;
         if (inputWavPath && fs.existsSync(inputWavPath)) fs.unlinkSync(inputWavPath);
       }
+    } catch (e) {
+      console.error("Message handler error:", e);
+    }
     });
 
-    ws.on("close", () => console.log("ESP32 disconnected"));
+    ws.on("error", (error) => {
+      console.error("WebSocket error:", error);
+      isProcessing = false;
+      audioChunks = [];
+    });
+
+    ws.on("close", () => {
+      console.log("ESP32 disconnected");
+      isProcessing = false;
+      audioChunks = [];
+    });
   });
 
   app.get(api.interactions.list.path, async (req, res) => {
