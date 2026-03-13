@@ -395,6 +395,12 @@ void setup() {
 
   prefs.begin("alexatron", false);
   currentVolume = prefs.getFloat("volume", 0.32f);
+  
+  // Load server config from preferences, or use defaults for local development
+  prefs.getString("ws_host", WS_HOST, DEFAULT_WS_HOST, sizeof(WS_HOST));
+  WS_PORT = prefs.getInt("ws_port", DEFAULT_WS_PORT);
+  
+  Serial.printf("[CONFIG] WS_HOST: %s, WS_PORT: %d\n", WS_HOST, WS_PORT);
 
   record_buffer = (uint8_t*)ps_malloc(RECORD_BUFFER_SIZE);
 
@@ -443,7 +449,12 @@ void setup() {
   i2s_driver_install(I2S_NUM_0, &dac_cfg, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &dac_p);
 
-  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+  // Use SSL only if port is 443, otherwise plain connection for local dev
+  if (WS_PORT == 443) {
+    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+  } else {
+    webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+  }
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(3000);
   webSocket.enableHeartbeat(15000, 3000, 2);
