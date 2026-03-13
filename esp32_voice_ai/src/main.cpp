@@ -8,9 +8,14 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 
-const char* WS_HOST = "voice-companion-nloh.onrender.com";
-const int WS_PORT   = 443;
+// Default to local development. Change to your laptop's IP (e.g., 192.168.137.1)
+// Or set via Web Portal when WiFiManager starts
+const char* DEFAULT_WS_HOST = "192.168.137.1";
+const int DEFAULT_WS_PORT   = 5000;
 const char* WS_PATH = "/ws/audio";
+
+char WS_HOST[64];
+int WS_PORT;
 
 #define LED_PIN        48
 #define MIC_BCK        16
