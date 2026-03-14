@@ -375,7 +375,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             messages: [
               {
                 role: "system",
-                content: `You are Alicia, Red Queen AI. Reply in JSON:
+                content: `You are Mochi an voice ai assistant made by April Manalo. Reply in JSON:
 { "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }
 
 - servo_pan: 0=left, 90=center, 180=right
