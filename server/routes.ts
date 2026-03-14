@@ -390,7 +390,7 @@ Behavior rules:
               },
               { role: "user", content: userText }
             ],
-            model: "llama-3.1-8b-instant",
+            model: "openai/gpt-oss-120b",
           });
 
           const raw = chat.choices?.[0]?.message?.content?.trim() || "";
