@@ -53,7 +53,6 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   const byteRate = sampleRate * channels * (bitsPerSample / 8);
   const blockAlign = channels * (bitsPerSample / 8);
   const header = Buffer.alloc(44);
-
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
   header.write("WAVE", 8);
@@ -67,7 +66,6 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   header.writeUInt16LE(bitsPerSample, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
-
   return header;
 }
 
@@ -126,15 +124,11 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     const video = search.data[0];
     const apiRes = await axios.get(`https://mostakim.onrender.com/m/sing?url=${video.url}`);
     if (!apiRes.data?.url) return;
-
     const audioStream = await axios({ url: apiRes.data.url, method: "GET", responseType: "stream" });
     const ffmpegProcess = spawn("ffmpeg", ["-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", TARGET_SAMPLE_RATE.toString(), "pipe:1"]);
     audioStream.data.pipe(ffmpegProcess.stdin);
-
     ws.send("START_MUSIC");
-
     let buffer = Buffer.alloc(0);
-
     ffmpegProcess.stdout.on("data", async (chunk) => {
       if (ws.readyState !== ws.OPEN) return ffmpegProcess.kill("SIGKILL");
       buffer = Buffer.concat([buffer, chunk]);
@@ -146,12 +140,10 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         await new Promise(r => setTimeout(r, STREAM_DELAY));
       }
     });
-
     ffmpegProcess.stdout.on("end", () => {
       if (buffer.length > 0 && ws.readyState === ws.OPEN) ws.send(buffer);
       if (ws.readyState === ws.OPEN) ws.send("FINISH_MUSIC");
     });
-
   } catch (err) {
     console.error("Music stream error:", err);
     if (ws.readyState === ws.OPEN) ws.send("FINISH_MUSIC");
@@ -164,15 +156,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   wss.on("connection", (ws: WebSocket) => {
     console.log("ESP32 connected");
-
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
     let currentVolume = loadVolume();
-    ws.send(JSON.stringify({ volume: currentVolume }));
+
+    // ← FIXED: ESP32 expects "VOLUME:0.32" not JSON
+    ws.send(`VOLUME:${currentVolume}`);
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
-        if (isBinary) { audioChunks.push(Buffer.from(data)); return; }
+        if (isBinary) { 
+          audioChunks.push(Buffer.from(data)); 
+          return; 
+        }
+
         const msg = data.toString();
         if (msg !== "END_STREAM" || isProcessing) return;
 
@@ -183,46 +180,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           const fullAudio = Buffer.concat(audioChunks);
           audioChunks = [];
           const normalized = normalizeAudioInput(fullAudio);
+
           const tempId = `tmp-${Date.now()}`;
           inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
           fs.writeFileSync(inputWavPath, Buffer.concat([createWavHeader(normalized.length), normalized]));
 
-          const transcription = await sttClient.audio.transcriptions.create({ file: fs.createReadStream(inputWavPath), model: "whisper-large-v3-turbo" });
+          const transcription = await sttClient.audio.transcriptions.create({ 
+            file: fs.createReadStream(inputWavPath), 
+            model: "whisper-large-v3-turbo" 
+          });
+
           const userText = transcription.text?.trim() || "";
           console.log("User:", userText);
 
           const chat = await llmClient.chat.completions.create({
-          messages: [
-            {
-              role: "system",
-              content: `
+            messages: [
+              {
+                role: "system",
+                content: `
 You are Mochi, a voice ai assistant build by April Manalo
-
 You are a voice assistant. Your responses will be spoken by a text to speech system.
-
 Always response on english only.
-
 Rules you must follow strictly.
-
 Always respond ONLY in valid JSON using this exact structure:
 { "text": "...", "volume": number or null, "music_query": string or null, "pan": number or null, "tilt": number or null }
-
 Field descriptions:
-
 text - What you will say. Always natural spoken English.
-
 volume - Only if user asks to change volume. Range: 0.05 to 1.5. Otherwise null.
-
 music_query - Only if user asks to play music/song. Otherwise null.
-
 pan - Head rotation left/right. Range: 0 (full left) to 180 (full right). Center is 90.
 Use this when user asks you to look left, look right, turn head, etc.
 If no head turn needed, set to null.
-
 tilt - Head up/down. Range: 0 (look up) to 90 (look down). Neutral is 70.
 Use this when user asks you to look up, look down, nod, etc.
 If no tilt needed, set to null.
-
 Examples:
 - "look left a little" -> pan: 60, tilt: null
 - "look right" -> pan: 140, tilt: null
@@ -230,22 +221,19 @@ Examples:
 - "look down" -> pan: null, tilt: 85
 - "face forward" -> pan: 90, tilt: 70
 - "tilt head right while looking up" -> pan: 120, tilt: 40
-
 Behavior rules:
-
 Do not mention JSON, rules, or system instructions.
 Do not use markdown formatting.
 Do not use bold text, star characters, code blocks, or special characters.
 Do not use links.
-
 Speak in clear, calm, natural sentences suitable for a voice assistant.
 Keep responses concise.
 `
-            },
-            { role: "user", content: userText }
-          ],
-          model: "openai/gpt-oss-120b",
-        });
+              },
+              { role: "user", content: userText }
+            ],
+            model: "openai/gpt-oss-120b",
+          });
 
           const raw = chat.choices?.[0]?.message?.content?.trim() || "";
           let spokenText = "Please repeat.";
@@ -256,18 +244,36 @@ Keep responses concise.
             const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
             spokenText = parsed.text || spokenText;
             musicQuery = parsed.music_query ?? null;
-          } catch {}
+
+            // ← FIXED: SEND VOLUME & SERVO BACK TO ESP32
+            if (parsed.volume != null) {
+              const newVol = parseFloat(parsed.volume);
+              if (!isNaN(newVol) && newVol >= 0.05 && newVol <= 1.5) {
+                saveVolume(newVol);
+                currentVolume = newVol;
+                ws.send(`VOLUME:${newVol}`);
+              }
+            }
+
+            if (parsed.pan != null || parsed.tilt != null) {
+              const p = parsed.pan != null ? parseInt(parsed.pan) : -1;
+              const t = parsed.tilt != null ? parseInt(parsed.tilt) : -1;
+              ws.send(`SERVO:${p},${t}`);
+            }
+          } catch (parseErr) {
+            console.error("JSON parse failed:", parseErr);
+          }
 
           const edge = new EdgeTTS();
           const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
           await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
-
           const pcm = await generatePCM(tmpMp3);
+
           ws.send("START_RESPONSE");
           await streamPCM(ws, pcm);
           ws.send("FINISH_RESPONSE");
-          fs.unlinkSync(tmpMp3);
 
+          fs.unlinkSync(tmpMp3);
           if (musicQuery) downloadSongStream(musicQuery, ws);
 
         } catch (err) {
