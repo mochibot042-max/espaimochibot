@@ -127,28 +127,43 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 /* ---------------- MUSIC STREAM ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   let ffmpegProcess: any = null;
+  let streamEnded = false;
   
   try {
     console.log("Searching music:", query);
     const search = await axios.get(
-      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`
+      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`,
+      { timeout: 15000 }
     );
+    
     if (!search.data?.length) {
       ws.send("ERROR_MUSIC_NOT_FOUND");
       return;
     }
+    
     const video = search.data[0];
-    const apiRes = await axios.get(`https://mostakim.onrender.com/m/sing?url=${video.url}`);
+    console.log("Found video:", video.title);
+    
+    const apiRes = await axios.get(
+      `https://mostakim.onrender.com/m/sing?url=${video.url}`,
+      { timeout: 15000 }
+    );
+    
     if (!apiRes.data?.url) {
       ws.send("ERROR_MUSIC_NO_URL");
       return;
+    }
+
+    // Start dance mode if requested
+    if ((ws as any).danceMode) {
+      ws.send(JSON.stringify({ type: "dance", action: "start" }));
     }
 
     const audioStream = await axios({
       url: apiRes.data.url,
       method: "GET",
       responseType: "stream",
-      timeout: 30000,
+      timeout: 60000,
     });
 
     ffmpegProcess = spawn("ffmpeg", [
@@ -157,8 +172,19 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
       "-af", "volume=0.9",
+      "-bufsize", "64k",
       "pipe:1",
     ]);
+
+    let errorOutput = "";
+    
+    ffmpegProcess.stderr.on("data", (data: Buffer) => {
+      errorOutput += data.toString();
+      // Detect actual end of stream
+      if (data.toString().includes("Conversion failed") || data.toString().includes("Error")) {
+        console.log("FFmpeg error detected");
+      }
+    });
 
     audioStream.data.pipe(ffmpegProcess.stdin);
 
@@ -166,10 +192,13 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 
     let buffer = Buffer.alloc(0);
     let isActive = true;
+    let lastDataTime = Date.now();
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
+      lastDataTime = Date.now();
       buffer = Buffer.concat([buffer, chunk]);
+      
       while (buffer.length >= CHUNK_SIZE && isActive) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
@@ -178,27 +207,54 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         const sendChunk = buffer.slice(0, CHUNK_SIZE);
         buffer = buffer.slice(CHUNK_SIZE);
         ws.send(sendChunk, { binary: true });
-        await new Promise(r => setTimeout(r, 4));
+        await new Promise(r => setTimeout(r, 3)); // Faster streaming
       }
     });
 
+    // Monitor for stream end
+    const endMonitor = setInterval(() => {
+      if (Date.now() - lastDataTime > 5000 && !streamEnded) {
+        // No data for 5 seconds, likely ended
+        console.log("Music stream appears ended (timeout)");
+        clearInterval(endMonitor);
+      }
+    }, 1000);
+
     ffmpegProcess.stdout.on("end", () => {
+      streamEnded = true;
+      clearInterval(endMonitor);
       isActive = false;
+      
+      // Send remaining buffer
       if (buffer.length > 0 && ws.readyState === ws.OPEN) {
         ws.send(buffer);
       }
-      if (ws.readyState === ws.OPEN) {
+      
+      // Small delay then send finish
+      setTimeout(() => {
+        if (ws.readyState === ws.OPEN) {
+          ws.send("FINISH_MUSIC");
+          if ((ws as any).danceMode) {
+            ws.send(JSON.stringify({ type: "dance", action: "stop" }));
+            (ws as any).danceMode = false;
+          }
+        }
+        console.log("Music finished properly");
+      }, 500);
+    });
+
+    ffmpegProcess.on("close", (code: number) => {
+      streamEnded = true;
+      clearInterval(endMonitor);
+      console.log("FFmpeg exited with code:", code);
+      if (!isActive && ws.readyState === ws.OPEN) {
         ws.send("FINISH_MUSIC");
       }
-      console.log("Music finished");
     });
 
-    ffmpegProcess.stderr.on("data", (data: Buffer) => {
-      console.log("FFmpeg:", data.toString());
-    });
-
-    // Store reference to kill if needed
+    // Store reference
     (ws as any).musicProcess = ffmpegProcess;
+    (ws as any).musicMonitor = endMonitor;
 
   } catch (err) {
     console.error("Music stream error:", err);
@@ -206,7 +262,24 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       ws.send("ERROR_MUSIC");
     }
     if (ffmpegProcess) ffmpegProcess.kill();
+    if ((ws as any).danceMode) {
+      (ws as any).danceMode = false;
+    }
   }
+}
+
+/* ---------------- DANCE SEQUENCE GENERATOR ---------------- */
+function generateDanceMove(): { pan: number, tilt: number, delay: number } {
+  const moves = [
+    { pan: 0, tilt: 45, delay: 400 },    // Left
+    { pan: 180, tilt: 45, delay: 400 },  // Right
+    { pan: 90, tilt: 0, delay: 300 },    // Down
+    { pan: 90, tilt: 90, delay: 300 },   // Up
+    { pan: 45, tilt: 70, delay: 350 },   // Left-Up
+    { pan: 135, tilt: 70, delay: 350 },  // Right-Up
+    { pan: 90, tilt: 45, delay: 200 },   // Center
+  ];
+  return moves[Math.floor(Math.random() * moves.length)];
 }
 
 /* ---------------- SERVER ---------------- */
@@ -221,9 +294,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   wss.on("connection", (ws: WebSocket) => {
     console.log("ESP32 connected");
     
-    // Heartbeat to prevent timeout
     let heartbeatInterval: NodeJS.Timeout;
     let isProcessing = false;
+    (ws as any).danceMode = false;
+    (ws as any).danceInterval = null;
 
     ws.on("pong", () => {
       (ws as any).isAlive = true;
@@ -232,7 +306,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let audioChunks: Buffer[] = [];
     let currentVolume = loadVolume();
 
-    // Send initial volume
     ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
 
     ws.on("message", async (data: any, isBinary: boolean) => {
@@ -245,7 +318,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const msg = data.toString();
         console.log("Received:", msg);
 
-        // Handle ping/pong manually if needed
         if (msg === "ping") {
           ws.send("pong");
           return;
@@ -277,6 +349,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           const userText = transcription.text?.trim() || "";
           console.log("User:", userText);
 
+          /* Check for dance command */
+          const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
+          
           /* LLM */
           const chat = await llmClient.chat.completions.create({
             messages: [
@@ -289,14 +364,15 @@ You are a voice assistant. Responses will be spoken by text-to-speech.
 You understand any language but MUST ALWAYS reply in English only.
 
 Respond ONLY in valid JSON with this exact structure:
-{ "text": "...", "volume": number or null, "music_query": string or null, "servo_pan": number or null, "servo_tilt": number or null }
+{ "text": "...", "volume": number or null, "music_query": string or null, "servo_pan": number or null, "servo_tilt": number or null, "dance": boolean }
 
 Field descriptions:
 - text: What you say to user. Natural spoken English only.
 - volume: Use ONLY if user requests volume changes. Range 0.05 to 1.5. Null if no change.
-- music_query: Use ONLY if user asks for music/song. Null if no music.
+- music_query: Use ONLY if user asks for music/song/dance. Null if no music.
 - servo_pan: Use ONLY if user asks to look left/right/turn head. Range 0-180 (0=left, 90=center, 180=right). Null if no movement.
 - servo_tilt: Use ONLY if user asks to look up/down. Range 0-90 (0=down, 90=up). Null if no movement.
+- dance: Set to TRUE if user says "dance", "sayaw", "boogie", etc.
 
 Examples:
 User: "look left" -> servo_pan: 0
@@ -304,6 +380,7 @@ User: "look right" -> servo_pan: 180
 User: "look up" or "tumingala" -> servo_tilt: 90
 User: "look down" -> servo_tilt: 0
 User: "center your head" -> servo_pan: 90, servo_tilt: 45
+User: "dance" or "sayaw ka" -> dance: true, music_query: "upbeat dance music"
 
 Behavior rules:
 - No markdown, no bold, no stars, no code blocks
@@ -323,6 +400,7 @@ Behavior rules:
           let newVolume: number | null = null;
           let servoPan: number | null = null;
           let servoTilt: number | null = null;
+          let danceMode = false;
 
           try {
             const parsed = JSON.parse(raw);
@@ -330,19 +408,32 @@ Behavior rules:
             musicQuery = parsed.music_query ?? null;
             servoPan = parsed.servo_pan ?? null;
             servoTilt = parsed.servo_tilt ?? null;
+            danceMode = parsed.dance || isDanceCommand;
             
             if (parsed.volume !== null && !isNaN(parsed.volume)) {
               newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
             }
+            
+            // If dance mode, set default music if none provided
+            if (danceMode && !musicQuery) {
+              musicQuery = "upbeat dance music";
+            }
           } catch (e) {
             console.log("JSON parse error:", raw);
-            // Fallback: use raw text if JSON fails
             spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand that.";
+            // Check if raw text indicates dance
+            if (isDanceCommand) {
+              danceMode = true;
+              musicQuery = "upbeat dance music";
+            }
           }
+
+          // Store dance mode flag
+          (ws as any).danceMode = danceMode;
 
           await storage.createInteraction({ transcript: userText, response: spokenText });
 
-          /* Send servo commands FIRST (before TTS) */
+          /* Send servo commands FIRST */
           if (servoPan !== null || servoTilt !== null) {
             const panVal = servoPan ?? -1;
             const tiltVal = servoTilt ?? -1;
@@ -374,7 +465,7 @@ Behavior rules:
             console.log("Volume changed:", currentVolume);
           }
 
-          /* Music */
+          /* Music with dance mode */
           if (musicQuery) {
             downloadSongStream(musicQuery, ws);
           }
@@ -404,6 +495,9 @@ Behavior rules:
         if ((ws as any).musicProcess) {
           (ws as any).musicProcess.kill();
         }
+        if ((ws as any).danceInterval) {
+          clearInterval((ws as any).danceInterval);
+        }
         return ws.terminate();
       }
       (ws as any).isAlive = false;
@@ -419,11 +513,17 @@ Behavior rules:
     ws.on("close", () => {
       console.log("ESP32 disconnected");
       clearInterval(heartbeatInterval);
-      isProcessing = false;
-      audioChunks = [];
       if ((ws as any).musicProcess) {
         (ws as any).musicProcess.kill();
       }
+      if ((ws as any).musicMonitor) {
+        clearInterval((ws as any).musicMonitor);
+      }
+      if ((ws as any).danceInterval) {
+        clearInterval((ws as any).danceInterval);
+      }
+      isProcessing = false;
+      audioChunks = [];
     });
   });
 
