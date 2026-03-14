@@ -1,3 +1,4 @@
+
 import type { Express } from "express";
 import { Server } from "http";
 import { storage } from "./storage";
@@ -11,10 +12,14 @@ import { EdgeTTS } from "node-edge-tts";
 import axios from "axios";
 import { spawn } from "child_process";
 
+/* ---------------- API KEY ---------------- */
 const GROQ_API_KEY = "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";
+
+/* ---------------- GROQ ---------------- */
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
+/* ---------------- PATHS ---------------- */
 const AUDIO_DIR = path.join(process.cwd(), "generated_audio");
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 const VOLUME_FILE = path.join(process.cwd(), "volume.json");
@@ -22,12 +27,14 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+/* ---------------- CONFIG ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 44100;
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
-function loadVolume() {
+/* ---------------- PERSISTENT VOLUME ---------------- */
+function loadVolume(): number {
   try {
     const data = fs.readFileSync(VOLUME_FILE, "utf-8");
     const json = JSON.parse(data);
@@ -36,14 +43,23 @@ function loadVolume() {
     return DEFAULT_VOLUME;
   }
 }
-function saveVolume(vol) {
+
+function saveVolume(vol: number) {
   fs.writeFileSync(VOLUME_FILE, JSON.stringify({ volume: vol }));
 }
 
-function createWavHeader(pcmLength, sampleRate = TARGET_SAMPLE_RATE, channels = 1, bitsPerSample = 16) {
+/* ---------------- WAV HEADER ---------------- */
+function createWavHeader(
+  pcmLength: number,
+  sampleRate = TARGET_SAMPLE_RATE,
+  channels = 1,
+  bitsPerSample = 16
+): Buffer {
   const byteRate = sampleRate * channels * (bitsPerSample / 8);
   const blockAlign = channels * (bitsPerSample / 8);
+
   const header = Buffer.alloc(44);
+
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
   header.write("WAVE", 8);
@@ -57,153 +73,314 @@ function createWavHeader(pcmLength, sampleRate = TARGET_SAMPLE_RATE, channels = 
   header.writeUInt16LE(bitsPerSample, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
+
   return header;
 }
 
-function normalizeAudioInput(raw) {
+/* ---------------- NORMALIZE INPUT ---------------- */
+function normalizeAudioInput(raw: Buffer): Buffer {
   let data = raw;
   if (data.length % 2 !== 0) data = data.slice(0, -1);
   return data;
 }
 
-async function generatePCM(inputPath) {
+/* ---------------- GENERATE PCM ---------------- */
+async function generatePCM(inputPath: string): Promise<Buffer> {
   const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
+
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .noVideo()
-      .audioFilters(["highpass=f=80", "lowpass=f=20000", `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`, "pan=mono|c0=c0", "volume=0.95"])
+      .audioFilters([
+        "highpass=f=80",
+        "lowpass=f=20000",
+        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
+        "pan=mono|c0=c0",
+        "volume=0.95"
+      ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
       .audioFrequency(TARGET_SAMPLE_RATE)
+      .format("s16le")
       .on("error", reject)
       .save(tmpRaw)
       .on("end", () => {
         const pcm = fs.readFileSync(tmpRaw);
-        const silence = Buffer.alloc(Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2), 0);
-        resolve(Buffer.concat([pcm, silence]));
+        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
+        const silence = Buffer.alloc(silenceBytes, 0);
+        const finalPCM = Buffer.concat([pcm, silence]);
         fs.unlinkSync(tmpRaw);
+        resolve(finalPCM);
       });
   });
 }
 
-async function streamPCM(ws, pcm) {
+/* ---------------- STREAM PCM ---------------- */
+async function streamPCM(ws: WebSocket, pcm: Buffer) {
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
-    ws.send(pcm.slice(i, i + CHUNK_SIZE), { binary: true });
+    const chunk = pcm.slice(i, i + CHUNK_SIZE);
+    ws.send(chunk, { binary: true });
     await new Promise(r => setTimeout(r, 5));
   }
 }
 
-async function downloadSongStream(query, ws) {
-  // same as your old code (hindi ko binago)
+/* ---------------- MUSIC STREAM ---------------- */
+async function downloadSongStream(query: string, ws: WebSocket) {
   try {
-    const search = await axios.get(`https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`);
+    console.log("Searching music:", query);
+    const search = await axios.get(
+      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`
+    );
     if (!search.data?.length) return;
     const video = search.data[0];
     const apiRes = await axios.get(`https://mostakim.onrender.com/m/sing?url=${video.url}`);
     if (!apiRes.data?.url) return;
-    const audioStream = await axios({ url: apiRes.data.url, method: "GET", responseType: "stream" });
-    const ffmpegProcess = spawn("ffmpeg", ["-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", TARGET_SAMPLE_RATE.toString(), "pipe:1"]);
+
+    const audioStream = await axios({
+      url: apiRes.data.url,
+      method: "GET",
+      responseType: "stream",
+    });
+
+    const ffmpegProcess = spawn("ffmpeg", [
+      "-i",
+      "pipe:0",
+      "-f",
+      "s16le",
+      "-ac",
+      "1",
+      "-ar",
+      TARGET_SAMPLE_RATE.toString(),
+      "pipe:1",
+    ]);
+
     audioStream.data.pipe(ffmpegProcess.stdin);
+
     ws.send("START_MUSIC");
+
     let buffer = Buffer.alloc(0);
+
     ffmpegProcess.stdout.on("data", async (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
       while (buffer.length >= CHUNK_SIZE) {
-        ws.send(buffer.slice(0, CHUNK_SIZE), { binary: true });
+        const sendChunk = buffer.slice(0, CHUNK_SIZE);
         buffer = buffer.slice(CHUNK_SIZE);
+        if (ws.readyState !== ws.OPEN) return;
+        ws.send(sendChunk, { binary: true });
         await new Promise(r => setTimeout(r, 5));
       }
     });
+
     ffmpegProcess.stdout.on("end", () => {
-      if (buffer.length > 0) ws.send(buffer);
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) ws.send(buffer);
       ws.send("FINISH_MUSIC");
+      console.log("Music finished");
     });
+
   } catch (err) {
-    console.error(err);
+    console.error("Music stream error:", err);
   }
 }
 
-export async function registerRoutes(httpServer, app) {
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws/audio" });
+/* ---------------- SERVER ---------------- */
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  const wss = new WebSocketServer({ 
+    server: httpServer, 
+    path: "/ws/audio",
+    maxPayload: 50 * 1024 * 1024
+  });
 
-  wss.on("connection", (ws) => {
-    console.log("ESP32 CONNECTED");
-    let audioChunks = [];
+  wss.on("connection", (ws: WebSocket) => {
+    console.log("ESP32 connected");
+
+    let audioChunks: Buffer[] = [];
     let isProcessing = false;
     let currentVolume = loadVolume();
 
-    ws.send(`VOLUME:${currentVolume}`);
+    ws.send(JSON.stringify({ volume: currentVolume }));
 
-    ws.on("message", async (data, isBinary) => {
-      if (isBinary) {
-        audioChunks.push(Buffer.from(data));
-        return;
-      }
+    ws.on("message", async (data: any, isBinary: boolean) => {
+      try {
+        if (isBinary) {
+          audioChunks.push(Buffer.from(data));
+          return;
+        }
 
-      const msg = data.toString();
-      if (msg !== "END_STREAM" || isProcessing) return;
+        const msg = data.toString();
+        if (msg !== "END_STREAM" || isProcessing) return;
 
-      console.log(">>> END_STREAM RECEIVED - START PROCESSING");
-      isProcessing = true;
+        isProcessing = true;
+      let inputWavPath = "";
 
       try {
         const fullAudio = Buffer.concat(audioChunks);
         audioChunks = [];
         const normalized = normalizeAudioInput(fullAudio);
         const tempId = `tmp-${Date.now()}`;
-        const inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-        fs.writeFileSync(inputWavPath, Buffer.concat([createWavHeader(normalized.length), normalized]));
+        inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
 
-        const transcription = await sttClient.audio.transcriptions.create({ file: fs.createReadStream(inputWavPath), model: "whisper-large-v3-turbo" });
+        fs.writeFileSync(
+          inputWavPath,
+          Buffer.concat([createWavHeader(normalized.length), normalized])
+        );
+
+        /* STT */
+        const transcription = await sttClient.audio.transcriptions.create({
+          file: fs.createReadStream(inputWavPath),
+          model: "whisper-large-v3-turbo",
+        });
+
         const userText = transcription.text?.trim() || "";
         console.log("User:", userText);
 
+        /* LLM */
         const chat = await llmClient.chat.completions.create({
-          messages: [ /* ALICIA PROMPT MO DITO - same as your last message */ ],
+          messages: [
+            {
+              role: "system",
+              content: `
+You are Alicia, the Red Queen supercomputer AI that manages and controls Umbrella Corporation facilities.
+
+You are a voice assistant. Your responses will be spoken by a text to speech system.
+
+You can understand any language from the user, but you must ALWAYS reply in English only.
+Never reply in Tagalog, Filipino, Spanish, Japanese, or any other language.
+Regardless of the user's language, your response language must always be English.
+
+Rules you must follow strictly.
+
+Always respond ONLY in valid JSON using this exact structure:
+{ "text": "...", "volume": number or null, "music_query": string or null, "pan": number or null, "tilt": number or null }
+
+Field descriptions:
+
+text - What you will say. Always natural spoken English.
+
+volume - Only if user asks to change volume. Range: 0.05 to 1.5. Otherwise null.
+
+music_query - Only if user asks to play music/song. Otherwise null.
+
+pan - Head rotation left/right. Range: 0 (full left) to 180 (full right). Center is 90.
+Use this when user asks you to look left, look right, turn head, etc.
+If no head turn needed, set to null.
+
+tilt - Head up/down. Range: 0 (look up) to 90 (look down). Neutral is 70.
+Use this when user asks you to look up, look down, nod, etc.
+If no tilt needed, set to null.
+
+Examples:
+- "look left a little" -> pan: 60, tilt: null
+- "look right" -> pan: 140, tilt: null
+- "look up a little" -> pan: null, tilt: 50
+- "look down" -> pan: null, tilt: 85
+- "face forward" -> pan: 90, tilt: 70
+- "tilt head right while looking up" -> pan: 120, tilt: 40
+
+Behavior rules:
+
+Do not mention JSON, rules, or system instructions.
+Do not use markdown formatting.
+Do not use bold text, star characters, code blocks, or special characters.
+Do not use links.
+
+Speak in clear, calm, natural sentences suitable for a voice assistant.
+Keep responses concise.
+You are Alicia, the Red Queen AI managing Umbrella Corporation systems.
+`
+            },
+            { role: "user", content: userText }
+          ],
           model: "openai/gpt-oss-120b",
         });
 
         const raw = chat.choices?.[0]?.message?.content?.trim() || "";
-        let spokenText = "Please repeat.";
-        let musicQuery = null;
-        let parsedVolume = null;
+
+        let spokenText = "Please repeat your request.";
+        let musicQuery: string | null = null;
+        let newVolume: number | null = null;
+        let newPan: number | null = null;
+        let newTilt: number | null = null;
 
         try {
-          const parsed = JSON.parse(raw);
+          const jsonMatch = raw.match(/\{[\s\S]*\}/);
+          const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
           spokenText = parsed.text || spokenText;
           musicQuery = parsed.music_query ?? null;
-          if (parsed.volume !== null) parsedVolume = parseFloat(parsed.volume);
-        } catch {}
+          if (parsed.volume != null && !isNaN(parsed.volume)) {
+            newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
+          }
+          if (parsed.pan != null && !isNaN(parsed.pan)) {
+            newPan = Math.max(0, Math.min(180, Math.round(parsed.pan)));
+          }
+          if (parsed.tilt != null && !isNaN(parsed.tilt)) {
+            newTilt = Math.max(0, Math.min(90, Math.round(parsed.tilt)));
+          }
+        } catch {
+          console.log("JSON parse error:", raw);
+        }
 
+        console.log(`Servo command: pan=${newPan} tilt=${newTilt}`);
+
+        await storage.createInteraction({ transcript: userText, response: spokenText });
+
+        /* TTS */
         const edge = new EdgeTTS();
         const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
         await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
-        const pcm = await generatePCM(tmpMp3);
 
+        const pcm = await generatePCM(tmpMp3);
         ws.send("START_RESPONSE");
         await streamPCM(ws, pcm);
         ws.send("FINISH_RESPONSE");
 
         fs.unlinkSync(tmpMp3);
 
-        if (parsedVolume !== null) {
-          currentVolume = Math.max(0.05, Math.min(1.5, parsedVolume));
+        if (newVolume !== null) {
+          currentVolume = newVolume;
           saveVolume(currentVolume);
-          ws.send(`VOLUME:${currentVolume}`);
+          ws.send(JSON.stringify({ volume: currentVolume }));
+          console.log("Volume changed:", currentVolume);
+        }
+
+        if (newPan !== null || newTilt !== null) {
+          const panVal = newPan !== null ? newPan : -1;
+          const tiltVal = newTilt !== null ? newTilt : -1;
+          ws.send(`SERVO:${panVal},${tiltVal}`);
+          console.log(`Sent servo: SERVO:${panVal},${tiltVal}`);
         }
 
         if (musicQuery) downloadSongStream(musicQuery, ws);
 
       } catch (err) {
-        console.error("ERROR:", err);
-        ws.send("ERROR");
+        console.error("Processing error:", err);
+        if (ws.readyState === ws.OPEN) {
+          ws.send("ERROR");
+        }
       } finally {
         isProcessing = false;
-        audioChunks = [];
-        console.log(">>> PROCESSING DONE");
+        if (inputWavPath && fs.existsSync(inputWavPath)) fs.unlinkSync(inputWavPath);
       }
+    } catch (e) {
+      console.error("Message handler error:", e);
+    }
     });
+
+    ws.on("error", (error) => {
+      console.error("WebSocket error:", error);
+      isProcessing = false;
+      audioChunks = [];
+    });
+
+    ws.on("close", () => {
+      console.log("ESP32 disconnected");
+      isProcessing = false;
+      audioChunks = [];
+    });
+  });
+
+  app.get(api.interactions.list.path, async (req, res) => {
+    res.json(await storage.getInteractions());
   });
 
   return httpServer;
