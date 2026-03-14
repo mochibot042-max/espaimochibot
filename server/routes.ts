@@ -195,39 +195,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
   }
 }
 
-// STREAMING STT: Accumulate chunks and transcribe when speech ends
-async function transcribeAccumulatedAudio(audioBuffer: Buffer): Promise<string> {
-  if (audioBuffer.length === 0) return "";
-  
-  try {
-    // Ensure 16-bit alignment
-    let data = audioBuffer;
-    if (data.length % 2 !== 0) data = data.slice(0, -1);
-    
-    // Create temp WAV file for Groq
-    const tempId = `stream_${Date.now()}`;
-    const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-    
-    // Write WAV file
-    fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(data.length), data]));
-
-    // Transcribe with Groq
-    const transcription = await sttClient.audio.transcriptions.create({
-      file: fs.createReadStream(inputPath),
-      model: "whisper-large-v3-turbo",
-      language: "en",
-    });
-
-    // Cleanup
-    fs.unlinkSync(inputPath);
-    
-    return transcription.text?.trim() || "";
-  } catch (err) {
-    console.error("[STT] Transcription error:", err);
-    return "";
-  }
-}
-
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   const wss = new WebSocketServer({ 
     server: httpServer, 
@@ -247,7 +214,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       (ws as any).isAlive = true;
     });
 
-    // STREAMING STATE - Accumulate audio chunks here
+    // STREAMING STATE: Accumulate audio chunks here
     let audioChunks: Buffer[] = [];
     let isRecording = false;
     let currentVolume = loadVolume();
@@ -257,51 +224,66 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
         if (isBinary) {
-          // STREAMING: Receive audio chunk from ESP32
+          // STREAMING: Accumulate audio chunk
           if (!isRecording) {
-            // ESP32 started streaming
             isRecording = true;
             audioChunks = [];
-            console.log("[STREAM] Started receiving audio chunks");
-            ws.send("LISTENING");
+            console.log("[STREAM] Started receiving chunks");
           }
-
-          // Accumulate chunk
+          
           audioChunks.push(Buffer.from(data));
           return;
         }
 
         // Handle text commands
         const msg = data.toString();
-        console.log("[WS] Received:", msg);
+        console.log("[WS] Command:", msg);
 
         if (msg === "ping") {
           ws.send("pong");
           return;
         }
 
-        // ESP32 detected end of speech
+        // END_SPEECH: Process accumulated audio
         if (msg === "END_SPEECH" && isRecording && !isProcessing) {
           isProcessing = true;
           isRecording = false;
           
-          console.log("[STREAM] End of speech, transcribing...");
+          console.log("[STREAM] Finalizing transcription...");
           ws.send("PROCESSING");
 
           try {
-            // Combine all chunks
+            // Combine all chunks into one buffer
             const fullAudio = Buffer.concat(audioChunks);
-            audioChunks = []; // Clear buffer
+            audioChunks = []; // Clear for next time
 
             if (fullAudio.length === 0) {
-              ws.send("NO_SPEECH");
+              ws.send("ERROR_NO_AUDIO");
               isProcessing = false;
               return;
             }
 
-            // Transcribe accumulated audio
-            const userText = await transcribeAccumulatedAudio(fullAudio);
-            console.log("[STT] Transcribed:", userText);
+            // Create WAV file for Groq
+            const tempId = `stream_${Date.now()}`;
+            const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+            
+            // Ensure 16-bit alignment
+            let wavData = fullAudio;
+            if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
+            
+            fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length), wavData]));
+
+            // Transcribe with Groq
+            const transcription = await sttClient.audio.transcriptions.create({
+              file: fs.createReadStream(inputPath),
+              model: "whisper-large-v3-turbo",
+              language: "en",
+            });
+
+            fs.unlinkSync(inputPath);
+            
+            const userText = transcription.text?.trim() || "";
+            console.log("[STT] Result:", userText);
 
             if (userText.length === 0) {
               ws.send("NO_SPEECH");
@@ -370,7 +352,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
-            // TTS Generation
+            // TTS Generation - THIS MUST WORK!
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
             await edge.ttsPromise(spokenText, tmpMp3, { 
@@ -378,6 +360,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             });
 
             const pcm = await generatePCM(tmpMp3);
+            
+            // Send TTS to ESP32
             ws.send("START_RESPONSE");
             await streamPCM(ws, pcm);
             ws.send("FINISH_RESPONSE");
@@ -397,7 +381,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             }
 
           } catch (err) {
-            console.error("[STREAM] Processing error:", err);
+            console.error("[STREAM] Error:", err);
             if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
@@ -405,8 +389,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // Legacy support for old END_STREAM (fallback)
-        if (msg === "END_STREAM" && !isProcessing && !isRecording) {
+        // Legacy support
+        if (msg === "END_STREAM") {
           ws.send("ERROR_USE_END_SPEECH");
         }
 
