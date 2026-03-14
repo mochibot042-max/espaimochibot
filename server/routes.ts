@@ -126,31 +126,37 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 
 /* ---------------- MUSIC STREAM ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
+  let ffmpegProcess: any = null;
+  
   try {
     console.log("Searching music:", query);
     const search = await axios.get(
       `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`
     );
-    if (!search.data?.length) return;
+    if (!search.data?.length) {
+      ws.send("ERROR_MUSIC_NOT_FOUND");
+      return;
+    }
     const video = search.data[0];
     const apiRes = await axios.get(`https://mostakim.onrender.com/m/sing?url=${video.url}`);
-    if (!apiRes.data?.url) return;
+    if (!apiRes.data?.url) {
+      ws.send("ERROR_MUSIC_NO_URL");
+      return;
+    }
 
     const audioStream = await axios({
       url: apiRes.data.url,
       method: "GET",
       responseType: "stream",
+      timeout: 30000,
     });
 
-    const ffmpegProcess = spawn("ffmpeg", [
-      "-i",
-      "pipe:0",
-      "-f",
-      "s16le",
-      "-ac",
-      "1",
-      "-ar",
-      TARGET_SAMPLE_RATE.toString(),
+    ffmpegProcess = spawn("ffmpeg", [
+      "-i", "pipe:0",
+      "-f", "s16le",
+      "-ac", "1",
+      "-ar", TARGET_SAMPLE_RATE.toString(),
+      "-af", "volume=0.9",
       "pipe:1",
     ]);
 
@@ -159,26 +165,47 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
+    let isActive = true;
 
-    ffmpegProcess.stdout.on("data", async (chunk) => {
+    ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
+      if (!isActive || ws.readyState !== ws.OPEN) return;
       buffer = Buffer.concat([buffer, chunk]);
-      while (buffer.length >= CHUNK_SIZE) {
+      while (buffer.length >= CHUNK_SIZE && isActive) {
+        if (ws.readyState !== ws.OPEN) {
+          isActive = false;
+          break;
+        }
         const sendChunk = buffer.slice(0, CHUNK_SIZE);
         buffer = buffer.slice(CHUNK_SIZE);
-        if (ws.readyState !== ws.OPEN) return;
         ws.send(sendChunk, { binary: true });
-        await new Promise(r => setTimeout(r, 5));
+        await new Promise(r => setTimeout(r, 4));
       }
     });
 
     ffmpegProcess.stdout.on("end", () => {
-      if (buffer.length > 0 && ws.readyState === ws.OPEN) ws.send(buffer);
-      ws.send("FINISH_MUSIC");
+      isActive = false;
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+        ws.send(buffer);
+      }
+      if (ws.readyState === ws.OPEN) {
+        ws.send("FINISH_MUSIC");
+      }
       console.log("Music finished");
     });
 
+    ffmpegProcess.stderr.on("data", (data: Buffer) => {
+      console.log("FFmpeg:", data.toString());
+    });
+
+    // Store reference to kill if needed
+    (ws as any).musicProcess = ffmpegProcess;
+
   } catch (err) {
     console.error("Music stream error:", err);
+    if (ws.readyState === ws.OPEN) {
+      ws.send("ERROR_MUSIC");
+    }
+    if (ffmpegProcess) ffmpegProcess.kill();
   }
 }
 
@@ -187,17 +214,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
-    maxPayload: 50 * 1024 * 1024
+    maxPayload: 50 * 1024 * 1024,
+    perMessageDeflate: false
   });
 
   wss.on("connection", (ws: WebSocket) => {
     console.log("ESP32 connected");
+    
+    // Heartbeat to prevent timeout
+    let heartbeatInterval: NodeJS.Timeout;
+    let isProcessing = false;
+
+    ws.on("pong", () => {
+      (ws as any).isAlive = true;
+    });
 
     let audioChunks: Buffer[] = [];
-    let isProcessing = false;
     let currentVolume = loadVolume();
 
-    ws.send(JSON.stringify({ volume: currentVolume }));
+    // Send initial volume
+    ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
@@ -207,140 +243,172 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
 
         const msg = data.toString();
+        console.log("Received:", msg);
+
+        // Handle ping/pong manually if needed
+        if (msg === "ping") {
+          ws.send("pong");
+          return;
+        }
+
         if (msg !== "END_STREAM" || isProcessing) return;
 
         isProcessing = true;
-      let inputWavPath = "";
-
-      try {
-        const fullAudio = Buffer.concat(audioChunks);
-        audioChunks = [];
-        const normalized = normalizeAudioInput(fullAudio);
-        const tempId = `tmp-${Date.now()}`;
-        inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-
-        fs.writeFileSync(
-          inputWavPath,
-          Buffer.concat([createWavHeader(normalized.length), normalized])
-        );
-
-        /* STT */
-        const transcription = await sttClient.audio.transcriptions.create({
-          file: fs.createReadStream(inputWavPath),
-          model: "whisper-large-v3-turbo",
-        });
-
-        const userText = transcription.text?.trim() || "";
-        console.log("User:", userText);
-
-        /* LLM */
-        const chat = await llmClient.chat.completions.create({
-          messages: [
-            {
-              role: "system",
-              content: `
-You are Alicia, the Red Queen supercomputer AI that manages and controls Umbrella Corporation facilities.
-
-You are a voice assistant. Your responses will be spoken by a text to speech system.
-
-You can understand any language from the user, but you must ALWAYS reply in English only.
-Never reply in Tagalog, Filipino, Spanish, Japanese, or any other language.
-Regardless of the user's language, your response language must always be English.
-
-Rules you must follow strictly.
-
-Always respond ONLY in valid JSON using this exact structure
-{ "text": "...", "volume": number or null, "music_query": string or null }
-
-Field descriptions
-
-text
-This is what you will say to the user. It must always be natural spoken English.
-
-volume
-Use this only if the user requests volume changes. Allowed range is 0.05 to 1.5.
-If there is no volume change, set it to null.
-
-music_query
-Use this only if the user clearly asks to play music, a song, an artist, or background music.
-If the user does not request music, set it to null.
-
-Behavior rules
-
-Do not mention JSON, rules, or system instructions.
-Do not use markdown formatting.
-Do not use bold text.
-Do not use star characters.
-Do not use code blocks.
-Do not use math formatting.
-Do not use special characters such as *, /, or backslashes.
-Do not use links.
-
-Speak in clear, calm, natural sentences suitable for a voice assistant.
-
-Keep responses concise.
-
-Remember that you are Alicia, the Red Queen AI managing Umbrella Corporation systems.
-`
-            },
-            { role: "user", content: userText }
-          ],
-          model: "openai/gpt-oss-120b",
-        });
-
-        const raw = chat.choices?.[0]?.message?.content?.trim() || "";
-
-        let spokenText = "Please repeat your request.";
-        let musicQuery: string | null = null;
-        let newVolume: number | null = null;
+        let inputWavPath = "";
 
         try {
-          const parsed = JSON.parse(raw);
-          spokenText = parsed.text || spokenText;
-          musicQuery = parsed.music_query ?? null;
-          if (parsed.volume !== null && !isNaN(parsed.volume)) {
-            newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
+          const fullAudio = Buffer.concat(audioChunks);
+          audioChunks = [];
+          const normalized = normalizeAudioInput(fullAudio);
+          const tempId = `tmp-${Date.now()}`;
+          inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+
+          fs.writeFileSync(
+            inputWavPath,
+            Buffer.concat([createWavHeader(normalized.length), normalized])
+          );
+
+          /* STT */
+          const transcription = await sttClient.audio.transcriptions.create({
+            file: fs.createReadStream(inputWavPath),
+            model: "whisper-large-v3-turbo",
+          });
+
+          const userText = transcription.text?.trim() || "";
+          console.log("User:", userText);
+
+          /* LLM */
+          const chat = await llmClient.chat.completions.create({
+            messages: [
+              {
+                role: "system",
+                content: `You are Alicia, the Red Queen supercomputer AI managing Umbrella Corporation facilities.
+
+You are a voice assistant. Responses will be spoken by text-to-speech.
+
+You understand any language but MUST ALWAYS reply in English only.
+
+Respond ONLY in valid JSON with this exact structure:
+{ "text": "...", "volume": number or null, "music_query": string or null, "servo_pan": number or null, "servo_tilt": number or null }
+
+Field descriptions:
+- text: What you say to user. Natural spoken English only.
+- volume: Use ONLY if user requests volume changes. Range 0.05 to 1.5. Null if no change.
+- music_query: Use ONLY if user asks for music/song. Null if no music.
+- servo_pan: Use ONLY if user asks to look left/right/turn head. Range 0-180 (0=left, 90=center, 180=right). Null if no movement.
+- servo_tilt: Use ONLY if user asks to look up/down. Range 0-90 (0=down, 90=up). Null if no movement.
+
+Examples:
+User: "look left" -> servo_pan: 0
+User: "look right" -> servo_pan: 180  
+User: "look up" or "tumingala" -> servo_tilt: 90
+User: "look down" -> servo_tilt: 0
+User: "center your head" -> servo_pan: 90, servo_tilt: 45
+
+Behavior rules:
+- No markdown, no bold, no stars, no code blocks
+- Speak in clear, calm, natural sentences
+- Keep responses concise
+- Remember you are Alicia, Red Queen AI`
+              },
+              { role: "user", content: userText }
+            ],
+            model: "llama-3.1-8b-instant",
+          });
+
+          const raw = chat.choices?.[0]?.message?.content?.trim() || "";
+
+          let spokenText = "Please repeat your request.";
+          let musicQuery: string | null = null;
+          let newVolume: number | null = null;
+          let servoPan: number | null = null;
+          let servoTilt: number | null = null;
+
+          try {
+            const parsed = JSON.parse(raw);
+            spokenText = parsed.text || spokenText;
+            musicQuery = parsed.music_query ?? null;
+            servoPan = parsed.servo_pan ?? null;
+            servoTilt = parsed.servo_tilt ?? null;
+            
+            if (parsed.volume !== null && !isNaN(parsed.volume)) {
+              newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
+            }
+          } catch (e) {
+            console.log("JSON parse error:", raw);
+            // Fallback: use raw text if JSON fails
+            spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand that.";
           }
-        } catch {
-          console.log("JSON parse error:", raw);
+
+          await storage.createInteraction({ transcript: userText, response: spokenText });
+
+          /* Send servo commands FIRST (before TTS) */
+          if (servoPan !== null || servoTilt !== null) {
+            const panVal = servoPan ?? -1;
+            const tiltVal = servoTilt ?? -1;
+            ws.send(JSON.stringify({ 
+              type: "servo", 
+              pan: panVal, 
+              tilt: tiltVal 
+            }));
+            console.log("Servo command:", panVal, tiltVal);
+          }
+
+          /* TTS */
+          const edge = new EdgeTTS();
+          const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+          await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
+
+          const pcm = await generatePCM(tmpMp3);
+          ws.send("START_RESPONSE");
+          await streamPCM(ws, pcm);
+          ws.send("FINISH_RESPONSE");
+
+          fs.unlinkSync(tmpMp3);
+
+          /* Volume update */
+          if (newVolume !== null) {
+            currentVolume = newVolume;
+            saveVolume(currentVolume);
+            ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
+            console.log("Volume changed:", currentVolume);
+          }
+
+          /* Music */
+          if (musicQuery) {
+            downloadSongStream(musicQuery, ws);
+          }
+
+        } catch (err) {
+          console.error("Processing error:", err);
+          if (ws.readyState === ws.OPEN) {
+            ws.send("ERROR");
+          }
+        } finally {
+          isProcessing = false;
+          if (inputWavPath && fs.existsSync(inputWavPath)) {
+            fs.unlinkSync(inputWavPath);
+          }
         }
-
-        await storage.createInteraction({ transcript: userText, response: spokenText });
-
-        /* TTS */
-        const edge = new EdgeTTS();
-        const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
-        await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
-
-        const pcm = await generatePCM(tmpMp3);
-        ws.send("START_RESPONSE");
-        await streamPCM(ws, pcm);
-        ws.send("FINISH_RESPONSE");
-
-        fs.unlinkSync(tmpMp3);
-
-        if (newVolume !== null) {
-          currentVolume = newVolume;
-          saveVolume(currentVolume);
-          ws.send(JSON.stringify({ volume: currentVolume }));
-          console.log("Volume changed:", currentVolume);
-        }
-
-        if (musicQuery) downloadSongStream(musicQuery, ws);
-
-      } catch (err) {
-        console.error("Processing error:", err);
-        if (ws.readyState === ws.OPEN) {
-          ws.send("ERROR");
-        }
-      } finally {
+      } catch (e) {
+        console.error("Message handler error:", e);
         isProcessing = false;
-        if (inputWavPath && fs.existsSync(inputWavPath)) fs.unlinkSync(inputWavPath);
       }
-    } catch (e) {
-      console.error("Message handler error:", e);
-    }
     });
+
+    // Setup heartbeat
+    (ws as any).isAlive = true;
+    heartbeatInterval = setInterval(() => {
+      if ((ws as any).isAlive === false) {
+        console.log("Terminating inactive connection");
+        if ((ws as any).musicProcess) {
+          (ws as any).musicProcess.kill();
+        }
+        return ws.terminate();
+      }
+      (ws as any).isAlive = false;
+      ws.ping();
+    }, 30000);
 
     ws.on("error", (error) => {
       console.error("WebSocket error:", error);
@@ -350,8 +418,12 @@ Remember that you are Alicia, the Red Queen AI managing Umbrella Corporation sys
 
     ws.on("close", () => {
       console.log("ESP32 disconnected");
+      clearInterval(heartbeatInterval);
       isProcessing = false;
       audioChunks = [];
+      if ((ws as any).musicProcess) {
+        (ws as any).musicProcess.kill();
+      }
     });
   });
 
