@@ -28,10 +28,6 @@ const TARGET_SAMPLE_RATE = 44100;
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
-// STREAMING CONFIG
-const STREAMING_CHUNK_MS = 500; // Process every 500ms of audio
-const STREAMING_BYTES = (TARGET_SAMPLE_RATE * 2 * STREAMING_CHUNK_MS) / 1000; // 44.1kHz, 16bit, mono
-
 function loadVolume(): number {
   try {
     const data = fs.readFileSync(VOLUME_FILE, "utf-8");
@@ -199,30 +195,27 @@ async function downloadSongStream(query: string, ws: WebSocket) {
   }
 }
 
-// STREAMING STT: Process audio chunks in real-time using Groq streaming
-async function processStreamingSTT(audioChunks: Buffer[]): Promise<string> {
-  if (audioChunks.length === 0) return "";
+// STREAMING STT: Accumulate chunks and transcribe when speech ends
+async function transcribeAccumulatedAudio(audioBuffer: Buffer): Promise<string> {
+  if (audioBuffer.length === 0) return "";
   
   try {
-    // Combine chunks into single buffer
-    const combinedBuffer = Buffer.concat(audioChunks);
-    
     // Ensure 16-bit alignment
-    let data = combinedBuffer;
+    let data = audioBuffer;
     if (data.length % 2 !== 0) data = data.slice(0, -1);
     
-    // Create temp WAV file
+    // Create temp WAV file for Groq
     const tempId = `stream_${Date.now()}`;
     const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
     
+    // Write WAV file
     fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(data.length), data]));
 
-    // Use Groq streaming transcription
+    // Transcribe with Groq
     const transcription = await sttClient.audio.transcriptions.create({
       file: fs.createReadStream(inputPath),
       model: "whisper-large-v3-turbo",
       language: "en",
-      response_format: "json",
     });
 
     // Cleanup
@@ -230,7 +223,7 @@ async function processStreamingSTT(audioChunks: Buffer[]): Promise<string> {
     
     return transcription.text?.trim() || "";
   } catch (err) {
-    console.error("[STT] Streaming error:", err);
+    console.error("[STT] Transcription error:", err);
     return "";
   }
 }
@@ -244,7 +237,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("[WS] ESP32 connected - STREAMING MODE");
+    console.log("[WS] ESP32 connected");
     
     let heartbeatInterval: NodeJS.Timeout;
     let isProcessing = false;
@@ -254,94 +247,70 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       (ws as any).isAlive = true;
     });
 
-    // STREAMING STATE
+    // STREAMING STATE - Accumulate audio chunks here
     let audioChunks: Buffer[] = [];
-    let streamBufferSize = 0;
     let isRecording = false;
-    let silenceCounter = 0;
     let currentVolume = loadVolume();
-    let lastSpeechTime = Date.now();
-    let accumulatedText = "";
-    let finalTranscription = "";
-    
-    // Send initial volume
+
     ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
         if (isBinary) {
           // STREAMING: Receive audio chunk from ESP32
-          const chunk = Buffer.from(data);
-          
           if (!isRecording) {
-            // Start of speech detected by ESP32
+            // ESP32 started streaming
             isRecording = true;
             audioChunks = [];
-            streamBufferSize = 0;
-            accumulatedText = "";
-            finalTranscription = "";
-            console.log("[STREAM] Recording started...");
+            console.log("[STREAM] Started receiving audio chunks");
             ws.send("LISTENING");
           }
 
           // Accumulate chunk
-          audioChunks.push(chunk);
-          streamBufferSize += chunk.length;
-          lastSpeechTime = Date.now();
-
-          // Process in intervals for real-time feedback
-          if (streamBufferSize >= STREAMING_BYTES) {
-            // Send processing indicator
-            ws.send("PROCESSING");
-            
-            // Transcribe accumulated audio so far (interim)
-            const interimText = await processStreamingSTT(audioChunks);
-            
-            if (interimText) {
-              console.log("[STREAM] Interim:", interimText);
-              accumulatedText = interimText;
-              // Send interim result to ESP32 for display
-              ws.send(JSON.stringify({ 
-                type: "interim", 
-                text: interimText 
-              }));
-            }
-          }
+          audioChunks.push(Buffer.from(data));
           return;
         }
 
-        // Handle text commands from ESP32
+        // Handle text commands
         const msg = data.toString();
-        console.log("[WS] Command:", msg);
+        console.log("[WS] Received:", msg);
 
         if (msg === "ping") {
           ws.send("pong");
           return;
         }
 
-        // ESP32 detected end of speech (silence timeout)
+        // ESP32 detected end of speech
         if (msg === "END_SPEECH" && isRecording && !isProcessing) {
           isProcessing = true;
           isRecording = false;
           
-          console.log("[STREAM] End of speech, finalizing...");
-          ws.send("FINALIZING");
+          console.log("[STREAM] End of speech, transcribing...");
+          ws.send("PROCESSING");
 
           try {
-            // Final transcription with all accumulated audio
-            finalTranscription = await processStreamingSTT(audioChunks);
-            
-            if (finalTranscription.length === 0) {
-              console.log("[STREAM] No speech detected");
+            // Combine all chunks
+            const fullAudio = Buffer.concat(audioChunks);
+            audioChunks = []; // Clear buffer
+
+            if (fullAudio.length === 0) {
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
-            console.log("[STREAM] Final text:", finalTranscription);
+            // Transcribe accumulated audio
+            const userText = await transcribeAccumulatedAudio(fullAudio);
+            console.log("[STT] Transcribed:", userText);
+
+            if (userText.length === 0) {
+              ws.send("NO_SPEECH");
+              isProcessing = false;
+              return;
+            }
 
             // Check for dance command
-            const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(finalTranscription);
+            const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
 
             // LLM Processing
             const chat = await llmClient.chat.completions.create({
@@ -355,7 +324,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 - servo_tilt: 0=down, 90=up
 - dance: true if user wants to dance`
                 },
-                { role: "user", content: finalTranscription }
+                { role: "user", content: userText }
               ],
               model: "llama-3.1-8b-instant",
             });
@@ -388,7 +357,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
             // Save interaction
             await storage.createInteraction({ 
-              transcript: finalTranscription, 
+              transcript: userText, 
               response: spokenText 
             });
 
@@ -432,15 +401,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
-            audioChunks = [];
-            streamBufferSize = 0;
           }
+          return;
         }
 
-        // Legacy END_STREAM support (for backward compatibility)
+        // Legacy support for old END_STREAM (fallback)
         if (msg === "END_STREAM" && !isProcessing && !isRecording) {
-          // Handle legacy mode if needed
-          ws.send("ERROR_LEGACY_MODE_NOT_SUPPORTED");
+          ws.send("ERROR_USE_END_SPEECH");
         }
 
       } catch (e) {
