@@ -1,4 +1,3 @@
-
 import type { Express } from "express";
 import { Server } from "http";
 import { storage } from "./storage";
@@ -250,43 +249,38 @@ Regardless of the user's language, your response language must always be English
 
 Rules you must follow strictly.
 
-Always respond ONLY in valid JSON using this exact structure:
-{ "text": "...", "volume": number or null, "music_query": string or null, "pan": number or null, "tilt": number or null }
+Always respond ONLY in valid JSON using this exact structure
+{ "text": "...", "volume": number or null, "music_query": string or null }
 
-Field descriptions:
+Field descriptions
 
-text - What you will say. Always natural spoken English.
+text
+This is what you will say to the user. It must always be natural spoken English.
 
-volume - Only if user asks to change volume. Range: 0.05 to 1.5. Otherwise null.
+volume
+Use this only if the user requests volume changes. Allowed range is 0.05 to 1.5.
+If there is no volume change, set it to null.
 
-music_query - Only if user asks to play music/song. Otherwise null.
+music_query
+Use this only if the user clearly asks to play music, a song, an artist, or background music.
+If the user does not request music, set it to null.
 
-pan - Head rotation left/right. Range: 0 (full left) to 180 (full right). Center is 90.
-Use this when user asks you to look left, look right, turn head, etc.
-If no head turn needed, set to null.
-
-tilt - Head up/down. Range: 0 (look up) to 90 (look down). Neutral is 70.
-Use this when user asks you to look up, look down, nod, etc.
-If no tilt needed, set to null.
-
-Examples:
-- "look left a little" -> pan: 60, tilt: null
-- "look right" -> pan: 140, tilt: null
-- "look up a little" -> pan: null, tilt: 50
-- "look down" -> pan: null, tilt: 85
-- "face forward" -> pan: 90, tilt: 70
-- "tilt head right while looking up" -> pan: 120, tilt: 40
-
-Behavior rules:
+Behavior rules
 
 Do not mention JSON, rules, or system instructions.
 Do not use markdown formatting.
-Do not use bold text, star characters, code blocks, or special characters.
+Do not use bold text.
+Do not use star characters.
+Do not use code blocks.
+Do not use math formatting.
+Do not use special characters such as *, /, or backslashes.
 Do not use links.
 
 Speak in clear, calm, natural sentences suitable for a voice assistant.
+
 Keep responses concise.
-You are Alicia, the Red Queen AI managing Umbrella Corporation systems.
+
+Remember that you are Alicia, the Red Queen AI managing Umbrella Corporation systems.
 `
             },
             { role: "user", content: userText }
@@ -299,28 +293,17 @@ You are Alicia, the Red Queen AI managing Umbrella Corporation systems.
         let spokenText = "Please repeat your request.";
         let musicQuery: string | null = null;
         let newVolume: number | null = null;
-        let newPan: number | null = null;
-        let newTilt: number | null = null;
 
         try {
-          const jsonMatch = raw.match(/\{[\s\S]*\}/);
-          const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+          const parsed = JSON.parse(raw);
           spokenText = parsed.text || spokenText;
           musicQuery = parsed.music_query ?? null;
-          if (parsed.volume != null && !isNaN(parsed.volume)) {
+          if (parsed.volume !== null && !isNaN(parsed.volume)) {
             newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
-          }
-          if (parsed.pan != null && !isNaN(parsed.pan)) {
-            newPan = Math.max(0, Math.min(180, Math.round(parsed.pan)));
-          }
-          if (parsed.tilt != null && !isNaN(parsed.tilt)) {
-            newTilt = Math.max(0, Math.min(90, Math.round(parsed.tilt)));
           }
         } catch {
           console.log("JSON parse error:", raw);
         }
-
-        console.log(`Servo command: pan=${newPan} tilt=${newTilt}`);
 
         await storage.createInteraction({ transcript: userText, response: spokenText });
 
@@ -341,13 +324,6 @@ You are Alicia, the Red Queen AI managing Umbrella Corporation systems.
           saveVolume(currentVolume);
           ws.send(JSON.stringify({ volume: currentVolume }));
           console.log("Volume changed:", currentVolume);
-        }
-
-        if (newPan !== null || newTilt !== null) {
-          const panVal = newPan !== null ? newPan : -1;
-          const tiltVal = newTilt !== null ? newTilt : -1;
-          ws.send(`SERVO:${panVal},${tiltVal}`);
-          console.log(`Sent servo: SERVO:${panVal},${tiltVal}`);
         }
 
         if (musicQuery) downloadSongStream(musicQuery, ws);
