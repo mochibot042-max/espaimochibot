@@ -24,7 +24,9 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const SAMPLE_RATE = 16000;
+const TARGET_SAMPLE_RATE = 44100;
+const SILENCE_MS = 100;
+const CHUNK_SIZE = 2048;
 
 function loadVolume(): number {
   try {
@@ -40,8 +42,9 @@ function saveVolume(vol: number) {
   fs.writeFileSync(VOLUME_FILE, JSON.stringify({ volume: vol }));
 }
 
-function createWavHeader(pcmLength: number, sampleRate: number): Buffer {
-  const byteRate = sampleRate * 2;
+function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, channels = 1, bitsPerSample = 16): Buffer {
+  const byteRate = sampleRate * channels * (bitsPerSample / 8);
+  const blockAlign = channels * (bitsPerSample / 8);
   const header = Buffer.alloc(44);
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
@@ -49,11 +52,11 @@ function createWavHeader(pcmLength: number, sampleRate: number): Buffer {
   header.write("fmt ", 12);
   header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
+  header.writeUInt16LE(channels, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
   return header;
@@ -67,46 +70,42 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
       .audioFilters([
         "highpass=f=80",
         "lowpass=f=20000",
-        "aresample=44100:resampler=soxr:precision=28",
+        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
         "pan=mono|c0=c0",
         "volume=0.95"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(44100)
+      .audioFrequency(TARGET_SAMPLE_RATE)
       .format("s16le")
       .on("error", reject)
       .save(tmpRaw)
       .on("end", () => {
         const pcm = fs.readFileSync(tmpRaw);
+        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
+        const silence = Buffer.alloc(silenceBytes, 0);
+        const finalPCM = Buffer.concat([pcm, silence]);
         fs.unlinkSync(tmpRaw);
-        resolve(pcm);
+        resolve(finalPCM);
       });
   });
 }
 
-// CRITICAL: Adaptive streaming with larger chunks para sa 4G
-async function streamPCM(ws: WebSocket, pcm: Buffer, is4G: boolean = false) {
-  // 4G: Mas malaking chunks, mas matagal na delay
-  const CHUNK_SIZE = is4G ? 4096 : 2048;
-  const BASE_DELAY = is4G ? 15 : 5; // ms
-  
+async function streamPCM(ws: WebSocket, pcm: Buffer) {
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
-    
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
     ws.send(chunk, { binary: true });
-    
-    // Adaptive: Check buffer health
-    const delay = is4G ? BASE_DELAY : BASE_DELAY;
-    await new Promise(r => setTimeout(r, delay));
+    await new Promise(r => setTimeout(r, 5));
   }
 }
 
-async function downloadSongStream(query: string, ws: WebSocket, is4G: boolean = false) {
+async function downloadSongStream(query: string, ws: WebSocket) {
   let ffmpegProcess: any = null;
+  let isStreamActive = true;
   
   try {
+    console.log("[MUSIC] Searching:", query);
     const search = await axios.get(
       `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`,
       { timeout: 15000 }
@@ -118,6 +117,8 @@ async function downloadSongStream(query: string, ws: WebSocket, is4G: boolean = 
     }
     
     const video = search.data[0];
+    console.log("[MUSIC] Found:", video.title);
+
     const apiRes = await axios.get(
       `https://mostakim.onrender.com/m/sing?url=${video.url}`,
       { timeout: 15000 }
@@ -143,7 +144,7 @@ async function downloadSongStream(query: string, ws: WebSocket, is4G: boolean = 
       "-i", "pipe:0",
       "-f", "s16le",
       "-ac", "1",
-      "-ar", "44100",
+      "-ar", TARGET_SAMPLE_RATE.toString(),
       "-af", "volume=0.9",
       "pipe:1",
     ]);
@@ -152,26 +153,24 @@ async function downloadSongStream(query: string, ws: WebSocket, is4G: boolean = 
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
-    let isActive = true;
-    
-    // 4G: Mas malaking buffer threshold
-    const BUFFER_THRESHOLD = is4G ? 8192 : 2048;
-    const SEND_DELAY = is4G ? 10 : 3;
     
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
-      if (!isActive || ws.readyState !== ws.OPEN) return;
+      if (!isStreamActive || ws.readyState !== ws.OPEN) return;
       buffer = Buffer.concat([buffer, chunk]);
       
-      while (buffer.length >= BUFFER_THRESHOLD && isActive && ws.readyState === ws.OPEN) {
-        ws.send(buffer.slice(0, BUFFER_THRESHOLD), { binary: true });
-        buffer = buffer.slice(BUFFER_THRESHOLD);
-        await new Promise(r => setTimeout(r, SEND_DELAY));
+      while (buffer.length >= CHUNK_SIZE && isStreamActive && ws.readyState === ws.OPEN) {
+        const sendChunk = buffer.slice(0, CHUNK_SIZE);
+        buffer = buffer.slice(CHUNK_SIZE);
+        ws.send(sendChunk, { binary: true });
+        await new Promise(r => setTimeout(r, 3));
       }
     });
 
     ffmpegProcess.stdout.on("end", () => {
-      isActive = false;
-      if (buffer.length > 0 && ws.readyState === ws.OPEN) ws.send(buffer);
+      isStreamActive = false;
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+        ws.send(buffer);
+      }
       setTimeout(() => {
         if (ws.readyState === ws.OPEN) {
           ws.send("FINISH_MUSIC");
@@ -181,6 +180,10 @@ async function downloadSongStream(query: string, ws: WebSocket, is4G: boolean = 
           }
         }
       }, 500);
+    });
+
+    ffmpegProcess.on("close", () => {
+      isStreamActive = false;
     });
 
     (ws as any).musicProcess = ffmpegProcess;
@@ -196,116 +199,87 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
-    maxPayload: 2 * 1024 * 1024,
+    maxPayload: 50 * 1024 * 1024,
     perMessageDeflate: false
   });
 
-  wss.on("connection", (ws: WebSocket, req: any) => {
+  wss.on("connection", (ws: WebSocket) => {
     console.log("[WS] ESP32 connected");
-    
-    // CRITICAL: Detect 4G connection (slower initial data rate)
-    let is4GConnection = false;
-    let connectionStartTime = Date.now();
-    let bytesReceived = 0;
     
     let heartbeatInterval: NodeJS.Timeout;
     let isProcessing = false;
     (ws as any).danceMode = false;
-    
-    let audioAccumulator: Buffer[] = [];
-    let isReceivingAudio = false;
-    let currentVolume = loadVolume();
-
-    ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
-
-    // CRITICAL: Mas frequent heartbeat para sa 4G
-    (ws as any).isAlive = true;
-    heartbeatInterval = setInterval(() => {
-      if ((ws as any).isAlive === false) {
-        console.log("[WS] Dead connection");
-        if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
-        return ws.terminate();
-      }
-      (ws as any).isAlive = false;
-      ws.ping();
-    }, 10000); // 10 seconds para sa 4G
 
     ws.on("pong", () => {
       (ws as any).isAlive = true;
     });
 
+    // RECORD MODE: Accumulate full audio here
+    let audioChunks: Buffer[] = [];
+    let isRecording = false;
+    let isReceivingAudio = false;
+    let currentVolume = loadVolume();
+
+    ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
+
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
         if (isBinary) {
+          // Accumulate binary audio data
           if (!isReceivingAudio) {
             isReceivingAudio = true;
-            audioAccumulator = [];
-            console.log("[AUDIO] Receiving...");
+            console.log("[REC] Started receiving audio...");
           }
           
-          // Track bytes for 4G detection
-          bytesReceived += data.length;
-          const elapsed = Date.now() - connectionStartTime;
-          if (elapsed > 2000 && bytesReceived > 0) {
-            const rate = bytesReceived / (elapsed / 1000); // bytes/sec
-            // Less than 50KB/s indicates 4G
-            if (rate < 50000) {
-              is4GConnection = true;
-            }
-          }
-          
-          audioAccumulator.push(Buffer.from(data));
+          audioChunks.push(Buffer.from(data));
           return;
         }
 
+        // Handle text commands
         const msg = data.toString();
-        console.log("[WS] Text:", msg);
+        console.log("[WS] Command:", msg);
 
         if (msg === "ping") {
           ws.send("pong");
           return;
         }
 
+        // END_SPEECH: Process accumulated full recording
         if (msg === "END_SPEECH" && isReceivingAudio && !isProcessing) {
           isProcessing = true;
           isReceivingAudio = false;
           
+          console.log("[REC] Finalizing transcription...");
           ws.send("PROCESSING");
-          
-          try {
-            const completeAudio = Buffer.concat(audioAccumulator);
-            audioAccumulator = [];
-            
-            console.log(`[AUDIO] Complete: ${completeAudio.length} bytes, 4G: ${is4GConnection}`);
 
-            if (completeAudio.length === 0) {
+          try {
+            // Combine all chunks into one buffer
+            const fullAudio = Buffer.concat(audioChunks);
+            audioChunks = []; // Clear for next time
+
+            if (fullAudio.length === 0) {
               ws.send("ERROR_NO_AUDIO");
               isProcessing = false;
               return;
             }
 
-            let audioData = completeAudio;
-            if (audioData.length % 2 !== 0) {
-              audioData = audioData.slice(0, -1);
-            }
+            console.log(`[REC] Total audio received: ${fullAudio.length} bytes`);
 
+            // Create WAV file for Groq
             const tempId = `rec_${Date.now()}`;
             const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             
-            const wavBuffer = Buffer.concat([
-              createWavHeader(audioData.length, SAMPLE_RATE),
-              audioData
-            ]);
+            // Ensure 16-bit alignment
+            let wavData = fullAudio;
+            if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
             
-            fs.writeFileSync(inputPath, wavBuffer);
+            fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length), wavData]));
 
+            // Transcribe with Groq
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(inputPath),
               model: "whisper-large-v3-turbo",
               language: "en",
-              prompt: "Mochi, how are you today, hello, hi, what, when, where, who, why",
-              temperature: 0.0,
-              response_format: "json"
             });
 
             fs.unlinkSync(inputPath);
@@ -319,19 +293,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               return;
             }
 
+            // Check for dance command
             const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
 
+            // LLM Processing
             const chat = await llmClient.chat.completions.create({
               messages: [
                 {
                   role: "system",
                   content: `You are Mochi, a voice AI assistant made by April Manalo. Reply in JSON:
-{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }`
+{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }
+
+- servo_pan: 0=left, 90=center, 180=right
+- servo_tilt: 0=down, 90=up
+- dance: true if user wants to dance`
                 },
                 { role: "user", content: userText }
               ],
               model: "llama-3.1-8b-instant",
-              temperature: 0.7
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -357,14 +336,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }
             } catch (e) {
               console.log("[LLM] Parse error:", raw);
-              spokenText = raw.replace(/[{}"]/g, '').substring(0, 200);
+              spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand.";
             }
 
+            // Save interaction
             await storage.createInteraction({ 
               transcript: userText, 
               response: spokenText 
             });
 
+            // Send servo commands
             if (servoPan !== null || servoTilt !== null) {
               ws.send(JSON.stringify({ 
                 type: "servo", 
@@ -373,11 +354,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
-            // CRITICAL: Send 4G hint to ESP32
-            if (is4GConnection) {
-              ws.send(JSON.stringify({ type: "network", speed: "4G" }));
-            }
-
+            // TTS Generation
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
             await edge.ttsPromise(spokenText, tmpMp3, { 
@@ -386,57 +363,64 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
             const pcm = await generatePCM(tmpMp3);
             
+            // Send TTS to ESP32
             ws.send("START_RESPONSE");
-            
-            // CRITICAL: Adaptive streaming based on detected network
-            await streamPCM(ws, pcm, is4GConnection);
-            
+            await streamPCM(ws, pcm);
             ws.send("FINISH_RESPONSE");
 
             fs.unlinkSync(tmpMp3);
 
+            // Update volume if requested
             if (newVolume !== null) {
-              saveVolume(newVolume);
-              ws.send(JSON.stringify({ type: "volume", volume: newVolume }));
+              currentVolume = newVolume;
+              saveVolume(currentVolume);
+              ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
 
+            // Handle music request
             if (musicQuery) {
-              downloadSongStream(musicQuery, ws, is4GConnection);
+              downloadSongStream(musicQuery, ws);
             }
 
           } catch (err) {
-            console.error("[PROCESS] Error:", err);
-            if (ws.readyState === ws.OPEN) ws.send("ERROR_PROCESSING");
+            console.error("[REC] Error:", err);
+            if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
           }
           return;
         }
 
-        if (msg.includes("dance") || msg.includes('"type":"dance"')) {
-          if (msg.includes("start")) {
-            (ws as any).danceMode = true;
-            ws.send(JSON.stringify({ type: "dance", action: "start" }));
-          } else if (msg.includes("stop")) {
-            (ws as any).danceMode = false;
-            ws.send(JSON.stringify({ type: "dance", action: "stop" }));
-          }
-        }
-
       } catch (e) {
-        console.error("[MSG] Error:", e);
+        console.error("[MSG] Handler error:", e);
         isProcessing = false;
         isReceivingAudio = false;
       }
     });
 
+    // Heartbeat
+    (ws as any).isAlive = true;
+    heartbeatInterval = setInterval(() => {
+      if ((ws as any).isAlive === false) {
+        console.log("[WS] Dead connection, terminating");
+        if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
+        return ws.terminate();
+      }
+      (ws as any).isAlive = false;
+      ws.ping();
+    }, 60000);
+
     ws.on("error", (error) => {
       console.error("[WS] Error:", error);
+      isProcessing = false;
+      isReceivingAudio = false;
     });
 
     ws.on("close", () => {
       console.log("[WS] Disconnected");
       clearInterval(heartbeatInterval);
+      isProcessing = false;
+      isReceivingAudio = false;
       if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
     });
   });
