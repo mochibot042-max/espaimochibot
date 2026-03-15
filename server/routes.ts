@@ -24,7 +24,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100;
+const TARGET_SAMPLE_RATE = 44100;  // STABLE: 44.1kHz to match ESP32
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
@@ -42,10 +42,12 @@ function saveVolume(vol: number) {
   fs.writeFileSync(VOLUME_FILE, JSON.stringify({ volume: vol }));
 }
 
+// STABLE: WAV header for 44.1kHz 16-bit mono PCM
 function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, channels = 1, bitsPerSample = 16): Buffer {
   const byteRate = sampleRate * channels * (bitsPerSample / 8);
   const blockAlign = channels * (bitsPerSample / 8);
   const header = Buffer.alloc(44);
+  
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
   header.write("WAVE", 8);
@@ -59,9 +61,11 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   header.writeUInt16LE(bitsPerSample, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
+  
   return header;
 }
 
+// STABLE: Generate PCM at 44.1kHz to match ESP32
 async function generatePCM(inputPath: string): Promise<Buffer> {
   const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
   return new Promise((resolve, reject) => {
@@ -214,7 +218,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       (ws as any).isAlive = true;
     });
 
-    // STREAMING STATE: Accumulate audio chunks here
+    // STABLE: Streaming state
     let audioChunks: Buffer[] = [];
     let isRecording = false;
     let currentVolume = loadVolume();
@@ -224,7 +228,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
         if (isBinary) {
-          // STREAMING: Accumulate audio chunk
+          // STABLE: Accumulate audio chunk
           if (!isRecording) {
             isRecording = true;
             audioChunks = [];
@@ -244,7 +248,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // END_SPEECH: Process accumulated audio
+        // STABLE: END_SPEECH processing
         if (msg === "END_SPEECH" && isRecording && !isProcessing) {
           isProcessing = true;
           isRecording = false;
@@ -253,9 +257,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ws.send("PROCESSING");
 
           try {
-            // Combine all chunks into one buffer
+            // Combine all chunks
             const fullAudio = Buffer.concat(audioChunks);
-            audioChunks = []; // Clear for next time
+            audioChunks = [];
 
             if (fullAudio.length === 0) {
               ws.send("ERROR_NO_AUDIO");
@@ -263,7 +267,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               return;
             }
 
-            // Create WAV file for Groq
+            console.log(`[STT] Total audio: ${fullAudio.length} bytes`);
+
+            // STABLE: Create WAV at 44.1kHz
             const tempId = `stream_${Date.now()}`;
             const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             
@@ -271,17 +277,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             let wavData = fullAudio;
             if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
             
-            fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length), wavData]));
+            // STABLE: Create WAV with 44.1kHz header
+            fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length, TARGET_SAMPLE_RATE), wavData]));
 
-            // Transcribe with Groq
+            console.log("[STT] Sending to Whisper...");
+            const startTime = Date.now();
+            
+            // STABLE: Use whisper-large-v3-turbo with 44.1kHz audio
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(inputPath),
               model: "whisper-large-v3-turbo",
               language: "en",
+              response_format: "text",
+              temperature: 0.0,
             });
 
-            fs.unlinkSync(inputPath);
-            
+            const duration = Date.now() - startTime;
+            console.log(`[STT] Done in ${duration}ms`);
+
+            // Cleanup
+            try { fs.unlinkSync(inputPath); } catch(e) {}
+
             const userText = transcription.text?.trim() || "";
             console.log("[STT] Result:", userText);
 
@@ -309,6 +325,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                 { role: "user", content: userText }
               ],
               model: "llama-3.1-8b-instant",
+              temperature: 0.7,
+              max_tokens: 100
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -322,19 +340,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             let danceMode = false;
 
             try {
-              const parsed = JSON.parse(raw);
-              spokenText = parsed.text || spokenText;
+              const jsonMatch = raw.match(/\{[\s\S]*\}/);
+              const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(raw);
+              
+              spokenText = parsed.text || raw.substring(0, 200);
               musicQuery = parsed.music_query ?? null;
               servoPan = parsed.servo_pan ?? null;
               servoTilt = parsed.servo_tilt ?? null;
               danceMode = parsed.dance || isDanceCommand;
               
               if (parsed.volume !== null && !isNaN(parsed.volume)) {
-                newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
+                newVolume = Math.max(0.05, Math.min(2.0, parsed.volume));
               }
             } catch (e) {
-              console.log("[LLM] Parse error:", raw);
               spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand.";
+              if (isDanceCommand) danceMode = true;
             }
 
             // Save interaction
@@ -352,36 +372,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
-            // TTS Generation - THIS MUST WORK!
-            const edge = new EdgeTTS();
-            const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
-            await edge.ttsPromise(spokenText, tmpMp3, { 
-              voice: "en-US-JennyNeural" 
-            });
+            if (danceMode && !musicQuery) {
+              ws.send(JSON.stringify({ type: "dance", action: "start" }));
+            }
 
-            const pcm = await generatePCM(tmpMp3);
-            
-            // Send TTS to ESP32
-            ws.send("START_RESPONSE");
-            await streamPCM(ws, pcm);
-            ws.send("FINISH_RESPONSE");
-
-            fs.unlinkSync(tmpMp3);
-
-            // Update volume if requested
             if (newVolume !== null) {
               currentVolume = newVolume;
               saveVolume(currentVolume);
               ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
 
+            // TTS Generation
+            console.log("[TTS] Generating...");
+            const edge = new EdgeTTS();
+            const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+            
+            await edge.ttsPromise(spokenText, tmpMp3, { 
+              voice: "en-US-JennyNeural",
+              rate: "0%",
+              pitch: "0Hz"
+            });
+
+            const pcm = await generatePCM(tmpMp3);
+            
+            ws.send("START_RESPONSE");
+            await streamPCM(ws, pcm);
+            ws.send("FINISH_RESPONSE");
+
+            try { fs.unlinkSync(tmpMp3); } catch(e) {}
+
             // Handle music request
             if (musicQuery) {
               downloadSongStream(musicQuery, ws);
             }
 
-          } catch (err) {
-            console.error("[STREAM] Error:", err);
+          } catch (err: any) {
+            console.error("[STREAM] Error:", err.message);
+            console.error("[STREAM] Stack:", err.stack);
             if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
@@ -394,7 +421,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ws.send("ERROR_USE_END_SPEECH");
         }
 
-      } catch (e) {
+      } catch (e: any) {
         console.error("[MSG] Handler error:", e);
         isProcessing = false;
         isRecording = false;
@@ -411,7 +438,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       (ws as any).isAlive = false;
       ws.ping();
-    }, 60000);
+    }, 30000);
 
     ws.on("error", (error) => {
       console.error("[WS] Error:", error);
