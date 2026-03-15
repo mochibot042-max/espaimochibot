@@ -96,7 +96,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     if (ws.readyState !== ws.OPEN) return;
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
     ws.send(chunk, { binary: true });
-    await new Promise(r => setTimeout(r, 5));
+    await new Promise(r => setTimeout(r, 3)); // Faster streaming
   }
 }
 
@@ -129,9 +129,8 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       return;
     }
 
-    if ((ws as any).danceMode) {
-      ws.send(JSON.stringify({ type: "dance", action: "start" }));
-    }
+    // Send dance start command
+    ws.send(JSON.stringify({ type: "dance", action: "start" }));
 
     const audioStream = await axios({
       url: apiRes.data.url,
@@ -162,7 +161,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         const sendChunk = buffer.slice(0, CHUNK_SIZE);
         buffer = buffer.slice(CHUNK_SIZE);
         ws.send(sendChunk, { binary: true });
-        await new Promise(r => setTimeout(r, 3));
+        await new Promise(r => setTimeout(r, 2)); // Faster for music
       }
     });
 
@@ -174,10 +173,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       setTimeout(() => {
         if (ws.readyState === ws.OPEN) {
           ws.send("FINISH_MUSIC");
-          if ((ws as any).danceMode) {
-            ws.send(JSON.stringify({ type: "dance", action: "stop" }));
-            (ws as any).danceMode = false;
-          }
+          ws.send(JSON.stringify({ type: "dance", action: "stop" }));
         }
       }, 500);
     });
@@ -208,13 +204,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     
     let heartbeatInterval: NodeJS.Timeout;
     let isProcessing = false;
-    (ws as any).danceMode = false;
 
     ws.on("pong", () => {
       (ws as any).isAlive = true;
     });
 
-    // STREAMING STATE: Accumulate audio chunks here
+    // STREAMING STATE
     let audioChunks: Buffer[] = [];
     let isRecording = false;
     let currentVolume = loadVolume();
@@ -253,12 +248,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ws.send("PROCESSING");
 
           try {
-            // Combine all chunks into one buffer
+            // Combine all chunks
             const fullAudio = Buffer.concat(audioChunks);
-            audioChunks = []; // Clear for next time
+            audioChunks = [];
 
             if (fullAudio.length === 0) {
-              ws.send("ERROR_NO_AUDIO");
+              ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
@@ -267,17 +262,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             const tempId = `stream_${Date.now()}`;
             const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             
-            // Ensure 16-bit alignment
             let wavData = fullAudio;
             if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
             
             fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length), wavData]));
 
-            // Transcribe with Groq
+            // IMPROVED: Use better model for accuracy
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(inputPath),
               model: "whisper-large-v3-turbo",
               language: "en",
+              prompt: "This is a voice command for a robot assistant.", // Helps with accuracy
             });
 
             fs.unlinkSync(inputPath);
@@ -304,11 +299,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
 - servo_pan: 0=left, 90=center, 180=right
 - servo_tilt: 0=down, 90=up
-- dance: true if user wants to dance`
+- dance: true if user wants to dance or play music`
                 },
                 { role: "user", content: userText }
               ],
               model: "llama-3.1-8b-instant",
+              temperature: 0.7,
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -330,7 +326,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               danceMode = parsed.dance || isDanceCommand;
               
               if (parsed.volume !== null && !isNaN(parsed.volume)) {
-                newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
+                newVolume = Math.max(0.05, Math.min(2.0, parsed.volume));
               }
             } catch (e) {
               console.log("[LLM] Parse error:", raw);
@@ -343,7 +339,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               response: spokenText 
             });
 
-            // Send servo commands
+            // Send commands to ESP32
             if (servoPan !== null || servoTilt !== null) {
               ws.send(JSON.stringify({ 
                 type: "servo", 
@@ -352,28 +348,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
-            // TTS Generation - THIS MUST WORK!
-            const edge = new EdgeTTS();
-            const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
-            await edge.ttsPromise(spokenText, tmpMp3, { 
-              voice: "en-US-JennyNeural" 
-            });
+            if (danceMode && !musicQuery) {
+              ws.send(JSON.stringify({ type: "dance", action: "start" }));
+            }
 
-            const pcm = await generatePCM(tmpMp3);
-            
-            // Send TTS to ESP32
-            ws.send("START_RESPONSE");
-            await streamPCM(ws, pcm);
-            ws.send("FINISH_RESPONSE");
-
-            fs.unlinkSync(tmpMp3);
-
-            // Update volume if requested
             if (newVolume !== null) {
               currentVolume = newVolume;
               saveVolume(currentVolume);
               ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
+
+            // TTS Generation
+            const edge = new EdgeTTS();
+            const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+            await edge.ttsPromise(spokenText, tmpMp3, { 
+              voice: "en-US-JennyNeural",
+              rate: "0%", // Normal speed
+              pitch: "0Hz" // Normal pitch
+            });
+
+            const pcm = await generatePCM(tmpMp3);
+            
+            // Send TTS
+            ws.send("START_RESPONSE");
+            await streamPCM(ws, pcm);
+            ws.send("FINISH_RESPONSE");
+
+            fs.unlinkSync(tmpMp3);
 
             // Handle music request
             if (musicQuery) {
@@ -389,11 +390,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // Legacy support
-        if (msg === "END_STREAM") {
-          ws.send("ERROR_USE_END_SPEECH");
-        }
-
       } catch (e) {
         console.error("[MSG] Handler error:", e);
         isProcessing = false;
@@ -401,7 +397,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     });
 
-    // Heartbeat
+    // Heartbeat - more frequent for hotspot stability
     (ws as any).isAlive = true;
     heartbeatInterval = setInterval(() => {
       if ((ws as any).isAlive === false) {
@@ -411,7 +407,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       (ws as any).isAlive = false;
       ws.ping();
-    }, 60000);
+    }, 30000); // 30 seconds
 
     ws.on("error", (error) => {
       console.error("[WS] Error:", error);
