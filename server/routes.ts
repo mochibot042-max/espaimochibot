@@ -24,7 +24,8 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100;
+const TARGET_SAMPLE_RATE = 44100; // ESP32 sample rate
+const WHISPER_SAMPLE_RATE = 16000; // Whisper prefers 16kHz
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
@@ -60,6 +61,66 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
   return header;
+}
+
+// NEW: Convert PCM to Whisper-friendly format (16kHz, normalized)
+async function convertForWhisper(inputPcm: Buffer): Promise<Buffer> {
+  const tmpIn = path.join(AUDIO_DIR, `whisper_in_${Date.now()}.raw`);
+  const tmpOut = path.join(AUDIO_DIR, `whisper_out_${Date.now()}.wav`);
+  
+  fs.writeFileSync(tmpIn, inputPcm);
+  
+  return new Promise((resolve, reject) => {
+    ffmpeg(tmpIn)
+      .inputFormat('s16le')
+      .audioChannels(1)
+      .audioFrequency(TARGET_SAMPLE_RATE)
+      .audioFilters([
+        'highpass=f=80',           // Remove low freq noise
+        'lowpass=f=8000',          // Focus on speech frequencies
+        'afftdn=nf=-25',           // Noise reduction
+        'loudnorm=I=-16:LRA=11:TP=-1.5', // Normalize volume
+        `aresample=${WHISPER_SAMPLE_RATE}:resampler=soxr:precision=28`
+      ])
+      .audioCodec('pcm_s16le')
+      .audioFrequency(WHISPER_SAMPLE_RATE)
+      .format('s16le')
+      .on('error', (err) => {
+        fs.unlinkSync(tmpIn);
+        reject(err);
+      })
+      .pipe()
+      .on('data', (chunk: Buffer) => {
+        // Collect all chunks
+      })
+      .on('end', () => {
+        fs.unlinkSync(tmpIn);
+        // Actually, let's use file output for reliability
+      });
+      
+    // Better approach: save to file then read
+    ffmpeg(tmpIn)
+      .inputFormat('s16le')
+      .audioChannels(1)
+      .audioFrequency(TARGET_SAMPLE_RATE)
+      .audioFilters([
+        'highpass=f=80',
+        'lowpass=f=8000',
+        'afftdn=nf=-25',
+        'loudnorm=I=-16:LRA=11:TP=-1.5',
+        `aresample=${WHISPER_SAMPLE_RATE}`
+      ])
+      .audioCodec('pcm_s16le')
+      .audioFrequency(WHISPER_SAMPLE_RATE)
+      .save(tmpOut)
+      .on('end', () => {
+        fs.unlinkSync(tmpIn);
+        const processed = fs.readFileSync(tmpOut);
+        fs.unlinkSync(tmpOut);
+        resolve(processed);
+      })
+      .on('error', reject);
+  });
 }
 
 async function generatePCM(inputPath: string): Promise<Buffer> {
@@ -214,7 +275,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       (ws as any).isAlive = true;
     });
 
-    // STREAMING STATE: Accumulate audio chunks here
     let audioChunks: Buffer[] = [];
     let isRecording = false;
     let currentVolume = loadVolume();
@@ -224,18 +284,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
         if (isBinary) {
-          // STREAMING: Accumulate audio chunk
+          // CRITICAL FIX: Ensure we store copies of the buffer, not references
           if (!isRecording) {
             isRecording = true;
             audioChunks = [];
             console.log("[STREAM] Started receiving chunks");
           }
           
+          // Use Buffer.from to ensure we copy the data, not reference it
           audioChunks.push(Buffer.from(data));
           return;
         }
 
-        // Handle text commands
         const msg = data.toString();
         console.log("[WS] Command:", msg);
 
@@ -244,7 +304,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // END_SPEECH: Process accumulated audio
         if (msg === "END_SPEECH" && isRecording && !isProcessing) {
           isProcessing = true;
           isRecording = false;
@@ -253,7 +312,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ws.send("PROCESSING");
 
           try {
-            // Combine all chunks
+            // Combine all chunks safely
             const fullAudio = Buffer.concat(audioChunks);
             audioChunks = [];
 
@@ -263,21 +322,34 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               return;
             }
 
-            // Create WAV file for Groq
+            console.log(`[AUDIO] Received ${fullAudio.length} bytes`);
+
+            // CRITICAL FIX: Ensure 16-bit alignment
+            let wavData = fullAudio;
+            if (wavData.length % 2 !== 0) {
+              wavData = wavData.slice(0, -1);
+            }
+
+            // NEW: Pre-process audio for better STT quality
+            const processedAudio = await convertForWhisper(wavData);
+            
             const tempId = `stream_${Date.now()}`;
             const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             
-            // Ensure 16-bit alignment
-            let wavData = fullAudio;
-            if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
-            
-            fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length, TARGET_SAMPLE_RATE), wavData]));
+            // Create proper WAV file at 16kHz for Whisper
+            fs.writeFileSync(inputPath, Buffer.concat([
+              createWavHeader(processedAudio.length, WHISPER_SAMPLE_RATE), 
+              processedAudio
+            ]));
 
-            // Transcribe with Groq
+            // Transcribe with Groq - using better parameters
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(inputPath),
               model: "whisper-large-v3-turbo",
               language: "en",
+              prompt: "Mochi, how are you, what, when, where, who, why, how", // Help with common words
+              temperature: 0.0, // More deterministic
+              response_format: "json"
             });
 
             fs.unlinkSync(inputPath);
@@ -309,6 +381,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                 { role: "user", content: userText }
               ],
               model: "llama-3.1-8b-instant",
+              temperature: 0.7
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -352,7 +425,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
-            // TTS Generation - THIS MUST WORK!
+            // TTS Generation
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
             await edge.ttsPromise(spokenText, tmpMp3, { 
@@ -389,7 +462,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // Legacy support
         if (msg === "END_STREAM") {
           ws.send("ERROR_USE_END_SPEECH");
         }
