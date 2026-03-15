@@ -24,7 +24,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const SAMPLE_RATE = 16000;  // Match ESP32
+const SAMPLE_RATE = 16000;
 
 function loadVolume(): number {
   try {
@@ -41,7 +41,7 @@ function saveVolume(vol: number) {
 }
 
 function createWavHeader(pcmLength: number, sampleRate: number): Buffer {
-  const byteRate = sampleRate * 2;  // 16-bit mono
+  const byteRate = sampleRate * 2;
   const header = Buffer.alloc(44);
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
@@ -49,11 +49,11 @@ function createWavHeader(pcmLength: number, sampleRate: number): Buffer {
   header.write("fmt ", 12);
   header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);  // mono
+  header.writeUInt16LE(1, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(2, 32);  // block align
-  header.writeUInt16LE(16, 34); // bits per sample
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
   return header;
@@ -85,16 +85,25 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
   });
 }
 
-async function streamPCM(ws: WebSocket, pcm: Buffer) {
-  const CHUNK = 2048;
-  for (let i = 0; i < pcm.length; i += CHUNK) {
+// CRITICAL: Adaptive streaming with larger chunks para sa 4G
+async function streamPCM(ws: WebSocket, pcm: Buffer, is4G: boolean = false) {
+  // 4G: Mas malaking chunks, mas matagal na delay
+  const CHUNK_SIZE = is4G ? 4096 : 2048;
+  const BASE_DELAY = is4G ? 15 : 5; // ms
+  
+  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
-    ws.send(pcm.slice(i, i + CHUNK), { binary: true });
-    await new Promise(r => setTimeout(r, 5));
+    
+    const chunk = pcm.slice(i, i + CHUNK_SIZE);
+    ws.send(chunk, { binary: true });
+    
+    // Adaptive: Check buffer health
+    const delay = is4G ? BASE_DELAY : BASE_DELAY;
+    await new Promise(r => setTimeout(r, delay));
   }
 }
 
-async function downloadSongStream(query: string, ws: WebSocket) {
+async function downloadSongStream(query: string, ws: WebSocket, is4G: boolean = false) {
   let ffmpegProcess: any = null;
   
   try {
@@ -145,13 +154,18 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     let buffer = Buffer.alloc(0);
     let isActive = true;
     
+    // 4G: Mas malaking buffer threshold
+    const BUFFER_THRESHOLD = is4G ? 8192 : 2048;
+    const SEND_DELAY = is4G ? 10 : 3;
+    
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       buffer = Buffer.concat([buffer, chunk]);
-      while (buffer.length >= 2048 && isActive && ws.readyState === ws.OPEN) {
-        ws.send(buffer.slice(0, 2048), { binary: true });
-        buffer = buffer.slice(2048);
-        await new Promise(r => setTimeout(r, 3));
+      
+      while (buffer.length >= BUFFER_THRESHOLD && isActive && ws.readyState === ws.OPEN) {
+        ws.send(buffer.slice(0, BUFFER_THRESHOLD), { binary: true });
+        buffer = buffer.slice(BUFFER_THRESHOLD);
+        await new Promise(r => setTimeout(r, SEND_DELAY));
       }
     });
 
@@ -182,25 +196,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
-    maxPayload: 2 * 1024 * 1024,  // 2MB max para sa buong recording
+    maxPayload: 2 * 1024 * 1024,
     perMessageDeflate: false
   });
 
-  wss.on("connection", (ws: WebSocket) => {
+  wss.on("connection", (ws: WebSocket, req: any) => {
     console.log("[WS] ESP32 connected");
+    
+    // CRITICAL: Detect 4G connection (slower initial data rate)
+    let is4GConnection = false;
+    let connectionStartTime = Date.now();
+    let bytesReceived = 0;
     
     let heartbeatInterval: NodeJS.Timeout;
     let isProcessing = false;
     (ws as any).danceMode = false;
     
-    // CRITICAL: Accumulate complete recording here
     let audioAccumulator: Buffer[] = [];
     let isReceivingAudio = false;
     let currentVolume = loadVolume();
 
     ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
 
-    // Heartbeat every 15 seconds
+    // CRITICAL: Mas frequent heartbeat para sa 4G
     (ws as any).isAlive = true;
     heartbeatInterval = setInterval(() => {
       if ((ws as any).isAlive === false) {
@@ -210,7 +228,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       (ws as any).isAlive = false;
       ws.ping();
-    }, 15000);
+    }, 10000); // 10 seconds para sa 4G
 
     ws.on("pong", () => {
       (ws as any).isAlive = true;
@@ -218,20 +236,28 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
-        // CRITICAL: Binary data = part of complete recording
         if (isBinary) {
           if (!isReceivingAudio) {
             isReceivingAudio = true;
             audioAccumulator = [];
-            console.log("[AUDIO] Receiving complete recording...");
+            console.log("[AUDIO] Receiving...");
           }
           
-          // Accumulate
+          // Track bytes for 4G detection
+          bytesReceived += data.length;
+          const elapsed = Date.now() - connectionStartTime;
+          if (elapsed > 2000 && bytesReceived > 0) {
+            const rate = bytesReceived / (elapsed / 1000); // bytes/sec
+            // Less than 50KB/s indicates 4G
+            if (rate < 50000) {
+              is4GConnection = true;
+            }
+          }
+          
           audioAccumulator.push(Buffer.from(data));
           return;
         }
 
-        // Text commands
         const msg = data.toString();
         console.log("[WS] Text:", msg);
 
@@ -240,7 +266,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // CRITICAL: END_SPEECH = process the complete accumulated audio
         if (msg === "END_SPEECH" && isReceivingAudio && !isProcessing) {
           isProcessing = true;
           isReceivingAudio = false;
@@ -248,25 +273,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ws.send("PROCESSING");
           
           try {
-            // Combine ALL audio into single buffer
             const completeAudio = Buffer.concat(audioAccumulator);
             audioAccumulator = [];
             
-            console.log(`[AUDIO] Complete recording: ${completeAudio.length} bytes`);
-            
+            console.log(`[AUDIO] Complete: ${completeAudio.length} bytes, 4G: ${is4GConnection}`);
+
             if (completeAudio.length === 0) {
               ws.send("ERROR_NO_AUDIO");
               isProcessing = false;
               return;
             }
 
-            // Ensure 16-bit alignment
             let audioData = completeAudio;
             if (audioData.length % 2 !== 0) {
               audioData = audioData.slice(0, -1);
             }
 
-            // Create WAV file
             const tempId = `rec_${Date.now()}`;
             const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             
@@ -276,9 +298,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             ]);
             
             fs.writeFileSync(inputPath, wavBuffer);
-            console.log(`[WAV] Saved ${wavBuffer.length} bytes to ${tempId}.wav`);
 
-            // Transcribe with Whisper
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(inputPath),
               model: "whisper-large-v3-turbo",
@@ -301,7 +321,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
             const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
 
-            // LLM
             const chat = await llmClient.chat.completions.create({
               messages: [
                 {
@@ -354,7 +373,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
-            // TTS
+            // CRITICAL: Send 4G hint to ESP32
+            if (is4GConnection) {
+              ws.send(JSON.stringify({ type: "network", speed: "4G" }));
+            }
+
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
             await edge.ttsPromise(spokenText, tmpMp3, { 
@@ -364,7 +387,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             const pcm = await generatePCM(tmpMp3);
             
             ws.send("START_RESPONSE");
-            await streamPCM(ws, pcm);
+            
+            // CRITICAL: Adaptive streaming based on detected network
+            await streamPCM(ws, pcm, is4GConnection);
+            
             ws.send("FINISH_RESPONSE");
 
             fs.unlinkSync(tmpMp3);
@@ -375,7 +401,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             }
 
             if (musicQuery) {
-              downloadSongStream(musicQuery, ws);
+              downloadSongStream(musicQuery, ws, is4GConnection);
             }
 
           } catch (err) {
@@ -387,7 +413,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // Handle other commands
         if (msg.includes("dance") || msg.includes('"type":"dance"')) {
           if (msg.includes("start")) {
             (ws as any).danceMode = true;
