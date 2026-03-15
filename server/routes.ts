@@ -24,7 +24,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 16000;  // CHANGED: Lower sample rate for better STT (Whisper prefers 16kHz)
+const TARGET_SAMPLE_RATE = 16000;
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
@@ -62,26 +62,32 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   return header;
 }
 
-// IMPROVED: Better audio preprocessing for STT
+// FIX: Simplified and more robust audio preprocessing
 async function preprocessForSTT(inputPath: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .noVideo()
       .audioFilters([
-        "highpass=f=80",           // Remove low freq noise
-        "lowpass=f=8000",          // Remove high freq noise
-        "afftdn=nf=-25",           // Noise reduction
-        "acompressor=threshold=-20dB:ratio=4:attack=5:release=100", // Compress dynamics
-        "volume=2.0",              // Boost volume
-        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`, // Resample to 16kHz
-        "pan=mono|c0=c0"           // Force mono
+        "aresample=16000",           // Simple resample to 16kHz
+        "pan=mono|c0=c0",            // Force mono
+        "volume=2.0"                 // Boost volume
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
+      .audioFrequency(16000)
       .format("s16le")
-      .on("error", reject)
-      .on("end", resolve)
+      .on("start", (cmd) => {
+        console.log("[FFMPEG] Preprocess:", cmd);
+      })
+      .on("error", (err, stdout, stderr) => {
+        console.error("[FFMPEG] Preprocess error:", err.message);
+        console.error("[FFMPEG] stderr:", stderr);
+        reject(err);
+      })
+      .on("end", () => {
+        console.log("[FFMPEG] Preprocess complete");
+        resolve();
+      })
       .save(outputPath);
   });
 }
@@ -94,19 +100,19 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
       .audioFilters([
         "highpass=f=80",
         "lowpass=f=20000",
-        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
+        "aresample=44100",
         "pan=mono|c0=c0",
         "volume=0.95"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
+      .audioFrequency(44100)
       .format("s16le")
       .on("error", reject)
       .save(tmpRaw)
       .on("end", () => {
         const pcm = fs.readFileSync(tmpRaw);
-        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
+        const silenceBytes = Math.floor((SILENCE_MS / 1000) * 44100 * 2);
         const silence = Buffer.alloc(silenceBytes, 0);
         const finalPCM = Buffer.concat([pcm, silence]);
         fs.unlinkSync(tmpRaw);
@@ -166,7 +172,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-i", "pipe:0",
       "-f", "s16le",
       "-ac", "1",
-      "-ar", "44100",  // Music stays at 44.1kHz
+      "-ar", "44100",
       "-af", "volume=0.9",
       "pipe:1",
     ]);
@@ -271,71 +277,81 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             audioChunks = [];
 
             if (fullAudio.length === 0) {
+              console.log("[STT] No audio received");
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
-            // IMPROVED: Create temp files for processing
+            console.log(`[STT] Audio size: ${fullAudio.length} bytes`);
+
+            // FIX: Simplified audio processing - direct to Whisper without complex preprocessing
             const tempId = `stream_${Date.now()}`;
-            const rawPath = path.join(UPLOAD_DIR, `${tempId}_raw.wav`);
-            const processedPath = path.join(UPLOAD_DIR, `${tempId}_processed.wav`);
+            const wavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             
-            // Save raw audio
-            let wavData = fullAudio;
-            if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
-            fs.writeFileSync(rawPath, Buffer.concat([createWavHeader(wavData.length, 44100), wavData]));
+            // FIX: Ensure even byte length for 16-bit audio
+            let audioData = fullAudio;
+            if (audioData.length % 2 !== 0) {
+              audioData = audioData.slice(0, -1);
+            }
 
-            // IMPROVED: Preprocess audio for better STT
-            console.log("[STT] Preprocessing audio...");
-            await preprocessForSTT(rawPath, processedPath);
-            fs.unlinkSync(rawPath);
+            // FIX: Create proper WAV file with 16kHz (Whisper optimal)
+            const wavHeader = createWavHeader(audioData.length, 16000, 1, 16);
+            fs.writeFileSync(wavPath, Buffer.concat([wavHeader, audioData]));
 
-            // IMPROVED: Use better Whisper settings
-            console.log("[STT] Transcribing with Whisper...");
+            console.log("[STT] Sending to Whisper...");
+
+            // FIX: Use whisper-large-v3-turbo with optimal settings
             const transcription = await sttClient.audio.transcriptions.create({
-              file: fs.createReadStream(processedPath),
+              file: fs.createReadStream(wavPath),
               model: "whisper-large-v3-turbo",
               language: "en",
-              prompt: "The user is speaking to a voice assistant named Mochi. Common phrases: how are you, what time is it, play music, stop, dance, hello, goodbye.",
-              response_format: "text",  // Simple text format
-              temperature: 0.0,        // Lower temperature for more accurate results
+              prompt: "The user is speaking to a voice assistant named Mochi.",
+              response_format: "text",
+              temperature: 0.0,
             });
 
-            fs.unlinkSync(processedPath);
-            
-            const userText = transcription.text?.trim() || "";
-            console.log("[STT] Raw result:", userText);
+            // Cleanup
+            try { fs.unlinkSync(wavPath); } catch(e) {}
 
-            // IMPROVED: Post-processing to fix common errors
+            const userText = transcription.text?.trim() || "";
+            console.log("[STT] Result:", userText);
+
+            if (userText.length === 0) {
+              console.log("[STT] Empty transcription");
+              ws.send("NO_SPEECH");
+              isProcessing = false;
+              return;
+            }
+
+            // Simple text corrections
             let correctedText = userText
               .toLowerCase()
               .replace(/wait for the/gi, "how are you")
               .replace(/weight for the/gi, "how are you")
-              .replace(/mochi/gi, "Mochi")  // Capitalize name
               .trim();
 
             console.log("[STT] Corrected:", correctedText);
 
-            if (correctedText.length === 0) {
-              ws.send("NO_SPEECH");
-              isProcessing = false;
-              return;
-            }
-
             const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(correctedText);
 
+            // FIX: Better LLM prompt
             const chat = await llmClient.chat.completions.create({
               messages: [
                 {
                   role: "system",
-                  content: `You are Mochi, a voice AI assistant made by April Manalo. Reply in JSON:
-{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }`
+                  content: `You are Mochi, a helpful voice AI assistant. 
+Respond naturally in English. 
+If the user asks for music, include a music_query field with the song name.
+If the user wants to dance, set dance to true.
+Reply in this exact JSON format:
+{"text": "your response here", "volume": null, "music_query": null, "servo_pan": null, "servo_tilt": null, "dance": false}`
                 },
                 { role: "user", content: correctedText }
               ],
               model: "llama-3.1-8b-instant",
               temperature: 0.7,
+              max_tokens: 150
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -349,8 +365,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             let danceMode = false;
 
             try {
-              const parsed = JSON.parse(raw);
-              spokenText = parsed.text || spokenText;
+              // FIX: Better JSON parsing with fallback
+              let parsed;
+              try {
+                parsed = JSON.parse(raw);
+              } catch (e) {
+                // Try to extract JSON from text if wrapped in other content
+                const jsonMatch = raw.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                  parsed = JSON.parse(jsonMatch[0]);
+                } else {
+                  throw e;
+                }
+              }
+              
+              spokenText = parsed.text || raw.substring(0, 200) || "I didn't understand.";
               musicQuery = parsed.music_query ?? null;
               servoPan = parsed.servo_pan ?? null;
               servoTilt = parsed.servo_tilt ?? null;
@@ -360,15 +389,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                 newVolume = Math.max(0.05, Math.min(2.0, parsed.volume));
               }
             } catch (e) {
-              console.log("[LLM] Parse error:", raw);
+              console.log("[LLM] Parse error, using raw:", raw);
               spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand.";
+              if (isDanceCommand) danceMode = true;
             }
 
+            // Save interaction
             await storage.createInteraction({ 
               transcript: correctedText, 
               response: spokenText 
             });
 
+            // Send servo commands
             if (servoPan !== null || servoTilt !== null) {
               ws.send(JSON.stringify({ 
                 type: "servo", 
@@ -377,18 +409,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               }));
             }
 
+            // Send dance command
             if (danceMode && !musicQuery) {
               ws.send(JSON.stringify({ type: "dance", action: "start" }));
             }
 
+            // Send volume update
             if (newVolume !== null) {
               currentVolume = newVolume;
               saveVolume(currentVolume);
               ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
 
+            // Generate TTS
+            console.log("[TTS] Generating:", spokenText);
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+            
             await edge.ttsPromise(spokenText, tmpMp3, { 
               voice: "en-US-JennyNeural",
               rate: "0%",
@@ -401,14 +438,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             await streamPCM(ws, pcm);
             ws.send("FINISH_RESPONSE");
 
-            fs.unlinkSync(tmpMp3);
+            // Cleanup
+            try { fs.unlinkSync(tmpMp3); } catch(e) {}
 
+            // Start music if requested
             if (musicQuery) {
               downloadSongStream(musicQuery, ws);
             }
 
-          } catch (err) {
-            console.error("[STREAM] Error:", err);
+          } catch (err: any) {
+            console.error("[STREAM] Error:", err.message || err);
+            console.error("[STREAM] Stack:", err.stack);
             if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
@@ -416,8 +456,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-      } catch (e) {
-        console.error("[MSG] Handler error:", e);
+      } catch (e: any) {
+        console.error("[MSG] Handler error:", e.message || e);
         isProcessing = false;
         isRecording = false;
       }
