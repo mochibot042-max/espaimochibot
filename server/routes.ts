@@ -24,20 +24,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100;
-const WHISPER_SAMPLE_RATE = 16000;
-const SILENCE_MS = 100;
-const CHUNK_SIZE = 2048;
-
-// CRITICAL: Process queue para hindi mag-timeout
-interface PendingJob {
-  ws: WebSocket;
-  audioData: Buffer;
-  timestamp: number;
-}
-
-const processingQueue: PendingJob[] = [];
-let isProcessingQueue = false;
+const SAMPLE_RATE = 16000;  // Match ESP32
 
 function loadVolume(): number {
   try {
@@ -53,9 +40,8 @@ function saveVolume(vol: number) {
   fs.writeFileSync(VOLUME_FILE, JSON.stringify({ volume: vol }));
 }
 
-function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, channels = 1, bitsPerSample = 16): Buffer {
-  const byteRate = sampleRate * channels * (bitsPerSample / 8);
-  const blockAlign = channels * (bitsPerSample / 8);
+function createWavHeader(pcmLength: number, sampleRate: number): Buffer {
+  const byteRate = sampleRate * 2;  // 16-bit mono
   const header = Buffer.alloc(44);
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
@@ -63,49 +49,14 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   header.write("fmt ", 12);
   header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
+  header.writeUInt16LE(1, 22);  // mono
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
+  header.writeUInt16LE(2, 32);  // block align
+  header.writeUInt16LE(16, 34); // bits per sample
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
   return header;
-}
-
-async function convertForWhisper(inputPcm: Buffer): Promise<Buffer> {
-  const tmpIn = path.join(AUDIO_DIR, `whisper_in_${Date.now()}.raw`);
-  const tmpOut = path.join(AUDIO_DIR, `whisper_out_${Date.now()}.wav`);
-  
-  fs.writeFileSync(tmpIn, inputPcm);
-  
-  return new Promise((resolve, reject) => {
-    ffmpeg(tmpIn)
-      .inputFormat('s16le')
-      .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
-      .audioFilters([
-        'highpass=f=80',
-        'lowpass=f=8000',
-        'afftdn=nf=-25',
-        'loudnorm=I=-16:LRA=11:TP=-1.5',
-        `aresample=${WHISPER_SAMPLE_RATE}`
-      ])
-      .audioCodec('pcm_s16le')
-      .audioFrequency(WHISPER_SAMPLE_RATE)
-      .save(tmpOut)
-      .on('end', () => {
-        fs.unlinkSync(tmpIn);
-        const processed = fs.readFileSync(tmpOut);
-        fs.unlinkSync(tmpOut);
-        resolve(processed);
-      })
-      .on('error', (err) => {
-        if (fs.existsSync(tmpIn)) fs.unlinkSync(tmpIn);
-        if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
-        reject(err);
-      });
-  });
 }
 
 async function generatePCM(inputPath: string): Promise<Buffer> {
@@ -116,42 +67,37 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
       .audioFilters([
         "highpass=f=80",
         "lowpass=f=20000",
-        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
+        "aresample=44100:resampler=soxr:precision=28",
         "pan=mono|c0=c0",
         "volume=0.95"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
+      .audioFrequency(44100)
       .format("s16le")
       .on("error", reject)
       .save(tmpRaw)
       .on("end", () => {
         const pcm = fs.readFileSync(tmpRaw);
-        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
-        const silence = Buffer.alloc(silenceBytes, 0);
-        const finalPCM = Buffer.concat([pcm, silence]);
         fs.unlinkSync(tmpRaw);
-        resolve(finalPCM);
+        resolve(pcm);
       });
   });
 }
 
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
-  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
+  const CHUNK = 2048;
+  for (let i = 0; i < pcm.length; i += CHUNK) {
     if (ws.readyState !== ws.OPEN) return;
-    const chunk = pcm.slice(i, i + CHUNK_SIZE);
-    ws.send(chunk, { binary: true });
+    ws.send(pcm.slice(i, i + CHUNK), { binary: true });
     await new Promise(r => setTimeout(r, 5));
   }
 }
 
 async function downloadSongStream(query: string, ws: WebSocket) {
   let ffmpegProcess: any = null;
-  let isStreamActive = true;
   
   try {
-    console.log("[MUSIC] Searching:", query);
     const search = await axios.get(
       `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`,
       { timeout: 15000 }
@@ -163,8 +109,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     }
     
     const video = search.data[0];
-    console.log("[MUSIC] Found:", video.title);
-
     const apiRes = await axios.get(
       `https://mostakim.onrender.com/m/sing?url=${video.url}`,
       { timeout: 15000 }
@@ -190,7 +134,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-i", "pipe:0",
       "-f", "s16le",
       "-ac", "1",
-      "-ar", TARGET_SAMPLE_RATE.toString(),
+      "-ar", "44100",
       "-af", "volume=0.9",
       "pipe:1",
     ]);
@@ -199,24 +143,21 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
+    let isActive = true;
     
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
-      if (!isStreamActive || ws.readyState !== ws.OPEN) return;
+      if (!isActive || ws.readyState !== ws.OPEN) return;
       buffer = Buffer.concat([buffer, chunk]);
-      
-      while (buffer.length >= CHUNK_SIZE && isStreamActive && ws.readyState === ws.OPEN) {
-        const sendChunk = buffer.slice(0, CHUNK_SIZE);
-        buffer = buffer.slice(CHUNK_SIZE);
-        ws.send(sendChunk, { binary: true });
+      while (buffer.length >= 2048 && isActive && ws.readyState === ws.OPEN) {
+        ws.send(buffer.slice(0, 2048), { binary: true });
+        buffer = buffer.slice(2048);
         await new Promise(r => setTimeout(r, 3));
       }
     });
 
     ffmpegProcess.stdout.on("end", () => {
-      isStreamActive = false;
-      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
-        ws.send(buffer);
-      }
+      isActive = false;
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) ws.send(buffer);
       setTimeout(() => {
         if (ws.readyState === ws.OPEN) {
           ws.send("FINISH_MUSIC");
@@ -228,10 +169,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       }, 500);
     });
 
-    ffmpegProcess.on("close", () => {
-      isStreamActive = false;
-    });
-
     (ws as any).musicProcess = ffmpegProcess;
 
   } catch (err) {
@@ -241,161 +178,11 @@ async function downloadSongStream(query: string, ws: WebSocket) {
   }
 }
 
-// CRITICAL: Background processor para hindi mag-timeout ang WS
-async function processQueue() {
-  if (isProcessingQueue || processingQueue.length === 0) return;
-  isProcessingQueue = true;
-
-  while (processingQueue.length > 0) {
-    const job = processingQueue.shift();
-    if (!job || job.ws.readyState !== WebSocket.OPEN) continue;
-
-    const { ws, audioData } = job;
-    
-    try {
-      console.log("[QUEUE] Processing job...");
-      
-      // Ensure 16-bit alignment
-      let wavData = audioData;
-      if (wavData.length % 2 !== 0) {
-        wavData = wavData.slice(0, -1);
-      }
-
-      // Pre-process audio
-      const processedAudio = await convertForWhisper(wavData);
-      
-      const tempId = `stream_${Date.now()}`;
-      const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-      
-      fs.writeFileSync(inputPath, Buffer.concat([
-        createWavHeader(processedAudio.length, WHISPER_SAMPLE_RATE), 
-        processedAudio
-      ]));
-
-      // Transcribe with Groq
-      const transcription = await sttClient.audio.transcriptions.create({
-        file: fs.createReadStream(inputPath),
-        model: "whisper-large-v3-turbo",
-        language: "en",
-        prompt: "Mochi, how are you, what, when, where, who, why, how",
-        temperature: 0.0,
-        response_format: "json"
-      });
-
-      fs.unlinkSync(inputPath);
-      
-      const userText = transcription.text?.trim() || "";
-      console.log("[STT] Result:", userText);
-
-      if (userText.length === 0) {
-        ws.send("NO_SPEECH");
-        continue;
-      }
-
-      const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
-
-      // LLM Processing
-      const chat = await llmClient.chat.completions.create({
-        messages: [
-          {
-            role: "system",
-            content: `You are Mochi, a voice AI assistant made by April Manalo. Reply in JSON:
-{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }`
-          },
-          { role: "user", content: userText }
-        ],
-        model: "llama-3.1-8b-instant",
-        temperature: 0.7
-      });
-
-      const raw = chat.choices?.[0]?.message?.content?.trim() || "";
-      console.log("[LLM] Raw:", raw);
-
-      let spokenText = "Please repeat.";
-      let musicQuery: string | null = null;
-      let newVolume: number | null = null;
-      let servoPan: number | null = null;
-      let servoTilt: number | null = null;
-      let danceMode = false;
-
-      try {
-        const parsed = JSON.parse(raw);
-        spokenText = parsed.text || spokenText;
-        musicQuery = parsed.music_query ?? null;
-        servoPan = parsed.servo_pan ?? null;
-        servoTilt = parsed.servo_tilt ?? null;
-        danceMode = parsed.dance || isDanceCommand;
-        
-        if (parsed.volume !== null && !isNaN(parsed.volume)) {
-          newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
-        }
-      } catch (e) {
-        console.log("[LLM] Parse error:", raw);
-        spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand.";
-      }
-
-      // Save interaction
-      await storage.createInteraction({ 
-        transcript: userText, 
-        response: spokenText 
-      });
-
-      // Send servo commands
-      if (servoPan !== null || servoTilt !== null) {
-        ws.send(JSON.stringify({ 
-          type: "servo", 
-          pan: servoPan ?? -1, 
-          tilt: servoTilt ?? -1 
-        }));
-      }
-
-      // TTS Generation
-      const edge = new EdgeTTS();
-      const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
-      await edge.ttsPromise(spokenText, tmpMp3, { 
-        voice: "en-US-JennyNeural" 
-      });
-
-      const pcm = await generatePCM(tmpMp3);
-      
-      // Send TTS to ESP32
-      ws.send("START_RESPONSE");
-      await streamPCM(ws, pcm);
-      ws.send("FINISH_RESPONSE");
-
-      fs.unlinkSync(tmpMp3);
-
-      // Update volume if requested
-      if (newVolume !== null) {
-        const currentVol = newVolume;
-        saveVolume(currentVol);
-        ws.send(JSON.stringify({ type: "volume", volume: currentVol }));
-      }
-
-      // Handle music request
-      if (musicQuery) {
-        downloadSongStream(musicQuery, ws);
-      }
-
-    } catch (err) {
-      console.error("[QUEUE] Processing error:", err);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send("ERROR_PROCESSING");
-      }
-    }
-  }
-
-  isProcessingQueue = false;
-}
-
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
-    maxPayload: 50 * 1024 * 1024,
-    perMessageDeflate: false,
-    // CRITICAL: Longer timeouts para sa Render
-    clientTracking: true,
+    maxPayload: 2 * 1024 * 1024,  // 2MB max para sa buong recording
     perMessageDeflate: false
   });
 
@@ -403,24 +190,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     console.log("[WS] ESP32 connected");
     
     let heartbeatInterval: NodeJS.Timeout;
-    let isRecording = false;
-    let audioChunks: Buffer[] = [];
+    let isProcessing = false;
+    (ws as any).danceMode = false;
+    
+    // CRITICAL: Accumulate complete recording here
+    let audioAccumulator: Buffer[] = [];
+    let isReceivingAudio = false;
     let currentVolume = loadVolume();
 
-    // Send initial volume
     ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
 
-    // CRITICAL: Mas frequent heartbeat para hindi mag-timeout
+    // Heartbeat every 15 seconds
     (ws as any).isAlive = true;
     heartbeatInterval = setInterval(() => {
       if ((ws as any).isAlive === false) {
-        console.log("[WS] Dead connection, terminating");
+        console.log("[WS] Dead connection");
         if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
         return ws.terminate();
       }
       (ws as any).isAlive = false;
       ws.ping();
-    }, 15000); // Every 15 seconds instead of 60
+    }, 15000);
 
     ws.on("pong", () => {
       (ws as any).isAlive = true;
@@ -428,107 +218,201 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
+        // CRITICAL: Binary data = part of complete recording
         if (isBinary) {
-          // Collect audio chunks
-          if (!isRecording) {
-            isRecording = true;
-            audioChunks = [];
-            console.log("[STREAM] Started receiving chunks");
+          if (!isReceivingAudio) {
+            isReceivingAudio = true;
+            audioAccumulator = [];
+            console.log("[AUDIO] Receiving complete recording...");
           }
           
-          audioChunks.push(Buffer.from(data));
+          // Accumulate
+          audioAccumulator.push(Buffer.from(data));
           return;
         }
 
-        // Handle text commands
+        // Text commands
         const msg = data.toString();
-        console.log("[WS] Command:", msg);
+        console.log("[WS] Text:", msg);
 
         if (msg === "ping") {
           ws.send("pong");
           return;
         }
 
-        // CRITICAL FIX: I-queue ang processing, huwag dito gawin
-        if (msg === "END_SPEECH" && isRecording) {
-          isRecording = false;
+        // CRITICAL: END_SPEECH = process the complete accumulated audio
+        if (msg === "END_SPEECH" && isReceivingAudio && !isProcessing) {
+          isProcessing = true;
+          isReceivingAudio = false;
           
-          // Acknowledge immediately para hindi mag-timeout
           ws.send("PROCESSING");
           
-          // Combine chunks
-          const fullAudio = Buffer.concat(audioChunks);
-          audioChunks = [];
+          try {
+            // Combine ALL audio into single buffer
+            const completeAudio = Buffer.concat(audioAccumulator);
+            audioAccumulator = [];
+            
+            console.log(`[AUDIO] Complete recording: ${completeAudio.length} bytes`);
+            
+            if (completeAudio.length === 0) {
+              ws.send("ERROR_NO_AUDIO");
+              isProcessing = false;
+              return;
+            }
 
-          if (fullAudio.length === 0) {
-            ws.send("ERROR_NO_AUDIO");
-            return;
+            // Ensure 16-bit alignment
+            let audioData = completeAudio;
+            if (audioData.length % 2 !== 0) {
+              audioData = audioData.slice(0, -1);
+            }
+
+            // Create WAV file
+            const tempId = `rec_${Date.now()}`;
+            const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+            
+            const wavBuffer = Buffer.concat([
+              createWavHeader(audioData.length, SAMPLE_RATE),
+              audioData
+            ]);
+            
+            fs.writeFileSync(inputPath, wavBuffer);
+            console.log(`[WAV] Saved ${wavBuffer.length} bytes to ${tempId}.wav`);
+
+            // Transcribe with Whisper
+            const transcription = await sttClient.audio.transcriptions.create({
+              file: fs.createReadStream(inputPath),
+              model: "whisper-large-v3-turbo",
+              language: "en",
+              prompt: "Mochi, how are you today, hello, hi, what, when, where, who, why",
+              temperature: 0.0,
+              response_format: "json"
+            });
+
+            fs.unlinkSync(inputPath);
+            
+            const userText = transcription.text?.trim() || "";
+            console.log("[STT] Result:", userText);
+
+            if (userText.length === 0) {
+              ws.send("NO_SPEECH");
+              isProcessing = false;
+              return;
+            }
+
+            const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
+
+            // LLM
+            const chat = await llmClient.chat.completions.create({
+              messages: [
+                {
+                  role: "system",
+                  content: `You are Mochi, a voice AI assistant made by April Manalo. Reply in JSON:
+{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }`
+                },
+                { role: "user", content: userText }
+              ],
+              model: "llama-3.1-8b-instant",
+              temperature: 0.7
+            });
+
+            const raw = chat.choices?.[0]?.message?.content?.trim() || "";
+            console.log("[LLM] Raw:", raw);
+
+            let spokenText = "Please repeat.";
+            let musicQuery: string | null = null;
+            let newVolume: number | null = null;
+            let servoPan: number | null = null;
+            let servoTilt: number | null = null;
+            let danceMode = false;
+
+            try {
+              const parsed = JSON.parse(raw);
+              spokenText = parsed.text || spokenText;
+              musicQuery = parsed.music_query ?? null;
+              servoPan = parsed.servo_pan ?? null;
+              servoTilt = parsed.servo_tilt ?? null;
+              danceMode = parsed.dance || isDanceCommand;
+              
+              if (parsed.volume !== null && !isNaN(parsed.volume)) {
+                newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
+              }
+            } catch (e) {
+              console.log("[LLM] Parse error:", raw);
+              spokenText = raw.replace(/[{}"]/g, '').substring(0, 200);
+            }
+
+            await storage.createInteraction({ 
+              transcript: userText, 
+              response: spokenText 
+            });
+
+            if (servoPan !== null || servoTilt !== null) {
+              ws.send(JSON.stringify({ 
+                type: "servo", 
+                pan: servoPan ?? -1, 
+                tilt: servoTilt ?? -1 
+              }));
+            }
+
+            // TTS
+            const edge = new EdgeTTS();
+            const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+            await edge.ttsPromise(spokenText, tmpMp3, { 
+              voice: "en-US-JennyNeural" 
+            });
+
+            const pcm = await generatePCM(tmpMp3);
+            
+            ws.send("START_RESPONSE");
+            await streamPCM(ws, pcm);
+            ws.send("FINISH_RESPONSE");
+
+            fs.unlinkSync(tmpMp3);
+
+            if (newVolume !== null) {
+              saveVolume(newVolume);
+              ws.send(JSON.stringify({ type: "volume", volume: newVolume }));
+            }
+
+            if (musicQuery) {
+              downloadSongStream(musicQuery, ws);
+            }
+
+          } catch (err) {
+            console.error("[PROCESS] Error:", err);
+            if (ws.readyState === ws.OPEN) ws.send("ERROR_PROCESSING");
+          } finally {
+            isProcessing = false;
           }
-
-          console.log(`[AUDIO] Queued ${fullAudio.length} bytes for processing`);
-          
-          // Add to queue for background processing
-          processingQueue.push({
-            ws: ws,
-            audioData: fullAudio,
-            timestamp: Date.now()
-          });
-
-          // Start processing queue (non-blocking)
-          processQueue().catch(console.error);
-          
           return;
         }
 
-        // Handle dance commands immediately
+        // Handle other commands
         if (msg.includes("dance") || msg.includes('"type":"dance"')) {
-          if (msg.includes("start") || msg.includes('"action":"start"')) {
+          if (msg.includes("start")) {
             (ws as any).danceMode = true;
             ws.send(JSON.stringify({ type: "dance", action: "start" }));
-          } else if (msg.includes("stop") || msg.includes('"action":"stop"')) {
+          } else if (msg.includes("stop")) {
             (ws as any).danceMode = false;
             ws.send(JSON.stringify({ type: "dance", action: "stop" }));
           }
-          return;
-        }
-
-        // Handle volume commands immediately
-        if (msg.includes("volume") || msg.includes('"type":"volume"')) {
-          try {
-            const parsed = JSON.parse(msg);
-            if (parsed.volume && !isNaN(parsed.volume)) {
-              const newVol = Math.max(0.05, Math.min(1.5, parsed.volume));
-              saveVolume(newVol);
-              ws.send(JSON.stringify({ type: "volume", volume: newVol }));
-            }
-          } catch (e) {
-            console.log("[VOL] Parse error:", msg);
-          }
-          return;
         }
 
       } catch (e) {
-        console.error("[MSG] Handler error:", e);
-        isRecording = false;
+        console.error("[MSG] Error:", e);
+        isProcessing = false;
+        isReceivingAudio = false;
       }
     });
 
     ws.on("error", (error) => {
       console.error("[WS] Error:", error);
-      isRecording = false;
     });
 
     ws.on("close", () => {
       console.log("[WS] Disconnected");
       clearInterval(heartbeatInterval);
-      isRecording = false;
       if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
-      
-      // Remove pending jobs for this WS
-      const index = processingQueue.findIndex(job => job.ws === ws);
-      if (index > -1) {
-        processingQueue.splice(index, 1);
-      }
     });
   });
 
