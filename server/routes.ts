@@ -24,7 +24,6 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 16000;
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
@@ -42,35 +41,51 @@ function saveVolume(vol: number) {
   fs.writeFileSync(VOLUME_FILE, JSON.stringify({ volume: vol }));
 }
 
-function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, channels = 1, bitsPerSample = 16): Buffer {
+// FIX: Proper WAV header for 16kHz 16-bit mono PCM
+function createWavHeader(pcmLength: number, sampleRate = 16000, channels = 1, bitsPerSample = 16): Buffer {
   const byteRate = sampleRate * channels * (bitsPerSample / 8);
   const blockAlign = channels * (bitsPerSample / 8);
   const header = Buffer.alloc(44);
+  
+  // RIFF chunk
   header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcmLength, 4);
+  header.writeUInt32LE(36 + pcmLength, 4);  // File size - 8
   header.write("WAVE", 8);
+  
+  // fmt chunk
   header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
+  header.writeUInt32LE(16, 16);           // Subchunk1Size (16 for PCM)
+  header.writeUInt16LE(1, 20);            // AudioFormat (1 for PCM)
+  header.writeUInt16LE(channels, 22);     // NumChannels
+  header.writeUInt32LE(sampleRate, 24);    // SampleRate
+  header.writeUInt32LE(byteRate, 28);      // ByteRate
+  header.writeUInt16LE(blockAlign, 32);   // BlockAlign
+  header.writeUInt16LE(bitsPerSample, 34); // BitsPerSample
+  
+  // data chunk
   header.write("data", 36);
-  header.writeUInt32LE(pcmLength, 40);
+  header.writeUInt32LE(pcmLength, 40);    // Subchunk2Size
+  
   return header;
 }
 
-// FAST: Direct PCM to WAV conversion, no heavy processing
+// FIX: Proper raw audio to WAV conversion with logging
 function saveRawAudioToWav(audioData: Buffer, outputPath: string): void {
+  // Ensure even length for 16-bit samples
   let data = audioData;
   if (data.length % 2 !== 0) {
     data = data.slice(0, -1);
   }
   
+  // Create proper WAV header for 16kHz
   const header = createWavHeader(data.length, 16000, 1, 16);
+  
+  // Write file
   fs.writeFileSync(outputPath, Buffer.concat([header, data]));
+  
+  console.log(`[WAV] Created: ${outputPath}`);
+  console.log(`[WAV] PCM data: ${data.length} bytes, ${data.length/2} samples`);
+  console.log(`[WAV] Duration: ~${(data.length/2)/16000}s at 16kHz`);
 }
 
 async function generatePCM(inputPath: string): Promise<Buffer> {
@@ -229,7 +244,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           if (!isRecording) {
             isRecording = true;
             audioChunks = [];
+            console.log("[AUDIO] Started receiving chunks");
           }
+          
+          // Log first few chunks for debugging
+          if (audioChunks.length < 3) {
+            const chunk = Buffer.from(data);
+            const sampleCount = chunk.length / 2;
+            const firstSample = chunk.readInt16LE(0);
+            const lastSample = chunk.readInt16LE(chunk.length - 2);
+            console.log(`[AUDIO] Chunk ${audioChunks.length}: ${chunk.length} bytes, samples: ${sampleCount}, first: ${firstSample}, last: ${lastSample}`);
+          }
+          
           audioChunks.push(Buffer.from(data));
           return;
         }
@@ -253,25 +279,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             const fullAudio = Buffer.concat(audioChunks);
             audioChunks = [];
 
-            if (fullAudio.length < 1000) {
+            console.log(`[STT] Total audio received: ${fullAudio.length} bytes`);
+
+            if (fullAudio.length < 2000) {
               console.log("[STT] Audio too short:", fullAudio.length);
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
-            console.log(`[STT] Audio: ${fullAudio.length} bytes`);
+            // Check if audio has valid data
+            let nonZeroCount = 0;
+            for (let i = 0; i < Math.min(fullAudio.length, 1000); i += 2) {
+              const sample = fullAudio.readInt16LE(i);
+              if (sample !== 0) nonZeroCount++;
+            }
+            console.log(`[STT] Non-zero samples in first 500: ${nonZeroCount}`);
+
+            if (nonZeroCount === 0) {
+              console.log("[STT] All samples are zero!");
+              ws.send("NO_SPEECH");
+              isProcessing = false;
+              return;
+            }
 
             const tempId = `stream_${Date.now()}`;
             const wavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+            
+            // Create WAV file
             saveRawAudioToWav(fullAudio, wavPath);
+
+            // Verify file was created
+            const stats = fs.statSync(wavPath);
+            console.log(`[STT] WAV file size: ${stats.size} bytes`);
 
             console.log("[STT] Sending to Whisper...");
             const startTime = Date.now();
             
+            // FIX: Use whisper-large-v3-turbo with explicit language
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(wavPath),
               model: "whisper-large-v3-turbo",
+              language: "en",
               response_format: "text",
               temperature: 0.0,
             });
@@ -279,17 +328,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             const duration = Date.now() - startTime;
             console.log(`[STT] Done in ${duration}ms`);
 
+            // Cleanup
             try { fs.unlinkSync(wavPath); } catch(e) {}
 
             const userText = transcription.text?.trim() || "";
-            console.log("[STT] Result:", userText);
+            console.log("[STT] Raw result:", userText);
 
             if (userText.length === 0) {
+              console.log("[STT] Empty transcription from Whisper");
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
+            // Simple corrections
             let correctedText = userText
               .toLowerCase()
               .replace(/wait for the/gi, "how are you")
@@ -383,6 +435,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
           } catch (err: any) {
             console.error("[STREAM] Error:", err.message);
+            console.error("[STREAM] Stack:", err.stack);
             if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
