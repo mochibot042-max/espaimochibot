@@ -64,7 +64,6 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
 
 // FAST: Direct PCM to WAV conversion, no heavy processing
 function saveRawAudioToWav(audioData: Buffer, outputPath: string): void {
-  // Ensure even length for 16-bit
   let data = audioData;
   if (data.length % 2 !== 0) {
     data = data.slice(0, -1);
@@ -254,7 +253,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             const fullAudio = Buffer.concat(audioChunks);
             audioChunks = [];
 
-            if (fullAudio.length < 1000) {  // Minimum 1000 bytes (~30ms)
+            if (fullAudio.length < 1000) {
               console.log("[STT] Audio too short:", fullAudio.length);
               ws.send("NO_SPEECH");
               isProcessing = false;
@@ -263,26 +262,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
             console.log(`[STT] Audio: ${fullAudio.length} bytes`);
 
-            // FAST: Direct save without ffmpeg preprocessing
             const tempId = `stream_${Date.now()}`;
             const wavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
             saveRawAudioToWav(fullAudio, wavPath);
 
-            // FAST STT: No prompt, simple text format, turbo model
             console.log("[STT] Sending to Whisper...");
             const startTime = Date.now();
             
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(wavPath),
               model: "whisper-large-v3-turbo",
-              response_format: "text",  // FAST: simple text only
+              response_format: "text",
               temperature: 0.0,
             });
 
             const duration = Date.now() - startTime;
             console.log(`[STT] Done in ${duration}ms`);
 
-            // Cleanup
             try { fs.unlinkSync(wavPath); } catch(e) {}
 
             const userText = transcription.text?.trim() || "";
@@ -294,7 +290,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               return;
             }
 
-            // Simple corrections
             let correctedText = userText
               .toLowerCase()
               .replace(/wait for the/gi, "how are you")
@@ -304,7 +299,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             console.log("[STT] Corrected:", correctedText);
             const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(correctedText);
 
-            // FAST LLM: Shorter system prompt
             const chat = await llmClient.chat.completions.create({
               messages: [
                 {
@@ -315,7 +309,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               ],
               model: "llama-3.1-8b-instant",
               temperature: 0.7,
-              max_tokens: 100  // Limit response length for speed
+              max_tokens: 100
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -351,7 +345,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               response: spokenText 
             });
 
-            // Send commands
             if (servoPan !== null || servoTilt !== null) {
               ws.send(JSON.stringify({ type: "servo", pan: servoPan ?? -1, tilt: servoTilt ?? -1 }));
             }
@@ -366,7 +359,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
 
-            // FAST TTS
             console.log("[TTS] Generating...");
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
@@ -426,7 +418,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       clearInterval(heartbeatInterval);
       isProcessing = false;
       isRecording = false;
-      if ((ws any).musicProcess) (ws as any).musicProcess.kill();
+      if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
     });
   });
 
