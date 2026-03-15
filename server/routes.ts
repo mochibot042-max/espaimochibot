@@ -62,34 +62,16 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   return header;
 }
 
-// FIX: Simplified and more robust audio preprocessing
-async function preprocessForSTT(inputPath: string, outputPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .noVideo()
-      .audioFilters([
-        "aresample=16000",           // Simple resample to 16kHz
-        "pan=mono|c0=c0",            // Force mono
-        "volume=2.0"                 // Boost volume
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .format("s16le")
-      .on("start", (cmd) => {
-        console.log("[FFMPEG] Preprocess:", cmd);
-      })
-      .on("error", (err, stdout, stderr) => {
-        console.error("[FFMPEG] Preprocess error:", err.message);
-        console.error("[FFMPEG] stderr:", stderr);
-        reject(err);
-      })
-      .on("end", () => {
-        console.log("[FFMPEG] Preprocess complete");
-        resolve();
-      })
-      .save(outputPath);
-  });
+// FAST: Direct PCM to WAV conversion, no heavy processing
+function saveRawAudioToWav(audioData: Buffer, outputPath: string): void {
+  // Ensure even length for 16-bit
+  let data = audioData;
+  if (data.length % 2 !== 0) {
+    data = data.slice(0, -1);
+  }
+  
+  const header = createWavHeader(data.length, 16000, 1, 16);
+  fs.writeFileSync(outputPath, Buffer.concat([header, data]));
 }
 
 async function generatePCM(inputPath: string): Promise<Buffer> {
@@ -98,8 +80,6 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
     ffmpeg(inputPath)
       .noVideo()
       .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=20000",
         "aresample=44100",
         "pan=mono|c0=c0",
         "volume=0.95"
@@ -250,9 +230,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           if (!isRecording) {
             isRecording = true;
             audioChunks = [];
-            console.log("[STREAM] Started receiving chunks");
           }
-          
           audioChunks.push(Buffer.from(data));
           return;
         }
@@ -269,47 +247,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           isProcessing = true;
           isRecording = false;
           
-          console.log("[STREAM] Finalizing transcription...");
+          console.log("[STREAM] Processing...");
           ws.send("PROCESSING");
 
           try {
             const fullAudio = Buffer.concat(audioChunks);
             audioChunks = [];
 
-            if (fullAudio.length === 0) {
-              console.log("[STT] No audio received");
+            if (fullAudio.length < 1000) {  // Minimum 1000 bytes (~30ms)
+              console.log("[STT] Audio too short:", fullAudio.length);
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
-            console.log(`[STT] Audio size: ${fullAudio.length} bytes`);
+            console.log(`[STT] Audio: ${fullAudio.length} bytes`);
 
-            // FIX: Simplified audio processing - direct to Whisper without complex preprocessing
+            // FAST: Direct save without ffmpeg preprocessing
             const tempId = `stream_${Date.now()}`;
             const wavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-            
-            // FIX: Ensure even byte length for 16-bit audio
-            let audioData = fullAudio;
-            if (audioData.length % 2 !== 0) {
-              audioData = audioData.slice(0, -1);
-            }
+            saveRawAudioToWav(fullAudio, wavPath);
 
-            // FIX: Create proper WAV file with 16kHz (Whisper optimal)
-            const wavHeader = createWavHeader(audioData.length, 16000, 1, 16);
-            fs.writeFileSync(wavPath, Buffer.concat([wavHeader, audioData]));
-
+            // FAST STT: No prompt, simple text format, turbo model
             console.log("[STT] Sending to Whisper...");
-
-            // FIX: Use whisper-large-v3-turbo with optimal settings
+            const startTime = Date.now();
+            
             const transcription = await sttClient.audio.transcriptions.create({
               file: fs.createReadStream(wavPath),
               model: "whisper-large-v3-turbo",
-              language: "en",
-              prompt: "The user is speaking to a voice assistant named Mochi.",
-              response_format: "text",
+              response_format: "text",  // FAST: simple text only
               temperature: 0.0,
             });
+
+            const duration = Date.now() - startTime;
+            console.log(`[STT] Done in ${duration}ms`);
 
             // Cleanup
             try { fs.unlinkSync(wavPath); } catch(e) {}
@@ -318,13 +289,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             console.log("[STT] Result:", userText);
 
             if (userText.length === 0) {
-              console.log("[STT] Empty transcription");
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
-            // Simple text corrections
+            // Simple corrections
             let correctedText = userText
               .toLowerCase()
               .replace(/wait for the/gi, "how are you")
@@ -332,26 +302,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               .trim();
 
             console.log("[STT] Corrected:", correctedText);
-
             const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(correctedText);
 
-            // FIX: Better LLM prompt
+            // FAST LLM: Shorter system prompt
             const chat = await llmClient.chat.completions.create({
               messages: [
                 {
                   role: "system",
-                  content: `You are Mochi, a helpful voice AI assistant. 
-Respond naturally in English. 
-If the user asks for music, include a music_query field with the song name.
-If the user wants to dance, set dance to true.
-Reply in this exact JSON format:
-{"text": "your response here", "volume": null, "music_query": null, "servo_pan": null, "servo_tilt": null, "dance": false}`
+                  content: `You are Mochi, a voice AI assistant. Reply in JSON: {"text": "...", "volume": null, "music_query": null, "servo_pan": null, "servo_tilt": null, "dance": false}`
                 },
                 { role: "user", content: correctedText }
               ],
               model: "llama-3.1-8b-instant",
               temperature: 0.7,
-              max_tokens: 150
+              max_tokens: 100  // Limit response length for speed
             });
 
             const raw = chat.choices?.[0]?.message?.content?.trim() || "";
@@ -365,21 +329,10 @@ Reply in this exact JSON format:
             let danceMode = false;
 
             try {
-              // FIX: Better JSON parsing with fallback
-              let parsed;
-              try {
-                parsed = JSON.parse(raw);
-              } catch (e) {
-                // Try to extract JSON from text if wrapped in other content
-                const jsonMatch = raw.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                  parsed = JSON.parse(jsonMatch[0]);
-                } else {
-                  throw e;
-                }
-              }
+              const jsonMatch = raw.match(/\{[\s\S]*\}/);
+              const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(raw);
               
-              spokenText = parsed.text || raw.substring(0, 200) || "I didn't understand.";
+              spokenText = parsed.text || raw.substring(0, 200);
               musicQuery = parsed.music_query ?? null;
               servoPan = parsed.servo_pan ?? null;
               servoTilt = parsed.servo_tilt ?? null;
@@ -389,40 +342,32 @@ Reply in this exact JSON format:
                 newVolume = Math.max(0.05, Math.min(2.0, parsed.volume));
               }
             } catch (e) {
-              console.log("[LLM] Parse error, using raw:", raw);
               spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand.";
               if (isDanceCommand) danceMode = true;
             }
 
-            // Save interaction
             await storage.createInteraction({ 
               transcript: correctedText, 
               response: spokenText 
             });
 
-            // Send servo commands
+            // Send commands
             if (servoPan !== null || servoTilt !== null) {
-              ws.send(JSON.stringify({ 
-                type: "servo", 
-                pan: servoPan ?? -1, 
-                tilt: servoTilt ?? -1 
-              }));
+              ws.send(JSON.stringify({ type: "servo", pan: servoPan ?? -1, tilt: servoTilt ?? -1 }));
             }
 
-            // Send dance command
             if (danceMode && !musicQuery) {
               ws.send(JSON.stringify({ type: "dance", action: "start" }));
             }
 
-            // Send volume update
             if (newVolume !== null) {
               currentVolume = newVolume;
               saveVolume(currentVolume);
               ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
 
-            // Generate TTS
-            console.log("[TTS] Generating:", spokenText);
+            // FAST TTS
+            console.log("[TTS] Generating...");
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
             
@@ -438,17 +383,14 @@ Reply in this exact JSON format:
             await streamPCM(ws, pcm);
             ws.send("FINISH_RESPONSE");
 
-            // Cleanup
             try { fs.unlinkSync(tmpMp3); } catch(e) {}
 
-            // Start music if requested
             if (musicQuery) {
               downloadSongStream(musicQuery, ws);
             }
 
           } catch (err: any) {
-            console.error("[STREAM] Error:", err.message || err);
-            console.error("[STREAM] Stack:", err.stack);
+            console.error("[STREAM] Error:", err.message);
             if (ws.readyState === ws.OPEN) ws.send("ERROR");
           } finally {
             isProcessing = false;
@@ -457,7 +399,7 @@ Reply in this exact JSON format:
         }
 
       } catch (e: any) {
-        console.error("[MSG] Handler error:", e.message || e);
+        console.error("[MSG] Error:", e.message);
         isProcessing = false;
         isRecording = false;
       }
@@ -466,7 +408,6 @@ Reply in this exact JSON format:
     (ws as any).isAlive = true;
     heartbeatInterval = setInterval(() => {
       if ((ws as any).isAlive === false) {
-        console.log("[WS] Dead connection, terminating");
         if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
         return ws.terminate();
       }
@@ -485,7 +426,7 @@ Reply in this exact JSON format:
       clearInterval(heartbeatInterval);
       isProcessing = false;
       isRecording = false;
-      if ((ws as any).musicProcess) (ws as any).musicProcess.kill();
+      if ((ws any).musicProcess) (ws as any).musicProcess.kill();
     });
   });
 
