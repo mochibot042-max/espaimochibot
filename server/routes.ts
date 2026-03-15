@@ -24,7 +24,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100;
+const TARGET_SAMPLE_RATE = 16000;  // CHANGED: Lower sample rate for better STT (Whisper prefers 16kHz)
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
@@ -62,6 +62,30 @@ function createWavHeader(pcmLength: number, sampleRate = TARGET_SAMPLE_RATE, cha
   return header;
 }
 
+// IMPROVED: Better audio preprocessing for STT
+async function preprocessForSTT(inputPath: string, outputPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .noVideo()
+      .audioFilters([
+        "highpass=f=80",           // Remove low freq noise
+        "lowpass=f=8000",          // Remove high freq noise
+        "afftdn=nf=-25",           // Noise reduction
+        "acompressor=threshold=-20dB:ratio=4:attack=5:release=100", // Compress dynamics
+        "volume=2.0",              // Boost volume
+        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`, // Resample to 16kHz
+        "pan=mono|c0=c0"           // Force mono
+      ])
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(TARGET_SAMPLE_RATE)
+      .format("s16le")
+      .on("error", reject)
+      .on("end", resolve)
+      .save(outputPath);
+  });
+}
+
 async function generatePCM(inputPath: string): Promise<Buffer> {
   const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
   return new Promise((resolve, reject) => {
@@ -96,7 +120,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     if (ws.readyState !== ws.OPEN) return;
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
     ws.send(chunk, { binary: true });
-    await new Promise(r => setTimeout(r, 3)); // Faster streaming
+    await new Promise(r => setTimeout(r, 3));
   }
 }
 
@@ -129,7 +153,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       return;
     }
 
-    // Send dance start command
     ws.send(JSON.stringify({ type: "dance", action: "start" }));
 
     const audioStream = await axios({
@@ -143,7 +166,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-i", "pipe:0",
       "-f", "s16le",
       "-ac", "1",
-      "-ar", TARGET_SAMPLE_RATE.toString(),
+      "-ar", "44100",  // Music stays at 44.1kHz
       "-af", "volume=0.9",
       "pipe:1",
     ]);
@@ -161,7 +184,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         const sendChunk = buffer.slice(0, CHUNK_SIZE);
         buffer = buffer.slice(CHUNK_SIZE);
         ws.send(sendChunk, { binary: true });
-        await new Promise(r => setTimeout(r, 2)); // Faster for music
+        await new Promise(r => setTimeout(r, 2));
       }
     });
 
@@ -209,7 +232,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       (ws as any).isAlive = true;
     });
 
-    // STREAMING STATE
     let audioChunks: Buffer[] = [];
     let isRecording = false;
     let currentVolume = loadVolume();
@@ -219,7 +241,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.on("message", async (data: any, isBinary: boolean) => {
       try {
         if (isBinary) {
-          // STREAMING: Accumulate audio chunk
           if (!isRecording) {
             isRecording = true;
             audioChunks = [];
@@ -230,7 +251,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // Handle text commands
         const msg = data.toString();
         console.log("[WS] Command:", msg);
 
@@ -239,7 +259,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        // END_SPEECH: Process accumulated audio
         if (msg === "END_SPEECH" && isRecording && !isProcessing) {
           isProcessing = true;
           isRecording = false;
@@ -248,7 +267,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ws.send("PROCESSING");
 
           try {
-            // Combine all chunks
             const fullAudio = Buffer.concat(audioChunks);
             audioChunks = [];
 
@@ -258,50 +276,63 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               return;
             }
 
-            // Create WAV file for Groq
+            // IMPROVED: Create temp files for processing
             const tempId = `stream_${Date.now()}`;
-            const inputPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+            const rawPath = path.join(UPLOAD_DIR, `${tempId}_raw.wav`);
+            const processedPath = path.join(UPLOAD_DIR, `${tempId}_processed.wav`);
             
+            // Save raw audio
             let wavData = fullAudio;
             if (wavData.length % 2 !== 0) wavData = wavData.slice(0, -1);
-            
-            fs.writeFileSync(inputPath, Buffer.concat([createWavHeader(wavData.length), wavData]));
+            fs.writeFileSync(rawPath, Buffer.concat([createWavHeader(wavData.length, 44100), wavData]));
 
-            // IMPROVED: Use better model for accuracy
+            // IMPROVED: Preprocess audio for better STT
+            console.log("[STT] Preprocessing audio...");
+            await preprocessForSTT(rawPath, processedPath);
+            fs.unlinkSync(rawPath);
+
+            // IMPROVED: Use better Whisper settings
+            console.log("[STT] Transcribing with Whisper...");
             const transcription = await sttClient.audio.transcriptions.create({
-              file: fs.createReadStream(inputPath),
+              file: fs.createReadStream(processedPath),
               model: "whisper-large-v3-turbo",
               language: "en",
-              prompt: "This is a voice command for a robot assistant.", // Helps with accuracy
+              prompt: "The user is speaking to a voice assistant named Mochi. Common phrases: how are you, what time is it, play music, stop, dance, hello, goodbye.",
+              response_format: "text",  // Simple text format
+              temperature: 0.0,        // Lower temperature for more accurate results
             });
 
-            fs.unlinkSync(inputPath);
+            fs.unlinkSync(processedPath);
             
             const userText = transcription.text?.trim() || "";
-            console.log("[STT] Result:", userText);
+            console.log("[STT] Raw result:", userText);
 
-            if (userText.length === 0) {
+            // IMPROVED: Post-processing to fix common errors
+            let correctedText = userText
+              .toLowerCase()
+              .replace(/wait for the/gi, "how are you")
+              .replace(/weight for the/gi, "how are you")
+              .replace(/mochi/gi, "Mochi")  // Capitalize name
+              .trim();
+
+            console.log("[STT] Corrected:", correctedText);
+
+            if (correctedText.length === 0) {
               ws.send("NO_SPEECH");
               isProcessing = false;
               return;
             }
 
-            // Check for dance command
-            const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(userText);
+            const isDanceCommand = /dance|sayaw|sumayaw|boogie|groove/i.test(correctedText);
 
-            // LLM Processing
             const chat = await llmClient.chat.completions.create({
               messages: [
                 {
                   role: "system",
                   content: `You are Mochi, a voice AI assistant made by April Manalo. Reply in JSON:
-{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }
-
-- servo_pan: 0=left, 90=center, 180=right
-- servo_tilt: 0=down, 90=up
-- dance: true if user wants to dance or play music`
+{ "text": "...", "volume": number|null, "music_query": string|null, "servo_pan": number|null, "servo_tilt": number|null, "dance": boolean }`
                 },
-                { role: "user", content: userText }
+                { role: "user", content: correctedText }
               ],
               model: "llama-3.1-8b-instant",
               temperature: 0.7,
@@ -333,13 +364,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               spokenText = raw.replace(/[{}"]/g, '').substring(0, 200) || "I didn't understand.";
             }
 
-            // Save interaction
             await storage.createInteraction({ 
-              transcript: userText, 
+              transcript: correctedText, 
               response: spokenText 
             });
 
-            // Send commands to ESP32
             if (servoPan !== null || servoTilt !== null) {
               ws.send(JSON.stringify({ 
                 type: "servo", 
@@ -358,25 +387,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               ws.send(JSON.stringify({ type: "volume", volume: currentVolume }));
             }
 
-            // TTS Generation
             const edge = new EdgeTTS();
             const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
             await edge.ttsPromise(spokenText, tmpMp3, { 
               voice: "en-US-JennyNeural",
-              rate: "0%", // Normal speed
-              pitch: "0Hz" // Normal pitch
+              rate: "0%",
+              pitch: "0Hz"
             });
 
             const pcm = await generatePCM(tmpMp3);
             
-            // Send TTS
             ws.send("START_RESPONSE");
             await streamPCM(ws, pcm);
             ws.send("FINISH_RESPONSE");
 
             fs.unlinkSync(tmpMp3);
 
-            // Handle music request
             if (musicQuery) {
               downloadSongStream(musicQuery, ws);
             }
@@ -397,7 +423,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     });
 
-    // Heartbeat - more frequent for hotspot stability
     (ws as any).isAlive = true;
     heartbeatInterval = setInterval(() => {
       if ((ws as any).isAlive === false) {
@@ -407,7 +432,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       (ws as any).isAlive = false;
       ws.ping();
-    }, 30000); // 30 seconds
+    }, 30000);
 
     ws.on("error", (error) => {
       console.error("[WS] Error:", error);
