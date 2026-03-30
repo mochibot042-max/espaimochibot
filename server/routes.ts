@@ -11,7 +11,7 @@ import { EdgeTTS } from "node-edge-tts";
 import axios from "axios";
 
 /* ---------------- API KEY ---------------- */
-const GROQ_API_KEY = "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 /* ---------------- GROQ ---------------- */
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
@@ -25,10 +25,69 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /* ---------------- CONFIG ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100;
+const TARGET_SAMPLE_RATE = 44100;  // Playback rate
+const RECORD_SAMPLE_RATE = 16000;  // Recording rate (matches ESP32)
 const SILENCE_MS = 100;
-const CHUNK_SIZE = 512;  // REDUCED: 512 bytes para mas maraming chunks, mas smooth
-const CHUNK_DELAY_MS = 15;  // INCREASED: 15ms para mas mabagal ang stream
+const CHUNK_SIZE = 512;           // Small chunks for smooth streaming
+const CHUNK_DELAY_MS = 12;        // ~85 chunks/sec = smooth for hotspot
+
+/* ---------------- ADPCM Decoder ---------------- */
+class ADPCMDecoder {
+  private lastSample = 0;
+  private index = 0;
+  
+  private readonly stepTable: number[] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253,
+    279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166,
+    1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026,
+    4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+  ];
+  
+  private readonly indexTable: number[] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+
+  reset() {
+    this.lastSample = 0;
+    this.index = 0;
+  }
+
+  decode(input: Buffer, output: Int16Array): number {
+    let outPos = 0;
+    
+    for (let i = 0; i < input.length && outPos < output.length - 1; i++) {
+      const byte = input[i];
+      
+      // Decode low nibble
+      this.decodeNibble(byte & 0x0F, output, outPos++);
+      
+      // Decode high nibble
+      this.decodeNibble((byte >> 4) & 0x0F, output, outPos++);
+    }
+    
+    return outPos;
+  }
+
+  private decodeNibble(code: number, output: Int16Array, outPos: number) {
+    const step = this.stepTable[this.index];
+    let diffq = step >> 3;
+    
+    if (code & 4) diffq += step;
+    if (code & 2) diffq += step >> 1;
+    if (code & 1) diffq += step >> 2;
+    if (code & 8) diffq = -diffq;
+    
+    this.lastSample += diffq;
+    if (this.lastSample > 32767) this.lastSample = 32767;
+    if (this.lastSample < -32768) this.lastSample = -32768;
+    
+    this.index += this.indexTable[code & 7];
+    if (this.index < 0) this.index = 0;
+    if (this.index > 88) this.index = 88;
+    
+    output[outPos] = this.lastSample;
+  }
+}
 
 /* ---------------- WAV HEADER ---------------- */
 function createWavHeader(
@@ -108,17 +167,20 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
   });
 }
 
-/* ---------------- STREAM PCM (IMPROVED with adaptive pacing) ---------------- */
-async function streamPCM(ws: WebSocket, pcm: Buffer) {
+/* ---------------- STREAM PCM (Hotspot-Optimized) ---------------- */
+async function streamPCM(ws: WebSocket, pcm: Buffer, startText: string, endText: string) {
+  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
   console.log(
-    `[STREAM START] Sending ${pcm.length} bytes PCM (~${(
+    `[STREAM START] ${startText}: ${pcm.length} bytes, ${totalChunks} chunks (~${(
       pcm.length /
       (TARGET_SAMPLE_RATE * 2)
     ).toFixed(2)} sec)`
   );
   
-  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
-  let chunksSent = 0;
+  ws.send(startText);
+  
+  // Initial burst: mas mabagal para mag-build up ang buffer ng ESP32
+  let initialBurst = Math.min(20, totalChunks);
   
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
@@ -128,20 +190,14 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     }
     
     ws.send(chunk, { binary: true });
-    chunksSent++;
     
-    // ADAPTIVE: Mas mahabang delay sa simula para mag-build up ang buffer ng ESP32
-    const adaptiveDelay = i < 16384 ? CHUNK_DELAY_MS + 5 : CHUNK_DELAY_MS;
-    
-    await new Promise(r => setTimeout(r, adaptiveDelay));
-    
-    // Log progress every 50 chunks
-    if (chunksSent % 50 === 0) {
-      console.log(`[STREAM PROGRESS] ${chunksSent}/${totalChunks} chunks sent`);
-    }
+    // Adaptive pacing: mas mabagal sa simula, normal pagkatapos
+    const delay = i < (initialBurst * CHUNK_SIZE) ? CHUNK_DELAY_MS + 8 : CHUNK_DELAY_MS;
+    await new Promise(r => setTimeout(r, delay));
   }
   
-  console.log(`[STREAM END] Finished sending ${chunksSent} chunks`);
+  ws.send(endText);
+  console.log(`[STREAM END] Finished ${endText}`);
 }
 
 /* ---------------- MUSIC STREAM ---------------- */
@@ -149,15 +205,15 @@ async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("Searching music:", query);
     const search = await axios.get(
-      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(
-        query
-      )}`
+      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`,
+      { timeout: 10000 }
     );
     if (!search.data?.length) return;
 
     const video = search.data[0];
     const apiRes = await axios.get(
-      `https://mostakim.onrender.com/m/sing?url=${video.url}`
+      `https://mostakim.onrender.com/m/sing?url=${video.url}`,
+      { timeout: 10000 }
     );
     if (!apiRes.data?.url) return;
 
@@ -166,7 +222,8 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     const stream = await axios({
       url: apiRes.data.url,
       method: "GET",
-      responseType: "stream"
+      responseType: "stream",
+      timeout: 30000
     });
     stream.data.pipe(writer);
     await new Promise((res, rej) => {
@@ -175,9 +232,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     });
 
     const pcm = await generatePCM(musicFile);
-    ws.send("START_MUSIC");
-    await streamPCM(ws, pcm);
-    ws.send("FINISH_MUSIC");
+    await streamPCM(ws, pcm, "START_MUSIC", "FINISH_MUSIC");
 
     fs.unlinkSync(musicFile);
     console.log("Music streamed:", video.title);
@@ -191,24 +246,50 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws/audio" });
+  const wss = new WebSocketServer({ 
+    server: httpServer, 
+    path: "/ws/audio",
+    perMessageDeflate: false,  // Disable compression for binary audio
+    maxPayload: 1024 * 1024    // 1MB max payload
+  });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected");
+    console.log("ESP32 connected (Hotspot Edition)");
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
     let currentVolume = DEFAULT_VOLUME;
+    let isADPCM = false;
+    const adpcmDecoder = new ADPCMDecoder();
 
     ws.send(`VOLUME:${currentVolume.toFixed(2)}`);
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (isBinary) {
-        audioChunks.push(Buffer.from(data));
+        if (isADPCM) {
+          // Decode ADPCM on-the-fly
+          const compressed = Buffer.from(data);
+          const decompressed = new Int16Array(compressed.length * 2);
+          const samplesDecoded = adpcmDecoder.decode(compressed, decompressed);
+          // Convert to buffer
+          const pcmBuffer = Buffer.from(decompressed.buffer).slice(0, samplesDecoded * 2);
+          audioChunks.push(pcmBuffer);
+        } else {
+          audioChunks.push(Buffer.from(data));
+        }
         return;
       }
 
       const msg = data.toString();
-      if (msg !== "END_STREAM" || isProcessing) return;
+      
+      // Handle ADPCM start
+      if (msg === "START_ADPCM") {
+        isADPCM = true;
+        adpcmDecoder.reset();
+        console.log("ADPCM compression enabled");
+        return;
+      }
+      
+      if (msg !== "END_STREAM" && msg !== "END_STREAM_ADPCM" || isProcessing) return;
 
       isProcessing = true;
       let inputWavPath = "";
@@ -223,12 +304,16 @@ export async function registerRoutes(
           return;
         }
 
+        console.log(`Received audio: ${normalized.length} bytes (${isADPCM ? 'ADPCM' : 'PCM'})`);
+
         const tempId = `tmp-${Date.now()}`;
         inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+        
+        // Create WAV at 16kHz (input rate)
         fs.writeFileSync(
           inputWavPath,
           Buffer.concat([
-            createWavHeader(normalized.length, TARGET_SAMPLE_RATE),
+            createWavHeader(normalized.length, RECORD_SAMPLE_RATE),
             normalized
           ])
         );
@@ -295,9 +380,7 @@ export async function registerRoutes(
         });
 
         const pcm = await generatePCM(tmpMp3);
-        ws.send("START_RESPONSE");
-        await streamPCM(ws, pcm);
-        ws.send("FINISH_RESPONSE");
+        await streamPCM(ws, pcm, "START_RESPONSE", "FINISH_RESPONSE");
 
         fs.unlinkSync(tmpMp3);
 
@@ -309,6 +392,8 @@ export async function registerRoutes(
         ws.send("ERROR");
       } finally {
         isProcessing = false;
+        isADPCM = false;
+        adpcmDecoder.reset();
         if (inputWavPath && fs.existsSync(inputWavPath)) {
           try {
             fs.unlinkSync(inputWavPath);
@@ -320,6 +405,7 @@ export async function registerRoutes(
     });
 
     ws.on("close", () => console.log("ESP32 disconnected"));
+    ws.on("error", (err) => console.error("WebSocket error:", err));
   });
 
   app.get(api.interactions.list.path, async (req, res) => {
