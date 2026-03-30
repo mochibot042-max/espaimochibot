@@ -25,9 +25,10 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /* ---------------- CONFIG ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100; // ESP32 44.1 kHz
+const TARGET_SAMPLE_RATE = 44100;
 const SILENCE_MS = 100;
-const CHUNK_SIZE = 1024;  // Reduced from 2048 for smoother streaming
+const CHUNK_SIZE = 512;  // REDUCED: 512 bytes para mas maraming chunks, mas smooth
+const CHUNK_DELAY_MS = 15;  // INCREASED: 15ms para mas mabagal ang stream
 
 /* ---------------- WAV HEADER ---------------- */
 function createWavHeader(
@@ -107,7 +108,7 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
   });
 }
 
-/* ---------------- STREAM PCM ---------------- */
+/* ---------------- STREAM PCM (IMPROVED with adaptive pacing) ---------------- */
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   console.log(
     `[STREAM START] Sending ${pcm.length} bytes PCM (~${(
@@ -115,14 +116,32 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
       (TARGET_SAMPLE_RATE * 2)
     ).toFixed(2)} sec)`
   );
+  
+  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
+  let chunksSent = 0;
+  
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
-    if (ws.readyState !== ws.OPEN) return;
+    if (ws.readyState !== ws.OPEN) {
+      console.log("[STREAM ABORTED] WebSocket closed mid-stream");
+      return;
+    }
+    
     ws.send(chunk, { binary: true });
-    // Increased delay from 5ms to 12ms for better mobile hotspot stability
-    await new Promise(r => setTimeout(r, 12));
+    chunksSent++;
+    
+    // ADAPTIVE: Mas mahabang delay sa simula para mag-build up ang buffer ng ESP32
+    const adaptiveDelay = i < 16384 ? CHUNK_DELAY_MS + 5 : CHUNK_DELAY_MS;
+    
+    await new Promise(r => setTimeout(r, adaptiveDelay));
+    
+    // Log progress every 50 chunks
+    if (chunksSent % 50 === 0) {
+      console.log(`[STREAM PROGRESS] ${chunksSent}/${totalChunks} chunks sent`);
+    }
   }
-  console.log("[STREAM END] Finished sending PCM");
+  
+  console.log(`[STREAM END] Finished sending ${chunksSent} chunks`);
 }
 
 /* ---------------- MUSIC STREAM ---------------- */
@@ -283,7 +302,6 @@ export async function registerRoutes(
         fs.unlinkSync(tmpMp3);
 
         if (musicQuery) {
-          // fire‑and‑forget – the function handles its own errors
           downloadSongStream(musicQuery, ws);
         }
       } catch (err) {
@@ -304,7 +322,6 @@ export async function registerRoutes(
     ws.on("close", () => console.log("ESP32 disconnected"));
   });
 
-  // expose stored interactions via HTTP
   app.get(api.interactions.list.path, async (req, res) => {
     res.json(await storage.getInteractions());
   });
