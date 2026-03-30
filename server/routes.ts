@@ -10,7 +10,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import axios from "axios";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "your-key-here";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
