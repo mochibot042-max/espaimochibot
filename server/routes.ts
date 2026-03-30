@@ -25,9 +25,9 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /* ---------------- CONFIG ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100; // ESP32 44.1 kHz
+const TARGET_SAMPLE_RATE = 44100; // ESP32 44.1 kHz
 const SILENCE_MS = 100;
-const CHUNK_SIZE = 2048;
+const CHUNK_SIZE = 1024;  // Reduced from 2048 for smoother streaming
 
 /* ---------------- WAV HEADER ---------------- */
 function createWavHeader(
@@ -119,7 +119,8 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
     if (ws.readyState !== ws.OPEN) return;
     ws.send(chunk, { binary: true });
-    await new Promise(r => setTimeout(r, 5));
+    // Increased delay from 5ms to 12ms for better mobile hotspot stability
+    await new Promise(r => setTimeout(r, 12));
   }
   console.log("[STREAM END] Finished sending PCM");
 }
