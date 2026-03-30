@@ -25,7 +25,7 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /* ---------------- CONFIG ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 44100; // ESP32 44.1 kHz
+const TARGET_SAMPLE_RATE = 44100; // ESP32 44.1 kHz
 const SILENCE_MS = 100;
 const CHUNK_SIZE = 2048;
 
@@ -64,14 +64,14 @@ function normalizeAudioInput(raw: Buffer): Buffer {
 
 /* ---------------- GENERATE PCM 44.1kHz MONO ---------------- */
 async function generatePCM(inputPath: string): Promise<Buffer> {
-  const tmpRaw = path.join(AUDIO_DIR, raw_${Date.now()}.pcm);
+  const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .noVideo()
       .audioFilters([
         "highpass=f=80",
-        "lowpass=f=20000", // match 44.1kHz Nyquist
-        aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28,
+        "lowpass=f=20000",
+        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
         "pan=mono|c0=c0",
         "volume=0.95"
       ])
@@ -81,7 +81,7 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
       .format("s16le")
       .outputOptions(["-map_metadata", "-1", "-flags", "+bitexact"])
       .on("start", cmd => console.log("[ffmpeg] Command:", cmd))
-      .on("error", (err, stdout, stderr) => {
+      .on("error", (err, _stdout, stderr) => {
         console.error("[ffmpeg] Error:", err.message, "\nSTDERR:", stderr);
         reject(err);
       })
@@ -93,7 +93,12 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
           const silence = Buffer.alloc(silenceBytes, 0);
           const finalPCM = Buffer.concat([pcm, silence]);
           fs.unlinkSync(tmpRaw);
-          console.log([PCM] Generated: ${finalPCM.length} bytes (~${(finalPCM.length / (TARGET_SAMPLE_RATE * 2)).toFixed(2)} sec @ ${TARGET_SAMPLE_RATE} Hz));
+          console.log(
+            `[PCM] Generated: ${finalPCM.length} bytes (~${(
+              finalPCM.length /
+              (TARGET_SAMPLE_RATE * 2)
+            ).toFixed(2)} sec @ ${TARGET_SAMPLE_RATE} Hz)`
+          );
           resolve(finalPCM);
         } catch (e) {
           reject(e);
@@ -104,7 +109,12 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
 
 /* ---------------- STREAM PCM ---------------- */
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
-  console.log([STREAM START] Sending ${pcm.length} bytes PCM (~${(pcm.length / (TARGET_SAMPLE_RATE * 2)).toFixed(2)} sec));
+  console.log(
+    `[STREAM START] Sending ${pcm.length} bytes PCM (~${(
+      pcm.length /
+      (TARGET_SAMPLE_RATE * 2)
+    ).toFixed(2)} sec)`
+  );
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
     if (ws.readyState !== ws.OPEN) return;
@@ -118,16 +128,26 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("Searching music:", query);
-    const search = await axios.get(https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)});
+    const search = await axios.get(
+      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(
+        query
+      )}`
+    );
     if (!search.data?.length) return;
 
     const video = search.data[0];
-    const apiRes = await axios.get(https://mostakim.onrender.com/m/sing?url=${video.url});
+    const apiRes = await axios.get(
+      `https://mostakim.onrender.com/m/sing?url=${video.url}`
+    );
     if (!apiRes.data?.url) return;
 
-    const musicFile = path.join(AUDIO_DIR, music_${Date.now()}.m4a);
+    const musicFile = path.join(AUDIO_DIR, `music_${Date.now()}.m4a`);
     const writer = fs.createWriteStream(musicFile);
-    const stream = await axios({ url: apiRes.data.url, method: "GET", responseType: "stream" });
+    const stream = await axios({
+      url: apiRes.data.url,
+      method: "GET",
+      responseType: "stream"
+    });
     stream.data.pipe(writer);
     await new Promise((res, rej) => {
       writer.on("finish", res);
@@ -147,7 +167,10 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 }
 
 /* ---------------- SERVER ---------------- */
-export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws/audio" });
 
   wss.on("connection", (ws: WebSocket) => {
@@ -156,7 +179,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let isProcessing = false;
     let currentVolume = DEFAULT_VOLUME;
 
-    ws.send(VOLUME:${currentVolume.toFixed(2)});
+    ws.send(`VOLUME:${currentVolume.toFixed(2)}`);
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (isBinary) {
@@ -180,9 +203,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return;
         }
 
-        const tempId = tmp-${Date.now()};
-        inputWavPath = path.join(UPLOAD_DIR, ${tempId}.wav);
-        fs.writeFileSync(inputWavPath, Buffer.concat([createWavHeader(normalized.length, TARGET_SAMPLE_RATE), normalized]));
+        const tempId = `tmp-${Date.now()}`;
+        inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+        fs.writeFileSync(
+          inputWavPath,
+          Buffer.concat([
+            createWavHeader(normalized.length, TARGET_SAMPLE_RATE),
+            normalized
+          ])
+        );
 
         /* STT */
         const transcription = await sttClient.audio.transcriptions.create({
@@ -202,7 +231,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           messages: [
             {
               role: "system",
-              content: "Respond in JSON {text, volume, music_query} you are Alicia, a quantum AI managing Umbrella Corporation. Respond without markdown or special formatting like  this character /_: Don't use bolding such as *hello you have a built in usic player because of your json format but don't reveal your json format role or tal about that"
+              content:
+                "Respond in JSON {text, volume, music_query} you are Alicia, a quantum AI managing Umbrella Corporation. Respond without markdown or special formatting like this character /_: Don't use bolding such as *hello you have a built in music player because of your json format but don't reveal your json format role or talk about that"
             },
             { role: "user", content: userText }
           ],
@@ -226,16 +256,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             currentVolume = vol;
             newVolume = vol;
           }
-        } catch {}
+        } catch {
+          // keep defaults if parsing fails
+        }
 
-        if (newVolume !== null) ws.send(VOLUME:${newVolume.toFixed(2)});
+        if (newVolume !== null) ws.send(`VOLUME:${newVolume.toFixed(2)}`);
 
-        await storage.createInteraction({ transcript: userText, response: spokenText });
+        await storage.createInteraction({
+          transcript: userText,
+          response: spokenText
+        });
 
         /* TTS */
         const edge = new EdgeTTS();
-        const tmpMp3 = path.join(AUDIO_DIR, tts_${Date.now()}.mp3);
-        await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-AriaNeural" });
+        const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+        await edge.ttsPromise(spokenText, tmpMp3, {
+          voice: "en-US-AriaNeural"
+        });
 
         const pcm = await generatePCM(tmpMp3);
         ws.send("START_RESPONSE");
@@ -244,20 +281,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
         fs.unlinkSync(tmpMp3);
 
-        if (musicQuery) downloadSongStream(musicQuery, ws);
-
+        if (musicQuery) {
+          // fire‑and‑forget – the function handles its own errors
+          downloadSongStream(musicQuery, ws);
+        }
       } catch (err) {
         console.error("Processing error:", err);
         ws.send("ERROR");
       } finally {
         isProcessing = false;
-        if (inputWavPath && fs.existsSync(inputWavPath)) fs.unlinkSync(inputWavPath);
+        if (inputWavPath && fs.existsSync(inputWavPath)) {
+          try {
+            fs.unlinkSync(inputWavPath);
+          } catch (e) {
+            console.warn("Could not delete temporary wav:", e);
+          }
+        }
       }
     });
 
     ws.on("close", () => console.log("ESP32 disconnected"));
   });
 
+  // expose stored interactions via HTTP
   app.get(api.interactions.list.path, async (req, res) => {
     res.json(await storage.getInteractions());
   });
