@@ -6,9 +6,6 @@
 #include <Preferences.h>
 #include <algorithm>
 #include <string.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
 
 const char* WS_HOST = "espaimochibot.onrender.com";
 const int WS_PORT = 443;
@@ -21,15 +18,11 @@ const char* WS_PATH = "/ws/audio";
 #define I2S_BCK 4
 #define I2S_WS  5
 #define I2S_DOUT 6
-#define OLED_SDA 20
-#define OLED_SCL 21
 
 Adafruit_NeoPixel pixels(1, LED_PIN, NEO_GRB + NEO_KHZ800);
-Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire, -1);
 
 WebSocketsClient webSocket;
 Preferences prefs;
-TaskHandle_t faceTaskHandle;
 
 bool is_recording = false;
 bool isPlaying = false;
@@ -60,21 +53,6 @@ const int SPEECH_CONFIRM = 4;
 unsigned long record_start_time = 0;
 const unsigned long MAX_RECORD_MS = 8000;
 
-float currentFaceX = 0;
-float currentFaceY = 0;
-
-float targetFaceX = 0;
-float targetFaceY = 0;
-
-float easing = 0.15f;
-
-unsigned long blinkTimer = 0;
-unsigned long eyeMoveTimer = 0;
-unsigned long animUpdateTimer = 0;
-
-bool blink = false;
-bool mouthOpen = false;
-
 // --------------------
 // Helpers
 // --------------------
@@ -82,18 +60,6 @@ bool mouthOpen = false;
 void setColor(uint32_t color){
   pixels.setPixelColor(0,color);
   pixels.show();
-}
-
-void showStatus(const char* msg,bool clear=true){
-
-  if(clear) display.clearDisplay();
-
-  display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(0,28);
-  display.println(msg);
-  display.display();
-
 }
 
 float calculateRMS(int16_t* buffer,size_t samples){
@@ -274,130 +240,6 @@ void webSocketEvent(WStype_t type,uint8_t* payload,size_t length){
 // Face Animation
 // --------------------
 
-void drawFace(){
-
-  display.clearDisplay();
-
-  currentFaceX+=(targetFaceX-currentFaceX)*easing;
-  currentFaceY+=(targetFaceY-currentFaceY)*easing;
-
-  int centerX=64+currentFaceX;
-  int centerY=32+currentFaceY;
-
-  int eyeDist=22;
-
-  int leftEyeX=centerX-eyeDist;
-  int rightEyeX=centerX+eyeDist;
-
-  int eyeY=centerY-5;
-
-  int mouthX=centerX;
-  int mouthY=centerY+12;
-
-  if(isPlaying){
-
-    if(blink){
-
-      display.fillRect(leftEyeX-6,eyeY,12,2,SH110X_WHITE);
-      display.fillRect(rightEyeX-6,eyeY,12,2,SH110X_WHITE);
-
-    }
-
-    else{
-
-      display.fillCircle(leftEyeX,eyeY,5,SH110X_WHITE);
-      display.fillCircle(rightEyeX,eyeY,5,SH110X_WHITE);
-
-    }
-
-    if(audioLevel>2000){
-
-      display.fillRoundRect(mouthX-12,mouthY-6,24,14,4,SH110X_WHITE);
-
-    }
-
-    else if(audioLevel>900){
-
-      display.fillRoundRect(mouthX-10,mouthY-3,20,8,4,SH110X_WHITE);
-
-    }
-
-    else{
-
-      display.fillRoundRect(mouthX-8,mouthY,16,4,2,SH110X_WHITE);
-
-    }
-
-  }
-
-  else{
-
-    if(blink){
-
-      display.fillRect(leftEyeX-5,eyeY,10,2,SH110X_WHITE);
-      display.fillRect(rightEyeX-5,eyeY,10,2,SH110X_WHITE);
-
-    }
-
-    else{
-
-      display.fillCircle(leftEyeX,eyeY,4,SH110X_WHITE);
-      display.fillCircle(rightEyeX,eyeY,4,SH110X_WHITE);
-
-    }
-
-    display.fillRect(mouthX-12,mouthY,24,3,SH110X_WHITE);
-
-  }
-
-  display.display();
-
-}
-
-void updateFaceAnim(){
-
-  if(millis()-animUpdateTimer<30) return;
-  animUpdateTimer=millis();
-
-  if(!blink && millis()>blinkTimer){
-
-    blink=true;
-    blinkTimer=millis()+150;
-
-  }
-
-  if(blink && millis()>blinkTimer){
-
-    blink=false;
-    blinkTimer=millis()+random(2000,5000);
-
-  }
-
-  if(millis()>eyeMoveTimer){
-
-    targetFaceX=random(-12,13);
-    targetFaceY=random(-6,7);
-
-    eyeMoveTimer=millis()+random(1000,3000);
-
-  }
-
-  drawFace();
-
-}
-
-void faceTask(void* pv){
-
-  while(true){
-
-    if(isWSConnected) updateFaceAnim();
-
-    vTaskDelay(10/portTICK_PERIOD_MS);
-
-  }
-
-}
-
 // --------------------
 // Setup
 // --------------------
@@ -409,18 +251,6 @@ void setup(){
   pixels.begin();
 
   setColor(pixels.Color(50,50,0));
-
-  Wire.begin(OLED_SDA,OLED_SCL,400000);
-
-  display.begin(0x3C,true);
-
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(0,20);
-  display.println("ALEXATRON");
-  display.display();
-
-  delay(1500);
 
   prefs.begin("alexatron",false);
 
@@ -481,8 +311,6 @@ void setup(){
   webSocket.beginSSL(WS_HOST,WS_PORT,WS_PATH);
 
   webSocket.onEvent(webSocketEvent);
-
-  xTaskCreatePinnedToCore(faceTask,"faceTask",4096,NULL,1,&faceTaskHandle,1);
 
 }
 
