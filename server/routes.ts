@@ -10,7 +10,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import axios from "axios";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
@@ -151,7 +151,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             role: "user", 
             content: userText
           }],
-          model: "groq/compound",
+          model: "qwen/qwen3-32b",
           temperature: 0.6,
           max_tokens: 300
         });
