@@ -117,7 +117,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const fullAudio = Buffer.concat(audioChunks);
         audioChunks = [];
         
-        if (fullAudio.length < 200) {
+        if (fullAudio.length < 800) {
           ws.send("ERROR: too short");
           return;
         }
@@ -125,15 +125,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const tempId = `tmp-${Date.now()}`;
         inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
         fs.writeFileSync(inputWavPath, Buffer.concat([
-          createWavHeader(fullAudio.length, 16000),
+          createWavHeader(fullAudio.length, 44100),
           fullAudio
         ]));
 
+        // Resample to 16kHz for Whisper (ESP32 sends 44100Hz)
+        const resampledPath = path.join(UPLOAD_DIR, `${tempId}_16k.wav`);
+        await new Promise<void>((resolve, reject) => {
+          ffmpeg(inputWavPath)
+            .noVideo()
+            .audioFilters([`aresample=16000:resampler=soxr:precision=28`])
+            .audioCodec("pcm_s16le")
+            .audioChannels(1)
+            .audioFrequency(16000)
+            .format("wav")
+            .on("error", reject)
+            .on("end", resolve)
+            .save(resampledPath);
+        });
+
         // STT
         const transcription = await sttClient.audio.transcriptions.create({
-          file: fs.createReadStream(inputWavPath),
+          file: fs.createReadStream(resampledPath),
           model: "whisper-large-v3-turbo"
         });
+
+        // Cleanup resampled file
+        if (fs.existsSync(resampledPath)) fs.unlinkSync(resampledPath);
 
         const userText = transcription.text?.trim() || "";
         if (!userText) {
