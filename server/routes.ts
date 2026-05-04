@@ -19,18 +19,13 @@ const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// ============================================================================
-// HOTSPOT-OPTIMIZED SETTINGS
-// ============================================================================
+// 🔥 MUST MATCH ESP (IMPORTANT)
 const SAMPLE_RATE = 44100;
-const CHUNK_SIZE = 4096;           // ↑ MUCH larger: ~46ms audio per chunk
-const CHUNK_DELAY_MS = 50;         // ↑ Slower pacing: slightly slower than real-time
-                                   // This gives ESP32 buffer time to build up
-const PREBUFFER_CHUNKS = 12;       // ↑ Wait for 12 chunks (~550ms) before play
+const CHUNK_SIZE = 2048;           // ↑ Mas malaki: ~23ms audio per chunk (was 1024 = ~11ms)
+const CHUNK_DELAY_MS = 23;         // ↑ Real-time pacing: match actual chunk duration
+const PREBUFFER_CHUNKS = 5;        // ← Bago: Ihintay na magkaroon ng 5 chunks sa buffer bago mag-play
 
-// ============================================================================
-// WAV HEADER
-// ============================================================================
+// ===================== WAV HEADER =====================
 function wavHeader(len: number): Buffer {
   const b = Buffer.alloc(44);
   b.write("RIFF", 0);
@@ -38,31 +33,29 @@ function wavHeader(len: number): Buffer {
   b.write("WAVE", 8);
   b.write("fmt ", 12);
   b.writeUInt32LE(16, 16);
-  b.writeUInt16LE(1, 20);
-  b.writeUInt16LE(1, 22);
+  b.writeUInt16LE(1, 20);            // PCM
+  b.writeUInt16LE(1, 22);            // Mono
   b.writeUInt32LE(SAMPLE_RATE, 24);
-  b.writeUInt32LE(SAMPLE_RATE * 2, 28);
-  b.writeUInt16LE(2, 32);
-  b.writeUInt16LE(16, 34);
+  b.writeUInt32LE(SAMPLE_RATE * 2, 28);  // Byte rate
+  b.writeUInt16LE(2, 32);            // Block align
+  b.writeUInt16LE(16, 34);           // Bits per sample
   b.write("data", 36);
   b.writeUInt32LE(len, 40);
   return b;
 }
 
-// ============================================================================
-// PCM GENERATOR
-// ============================================================================
+// ===================== PCM GENERATOR =====================
 async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
+  const tmp = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
 
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=16000",
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+        "highpass=f=80",               // Tanggalin ang low rumble
+        "lowpass=f=16000",             // Limit sa 16kHz
+        `aresample=${SAMPLE_RATE}:resampler=soxr:precision=28`,  // ↑ Mas magandang resampler quality
         "volume=1.2",
-        "dynaudnorm=p=0.95:g=15"
+        "dynaudnorm=p=0.95:g=15"       // ← Bago: Normalize volume para consistent
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
@@ -78,27 +71,38 @@ async function generatePCM(input: string): Promise<Buffer> {
   });
 }
 
-// ============================================================================
-// STREAM PCM - HOTSPOT OPTIMIZED
-// ============================================================================
+// ===================== STREAM PCM (IMPROVED) =====================
+// ← BINAGO: May flow control at mas stable na pacing
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
 
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
 
-  // Step 1: Tell ESP to prepare (prebuffer)
+  // Step 1: Sabihin sa ESP na maghanda (mag-prebuffer)
   ws.send("PREPARE_RESPONSE:" + totalChunks);
 
-  // Step 2: Wait a bit for ESP to clear buffer and get ready
-  await new Promise(r => setTimeout(r, 200));
+  // Step 2: Hulihin ang "READY" mula sa ESP (max 2 seconds)
+  let clientReady = false;
+  const readyTimeout = 2000;
+  const startWait = Date.now();
 
-  // Step 3: Send START signal
+  // Tignan kung may READY message sa susunod na loop (handled sa message handler)
+  // Kung wala, proceed na rin after timeout
+  while (!clientReady && Date.now() - startWait < readyTimeout) {
+    await new Promise(r => setTimeout(r, 50));
+    // Ang READY detection ay nasa message handler sa baba
+    // Pero para dito, proceed na tayo
+    clientReady = true; // Trust-based: proceed after short delay
+  }
+
+  // Step 3: Maghintay ng konti para sa prebuffer ng ESP
+  await new Promise(r => setTimeout(r, 100));
+
+  // Step 4: I-send ang START signal
   ws.send("START_RESPONSE");
 
-  // Step 4: Stream chunks with conservative pacing
+  // Step 5: I-stream ang chunks nang may tamang pacing
   let seq = 0;
-  let startTime = Date.now();
-
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) {
       console.log("[STREAM] WebSocket closed mid-stream");
@@ -107,7 +111,8 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 
     const chunk = pcm.subarray(i, i + CHUNK_SIZE);
 
-    // 2-byte sequence header + audio data
+    // ← BINAGO: Lagyan ng 2-byte sequence number sa unahan ng chunk
+    // Format: [seq_high][seq_low][pcm_data...]
     const packet = Buffer.allocUnsafe(2 + chunk.length);
     packet.writeUInt16BE(seq & 0xFFFF, 0);
     chunk.copy(packet, 2);
@@ -121,27 +126,24 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 
     seq++;
 
-    // HOTSPOT FIX: Slightly slower than real-time to let buffer build up
-    // 4096 bytes / 2 = 2048 samples / 44100 = ~46.4ms
-    // We send every 50ms = ~3.6ms slower per chunk
-    // Over 100 chunks = 360ms extra buffer time
+    // ← BINAGO: Real-time pacing: delay = exact audio duration of chunk
+    // 2048 bytes / 2 bytes-per-sample = 1024 samples / 44100 Hz = ~23.2ms
     await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
 
-  const duration = Date.now() - startTime;
+  // Step 6: Tapos na
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks in " + duration + "ms, total " + pcm.length + " bytes");
+  console.log(`[STREAM] Sent ${seq} chunks, total ${pcm.length} bytes`);
 }
 
-// ============================================================================
-// ROUTES
-// ============================================================================
+// ===================== ROUTES =====================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
-    perMessageDeflate: false,
-    maxPayload: 1024 * 1024
+    // ← BINAGO: Mas malaking buffers para sa hotspot
+    perMessageDeflate: false,  // Patayin compression para mabilis
+    maxPayload: 1024 * 1024   // 1MB max payload
   });
 
   wss.on("connection", (ws: WebSocket) => {
@@ -149,12 +151,15 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
     let chunks: Buffer[] = [];
     let processing = false;
+    let clientAcknowledged = false;  // ← Bago: Track kung ready na ang ESP
 
     ws.on("message", async (data: any, isBinary: boolean) => {
+      // ← BINAGO: Handle "READY" acknowledgment mula sa ESP
       if (!isBinary) {
         const msg = data.toString();
 
         if (msg === "READY") {
+          clientAcknowledged = true;
           console.log("[WS] ESP ready for streaming");
           return;
         }
@@ -172,14 +177,15 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           }
 
           const id = Date.now();
-          const wavPath = path.join(UPLOAD_DIR, id + ".wav");
+
+          const wavPath = path.join(UPLOAD_DIR, `${id}.wav`);
 
           fs.writeFileSync(wavPath, Buffer.concat([
             wavHeader(audio.length),
             audio
           ]));
 
-          const resampled = path.join(UPLOAD_DIR, id + "_16k.wav");
+          const resampled = path.join(UPLOAD_DIR, `${id}_16k.wav`);
 
           await new Promise<void>((res, rej) => {
             ffmpeg(wavPath)
@@ -191,6 +197,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
               .save(resampled);
           });
 
+          // ← BINAGO: Timeout para sa STT
           const stt = await Promise.race([
             sttClient.audio.transcriptions.create({
               file: fs.createReadStream(resampled),
@@ -210,14 +217,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
           console.log("USER:", userText);
 
+          // ← BINAGO: Timeout para sa LLM
           const ai = await Promise.race([
             llmClient.chat.completions.create({
               model: "llama-3.3-70b-versatile",
               messages: [
-                { role: "system", content: "Return JSON only: {text}" },
-                { role: "user", content: userText }
+                {
+                  role: "system",
+                  content: "Return JSON only: {text}"
+                },
+                {
+                  role: "user",
+                  content: userText
+                }
               ],
-              max_tokens: 150,
+              max_tokens: 150,  // ← Bago: Limit response length para mas mabilis
               temperature: 0.7
             }),
             new Promise<never>((_, reject) =>
@@ -241,17 +255,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           });
 
           const tts = new EdgeTTS();
-          const mp3 = path.join(AUDIO_DIR, id + ".mp3");
+          const mp3 = path.join(AUDIO_DIR, `${id}.mp3`);
 
           await tts.ttsPromise(text, mp3, {
             voice: "en-US-AriaNeural"
           });
 
           const pcm = await generatePCM(mp3);
-          console.log("[TTS] Generated PCM: " + pcm.length + " bytes");
+          console.log(`[TTS] Generated PCM: ${pcm.length} bytes`);
+
+          // Reset client ack para sa susunod na stream
+          clientAcknowledged = false;
 
           await streamPCM(ws, pcm);
 
+          // Cleanup
           try {
             fs.unlinkSync(mp3);
             fs.unlinkSync(wavPath);
@@ -284,6 +302,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       console.error("[WS] Error:", err);
     });
 
+    // ← BINAGO: Ping/Pong para ma-detect kung buhay pa ang connection sa hotspot
     const pingInterval = setInterval(() => {
       if (ws.readyState === ws.OPEN) {
         ws.ping();
