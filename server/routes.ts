@@ -188,61 +188,70 @@ export async function registerRoutes(
 
         console.log("User:", userText);
 
-        // =========================
-        // AI Response with Web Search
-        // =========================
-        const chatCompletion =
-          await llmClient.chat.completions.create({
-            messages: [
-              {
-                role: "system",
-                content:
-                  'Respond ONLY in valid JSON format: {"text":"...","volume":number}. You are Alicia, an advanced quantum AI assistant with internet access. Give intelligent, natural, helpful answers. No markdown. No extra commentary.'
-              },
-              {
-                role: "user",
-                content: userText
-              }
-            ],
-            model: "openai/gpt-oss-120b",
-            temperature: 0.6,
-            max_completion_tokens: 300,
-            top_p: 1,
-            reasoning_effort: "medium",
-            stream: false,
-            tools: [
-              {
-                type: "browser_search"
-              }
-            ]
-          });
+        /// FIXES:
+/// 1. Groq browser_search tool often breaks JSON formatting
+/// 2. GPT-OSS may return tool-call structures instead of plain content
+/// 3. ESP expects immediate START_RESPONSE + binary stream
+/// 4. Safer fallback added
+/// 5. Removed unstable tool mode for real-time voice
+/// 6. Faster model for voice assistant
 
-        const raw =
-          chatCompletion.choices?.[0]?.message?.content?.trim() ||
-          "{}";
+// =========================
+// REPLACE ONLY LLM SECTION
+// =========================
 
-        let spokenText =
-          "I'm sorry, I couldn't process that properly.";
+const chatCompletion =
+  await llmClient.chat.completions.create({
+    messages: [
+      {
+        role: "system",
+        content:
+          'You are Alicia, a highly intelligent quantum AI voice assistant. Respond ONLY with raw JSON in this exact format: {"text":"your response","volume":1.0}. No markdown, no code block, no explanations.'
+      },
+      {
+        role: "user",
+        content: userText
+      }
+    ],
+    model: "llama-3.3-70b-versatile",
+    temperature: 0.6,
+    max_tokens: 250,
+    top_p: 1,
+    stream: false
+  });
 
-        try {
-          const parsed = JSON.parse(raw);
+let raw =
+  chatCompletion.choices?.[0]?.message?.content?.trim() || "";
 
-          spokenText = parsed.text || spokenText;
+let spokenText =
+  "I'm sorry, I couldn't process that properly.";
 
-          if (parsed.volume) {
-            currentVolume = parseFloat(parsed.volume);
+try {
+  // Clean accidental markdown/codeblocks
+  raw = raw
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
 
-            if (!isNaN(currentVolume)) {
-              ws.send(
-                `VOLUME:${currentVolume.toFixed(2)}`
-              );
-            }
-          }
-        } catch {
-          spokenText = raw;
-        }
+  const parsed = JSON.parse(raw);
 
-        console.log("AI:", spokenText);
+  spokenText = parsed.text || spokenText;
+
+  if (parsed.volume !== undefined) {
+    currentVolume = parseFloat(parsed.volume);
+
+    if (!isNaN(currentVolume)) {
+      ws.send(`VOLUME:${currentVolume.toFixed(2)}`);
+    }
+  }
+} catch (err) {
+  console.log("JSON parse failed, fallback raw text:", raw);
+
+  // If AI ignored JSON, use plain text directly
+  spokenText = raw || spokenText;
+}
+
+console.log("AI:", spokenText);
 
         // =========================
         // Save interaction
