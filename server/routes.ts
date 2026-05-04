@@ -19,12 +19,9 @@ const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// 🔥 MUST MATCH ESP (IMPORTANT)
-const SAMPLE_RATE = 44100;
-const CHUNK_SIZE = 1024;
-const CHUNK_DELAY_MS = 8;
+// 🔥 FIXED: match ESP32
+const SAMPLE_RATE = 16000;
 
-// ===================== WAV HEADER =====================
 function wavHeader(len: number): Buffer {
   const b = Buffer.alloc(44);
   b.write("RIFF", 0);
@@ -43,65 +40,76 @@ function wavHeader(len: number): Buffer {
   return b;
 }
 
-// ===================== PCM GENERATOR =====================
-async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
-
-  return new Promise((resolve, reject) => {
-    ffmpeg(input)
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=16000",
-        `aresample=${SAMPLE_RATE}:resampler=soxr`,
-        "volume=1.2"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => {
-        const pcm = fs.readFileSync(tmp);
-        fs.unlinkSync(tmp);
-        resolve(pcm);
-      })
-      .save(tmp);
-  });
-}
-
 // ===================== STREAM PCM =====================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
-  if (ws.readyState !== ws.OPEN) return;
+  if (ws.readyState !== WebSocket.OPEN) return;
 
   ws.send("START_RESPONSE");
 
-  await new Promise(r => setTimeout(r, 60));
+  await new Promise(r => setTimeout(r, 100));
 
-  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
-    if (ws.readyState !== ws.OPEN) return;
+  for (let i = 0; i < pcm.length; i += 1024) {
+    if (ws.readyState !== WebSocket.OPEN) break;
 
-    ws.send(pcm.subarray(i, i + CHUNK_SIZE), { binary: true });
+    ws.send(pcm.subarray(i, i + 1024));
 
-    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+    await new Promise(r => setTimeout(r, 12)); // 🔥 stability delay
   }
+
+  await new Promise(r => setTimeout(r, 50));
 
   ws.send("FINISH_RESPONSE");
 }
 
+// ===================== TTS → PCM (FIXED) =====================
+async function generatePCM(text: string): Promise<Buffer> {
+  const id = Date.now();
+
+  const mp3 = path.join(AUDIO_DIR, `${id}.mp3`);
+  const pcmFile = path.join(AUDIO_DIR, `${id}.pcm`);
+
+  const tts = new EdgeTTS();
+
+  await tts.ttsPromise(text, mp3, {
+    voice: "en-US-AriaNeural"
+  });
+
+  await new Promise<void>((res, rej) => {
+    ffmpeg(mp3)
+      .audioFrequency(SAMPLE_RATE)
+      .audioChannels(1)
+      .audioCodec("pcm_s16le")
+      .format("s16le")
+      .on("end", res)
+      .on("error", rej)
+      .save(pcmFile);
+  });
+
+  const pcm = fs.readFileSync(pcmFile);
+
+  fs.unlinkSync(mp3);
+  fs.unlinkSync(pcmFile);
+
+  return pcm;
+}
+
 // ===================== ROUTES =====================
 export async function registerRoutes(httpServer: Server, app: Express) {
+
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio"
   });
 
+  let processing = false;
+
   wss.on("connection", (ws: WebSocket) => {
     console.log("ESP connected");
 
     let chunks: Buffer[] = [];
-    let processing = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
+
       if (isBinary) {
         chunks.push(Buffer.from(data));
         return;
@@ -109,7 +117,9 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
       const msg = data.toString();
 
-      if (msg !== "END_STREAM" || processing) return;
+      if (msg !== "END_STREAM") return;
+      if (processing) return;
+
       processing = true;
 
       try {
@@ -124,13 +134,12 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         const id = Date.now();
 
         const wavPath = path.join(UPLOAD_DIR, `${id}.wav`);
+        const resampled = path.join(UPLOAD_DIR, `${id}_16k.wav`);
 
         fs.writeFileSync(wavPath, Buffer.concat([
           wavHeader(audio.length),
           audio
         ]));
-
-        const resampled = path.join(UPLOAD_DIR, `${id}_16k.wav`);
 
         await new Promise<void>((res, rej) => {
           ffmpeg(wavPath)
@@ -155,24 +164,17 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         const ai = await llmClient.chat.completions.create({
           model: "llama-3.3-70b-versatile",
           messages: [
-            {
-              role: "system",
-              content: "Return JSON only: {text}"
-            },
-            {
-              role: "user",
-              content: userText
-            }
+            { role: "system", content: "Return JSON only: {text}" },
+            { role: "user", content: userText }
           ]
         });
 
-        const raw = ai.choices[0].message.content || "{}";
-
         let text = "Sorry.";
+
         try {
-          text = JSON.parse(raw).text || text;
+          text = JSON.parse(ai.choices[0].message.content || "{}").text || text;
         } catch {
-          text = raw;
+          text = ai.choices[0].message.content || text;
         }
 
         await storage.createInteraction({
@@ -180,19 +182,10 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           response: text
         });
 
-        const tts = new EdgeTTS();
-
-        const mp3 = path.join(AUDIO_DIR, `${id}.mp3`);
-
-        await tts.ttsPromise(text, mp3, {
-          voice: "en-US-AriaNeural"
-        });
-
-        const pcm = await generatePCM(mp3);
+        const pcm = await generatePCM(text);
 
         await streamPCM(ws, pcm);
 
-        fs.unlinkSync(mp3);
         fs.unlinkSync(wavPath);
         fs.unlinkSync(resampled);
 
