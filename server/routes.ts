@@ -1,456 +1,211 @@
 import type { Express } from "express";
 import { Server } from "http";
-import { storage } from "./storage";
-import { api } from "@shared/routes";
+import { WebSocketServer, WebSocket } from "ws";
+import Groq from "groq-sdk";
 import fs from "fs";
 import path from "path";
-import Groq from "groq-sdk";
-import { WebSocketServer, WebSocket } from "ws";
 import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
+import { storage } from "./storage";
 
-// =============================
-// CONFIG
-// =============================
-const GROQ_API_KEY =
-  process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
-const AUDIO_DIR = path.join(
-  process.cwd(),
-  "generated_audio"
-);
+const AUDIO_DIR = path.join(process.cwd(), "audio");
+const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 
-const UPLOAD_DIR = path.join(
-  process.cwd(),
-  "uploads"
-);
+if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-if (!fs.existsSync(AUDIO_DIR)) {
-  fs.mkdirSync(AUDIO_DIR, { recursive: true });
+// 🔥 MUST MATCH ESP (IMPORTANT)
+const SAMPLE_RATE = 44100;
+const CHUNK_SIZE = 1024;
+const CHUNK_DELAY_MS = 8;
+
+// ===================== WAV HEADER =====================
+function wavHeader(len: number): Buffer {
+  const b = Buffer.alloc(44);
+  b.write("RIFF", 0);
+  b.writeUInt32LE(36 + len, 4);
+  b.write("WAVE", 8);
+  b.write("fmt ", 12);
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20);
+  b.writeUInt16LE(1, 22);
+  b.writeUInt32LE(SAMPLE_RATE, 24);
+  b.writeUInt32LE(SAMPLE_RATE * 2, 28);
+  b.writeUInt16LE(2, 32);
+  b.writeUInt16LE(16, 34);
+  b.write("data", 36);
+  b.writeUInt32LE(len, 40);
+  return b;
 }
 
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
-
-// =============================
-// AUDIO SETTINGS
-// =============================
-const DEFAULT_VOLUME = 1.0;
-
-// Lower bitrate for hotspot stability
-const TARGET_SAMPLE_RATE = 22050;
-
-// Larger packets
-const CHUNK_SIZE = 4096;
-
-// More stable pacing
-const CHUNK_DELAY_MS = 15;
-
-// =============================
-// WAV HEADER
-// =============================
-function createWavHeader(
-  pcmLength: number,
-  sampleRate = TARGET_SAMPLE_RATE
-): Buffer {
-  const header = Buffer.alloc(44);
-
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcmLength, 4);
-  header.write("WAVE", 8);
-
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * 2, 28);
-
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-
-  header.write("data", 36);
-  header.writeUInt32LE(pcmLength, 40);
-
-  return header;
-}
-
-// =============================
-// GENERATE PCM
-// =============================
-async function generatePCM(
-  inputPath: string
-): Promise<Buffer> {
-  const tmpRaw = path.join(
-    AUDIO_DIR,
-    `raw_${Date.now()}.pcm`
-  );
+// ===================== PCM GENERATOR =====================
+async function generatePCM(input: string): Promise<Buffer> {
+  const tmp = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
 
   return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .noVideo()
+    ffmpeg(input)
       .audioFilters([
         "highpass=f=80",
-        "lowpass=f=12000",
-        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
-        "pan=mono|c0=c0",
-        "volume=1.0"
+        "lowpass=f=16000",
+        `aresample=${SAMPLE_RATE}:resampler=soxr`,
+        "volume=1.2"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
+      .audioFrequency(SAMPLE_RATE)
       .format("s16le")
       .on("error", reject)
       .on("end", () => {
-        const pcm = fs.readFileSync(tmpRaw);
-
-        if (fs.existsSync(tmpRaw)) {
-          fs.unlinkSync(tmpRaw);
-        }
-
+        const pcm = fs.readFileSync(tmp);
+        fs.unlinkSync(tmp);
         resolve(pcm);
       })
-      .save(tmpRaw);
+      .save(tmp);
   });
 }
 
-// =============================
-// STREAM AUDIO
-// =============================
-async function streamPCM(
-  ws: WebSocket,
-  pcm: Buffer,
-  startMsg: string,
-  endMsg: string
-) {
+// ===================== STREAM PCM =====================
+async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
 
-  ws.send(startMsg);
+  ws.send("START_RESPONSE");
 
-  // Small startup buffer
-  await new Promise((r) => setTimeout(r, 40));
+  await new Promise(r => setTimeout(r, 60));
 
-  for (
-    let i = 0;
-    i < pcm.length;
-    i += CHUNK_SIZE
-  ) {
+  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
 
-    const chunk = pcm.slice(i, i + CHUNK_SIZE);
+    ws.send(pcm.subarray(i, i + CHUNK_SIZE), { binary: true });
 
-    ws.send(chunk, { binary: true });
-
-    await new Promise((r) =>
-      setTimeout(r, CHUNK_DELAY_MS)
-    );
+    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
 
-  ws.send(endMsg);
+  ws.send("FINISH_RESPONSE");
 }
 
-// =============================
-// SAFE JSON PARSER
-// =============================
-function parseAIResponse(raw: string) {
-  let spokenText =
-    "I'm sorry, I couldn't process that properly.";
-
-  let volume = DEFAULT_VOLUME;
-
-  try {
-    raw = raw
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
-
-    const parsed = JSON.parse(raw);
-
-    spokenText = parsed.text || spokenText;
-
-    if (
-      parsed.volume !== undefined &&
-      !isNaN(parseFloat(parsed.volume))
-    ) {
-      volume = parseFloat(parsed.volume);
-    }
-  } catch {
-    spokenText = raw || spokenText;
-  }
-
-  return {
-    spokenText,
-    volume
-  };
-}
-
-// =============================
-// MAIN ROUTES
-// =============================
-export async function registerRoutes(
-  httpServer: Server,
-  app: Express
-): Promise<Server> {
+// ===================== ROUTES =====================
+export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
     server: httpServer,
-    path: "/ws/audio",
-    perMessageDeflate: false
+    path: "/ws/audio"
   });
 
   wss.on("connection", (ws: WebSocket) => {
     console.log("ESP connected");
 
-    let audioChunks: Buffer[] = [];
-    let isProcessing = false;
-    let currentVolume = DEFAULT_VOLUME;
+    let chunks: Buffer[] = [];
+    let processing = false;
 
-    ws.send(
-      `VOLUME:${currentVolume.toFixed(2)}`
-    );
-
-    ws.on(
-      "message",
-      async (data: any, isBinary: boolean) => {
-        if (isBinary) {
-          audioChunks.push(Buffer.from(data));
-          return;
-        }
-
-        const msg = data.toString();
-
-        if (
-          msg !== "END_STREAM" ||
-          isProcessing
-        ) {
-          return;
-        }
-
-        isProcessing = true;
-
-        let inputWavPath = "";
-        let resampledPath = "";
-
-        try {
-          const fullAudio = Buffer.concat(
-            audioChunks
-          );
-
-          audioChunks = [];
-
-          if (fullAudio.length < 800) {
-            ws.send("ERROR: too short");
-            return;
-          }
-
-          const tempId = `tmp-${Date.now()}`;
-
-          inputWavPath = path.join(
-            UPLOAD_DIR,
-            `${tempId}.wav`
-          );
-
-          fs.writeFileSync(
-            inputWavPath,
-            Buffer.concat([
-              createWavHeader(
-                fullAudio.length,
-                TARGET_SAMPLE_RATE
-              ),
-              fullAudio
-            ])
-          );
-
-          // =============================
-          // RESAMPLE FOR WHISPER
-          // =============================
-          resampledPath = path.join(
-            UPLOAD_DIR,
-            `${tempId}_16k.wav`
-          );
-
-          await new Promise<void>(
-            (resolve, reject) => {
-              ffmpeg(inputWavPath)
-                .noVideo()
-                .audioFilters([
-                  `aresample=16000:resampler=soxr:precision=28`
-                ])
-                .audioCodec("pcm_s16le")
-                .audioChannels(1)
-                .audioFrequency(16000)
-                .format("wav")
-                .on("error", reject)
-                .on("end", resolve)
-                .save(resampledPath);
-            }
-          );
-
-          // =============================
-          // STT
-          // =============================
-          const transcription =
-            await sttClient.audio.transcriptions.create(
-              {
-                file: fs.createReadStream(
-                  resampledPath
-                ),
-                model:
-                  "whisper-large-v3-turbo"
-              }
-            );
-
-          const userText =
-            transcription.text?.trim() || "";
-
-          if (!userText) {
-            ws.send("ERROR: no text");
-            return;
-          }
-
-          console.log(
-            "User:",
-            userText
-          );
-
-          // =============================
-          // AI
-          // =============================
-          const chat =
-            await llmClient.chat.completions.create(
-              {
-                messages: [
-                  {
-                    role: "system",
-                    content:
-                      'You are Alicia, an advanced AI assistant. Respond ONLY with raw JSON: {"text":"response","volume":1.0}. No markdown.'
-                  },
-                  {
-                    role: "user",
-                    content: userText
-                  }
-                ],
-                model:
-                  "llama-3.3-70b-versatile",
-                temperature: 0.6,
-                max_tokens: 250,
-                top_p: 1,
-                stream: false
-              }
-            );
-
-          const raw =
-            chat.choices?.[0]?.message?.content?.trim() ||
-            "";
-
-          const {
-            spokenText,
-            volume
-          } = parseAIResponse(raw);
-
-          currentVolume = volume;
-
-          ws.send(
-            `VOLUME:${currentVolume.toFixed(
-              2
-            )}`
-          );
-
-          console.log(
-            "AI:",
-            spokenText
-          );
-
-          // =============================
-          // SAVE HISTORY
-          // =============================
-          await storage.createInteraction({
-            transcript: userText,
-            response: spokenText
-          });
-
-          // =============================
-          // TTS
-          // =============================
-          const edge = new EdgeTTS();
-
-          const tmpMp3 = path.join(
-            AUDIO_DIR,
-            `tts_${Date.now()}.mp3`
-          );
-
-          await edge.ttsPromise(
-            spokenText,
-            tmpMp3,
-            {
-              voice: "en-US-AriaNeural"
-            }
-          );
-
-          // =============================
-          // CONVERT + STREAM
-          // =============================
-          const pcm =
-            await generatePCM(tmpMp3);
-
-          await streamPCM(
-            ws,
-            pcm,
-            "START_RESPONSE",
-            "FINISH_RESPONSE"
-          );
-
-          // =============================
-          // CLEANUP
-          // =============================
-          if (fs.existsSync(tmpMp3)) {
-            fs.unlinkSync(tmpMp3);
-          }
-        } catch (err) {
-          console.error(
-            "Processing Error:",
-            err
-          );
-
-          ws.send("ERROR");
-        } finally {
-          isProcessing = false;
-
-          [
-            inputWavPath,
-            resampledPath
-          ].forEach((file) => {
-            if (
-              file &&
-              fs.existsSync(file)
-            ) {
-              fs.unlinkSync(file);
-            }
-          });
-        }
+    ws.on("message", async (data: any, isBinary: boolean) => {
+      if (isBinary) {
+        chunks.push(Buffer.from(data));
+        return;
       }
-    );
 
-    ws.on("close", () => {
-      console.log("Disconnected");
+      const msg = data.toString();
+
+      if (msg !== "END_STREAM" || processing) return;
+      processing = true;
+
+      try {
+        const audio = Buffer.concat(chunks);
+        chunks = [];
+
+        if (audio.length < 800) {
+          ws.send("ERROR");
+          return;
+        }
+
+        const id = Date.now();
+
+        const wavPath = path.join(UPLOAD_DIR, `${id}.wav`);
+
+        fs.writeFileSync(wavPath, Buffer.concat([
+          wavHeader(audio.length),
+          audio
+        ]));
+
+        const resampled = path.join(UPLOAD_DIR, `${id}_16k.wav`);
+
+        await new Promise<void>((res, rej) => {
+          ffmpeg(wavPath)
+            .audioFrequency(16000)
+            .audioChannels(1)
+            .format("wav")
+            .on("end", res)
+            .on("error", rej)
+            .save(resampled);
+        });
+
+        const stt = await sttClient.audio.transcriptions.create({
+          file: fs.createReadStream(resampled),
+          model: "whisper-large-v3-turbo"
+        });
+
+        const userText = stt.text?.trim();
+        if (!userText) return;
+
+        console.log("USER:", userText);
+
+        const ai = await llmClient.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content: "Return JSON only: {text}"
+            },
+            {
+              role: "user",
+              content: userText
+            }
+          ]
+        });
+
+        const raw = ai.choices[0].message.content || "{}";
+
+        let text = "Sorry.";
+        try {
+          text = JSON.parse(raw).text || text;
+        } catch {
+          text = raw;
+        }
+
+        await storage.createInteraction({
+          transcript: userText,
+          response: text
+        });
+
+        const tts = new EdgeTTS();
+
+        const mp3 = path.join(AUDIO_DIR, `${id}.mp3`);
+
+        await tts.ttsPromise(text, mp3, {
+          voice: "en-US-AriaNeural"
+        });
+
+        const pcm = await generatePCM(mp3);
+
+        await streamPCM(ws, pcm);
+
+        fs.unlinkSync(mp3);
+        fs.unlinkSync(wavPath);
+        fs.unlinkSync(resampled);
+
+      } catch (e) {
+        console.error(e);
+        ws.send("ERROR");
+      } finally {
+        processing = false;
+      }
     });
-  });
 
-  // =============================
-  // API ROUTES
-  // =============================
-  app.get(
-    api.interactions.list.path,
-    async (req, res) => {
-      res.json(
-        await storage.getInteractions()
-      );
-    }
-  );
+    ws.on("close", () => console.log("ESP disconnected"));
+  });
 
   return httpServer;
 }
