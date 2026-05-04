@@ -8,24 +8,26 @@ import Groq from "groq-sdk";
 import { WebSocketServer, WebSocket } from "ws";
 import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
-import axios from "axios";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
 const AUDIO_DIR = path.join(process.cwd(), "generated_audio");
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 44100;
 const CHUNK_SIZE = 1024;
-const CHUNK_DELAY_MS = 8; // 8ms = ~125 chunks/sec = smooth
+const CHUNK_DELAY_MS = 8;
 
 function createWavHeader(pcmLength: number, sampleRate = 44100): Buffer {
   const header = Buffer.alloc(44);
+
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
   header.write("WAVE", 8);
@@ -39,11 +41,13 @@ function createWavHeader(pcmLength: number, sampleRate = 44100): Buffer {
   header.writeUInt16LE(16, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcmLength, 40);
+
   return header;
 }
 
 async function generatePCM(inputPath: string): Promise<Buffer> {
   const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
+
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .noVideo()
@@ -68,33 +72,39 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
   });
 }
 
-async function streamPCM(ws: WebSocket, pcm: Buffer, startMsg: string, endMsg: string) {
-  console.log(`Streaming ${pcm.length} bytes...`);
-  
+async function streamPCM(
+  ws: WebSocket,
+  pcm: Buffer,
+  startMsg: string,
+  endMsg: string
+) {
   ws.send(startMsg);
-  
-  // Send all chunks with consistent delay
+
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     const chunk = pcm.slice(i, i + CHUNK_SIZE);
+
     if (ws.readyState !== ws.OPEN) return;
-    
+
     ws.send(chunk, { binary: true });
-    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+    await new Promise((r) => setTimeout(r, CHUNK_DELAY_MS));
   }
-  
+
   ws.send(endMsg);
-  console.log("Stream done");
 }
 
-export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  const wss = new WebSocketServer({ 
-    server: httpServer, 
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
+  const wss = new WebSocketServer({
+    server: httpServer,
     path: "/ws/audio",
     perMessageDeflate: false
   });
 
   wss.on("connection", (ws: WebSocket) => {
     console.log("ESP connected");
+
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
     let currentVolume = DEFAULT_VOLUME;
@@ -108,33 +118,45 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       const msg = data.toString();
+
       if (msg !== "END_STREAM" || isProcessing) return;
 
       isProcessing = true;
+
       let inputWavPath = "";
 
       try {
         const fullAudio = Buffer.concat(audioChunks);
         audioChunks = [];
-        
+
         if (fullAudio.length < 800) {
           ws.send("ERROR: too short");
           return;
         }
 
         const tempId = `tmp-${Date.now()}`;
-        inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-        fs.writeFileSync(inputWavPath, Buffer.concat([
-          createWavHeader(fullAudio.length, 44100),
-          fullAudio
-        ]));
 
-        // Resample to 16kHz for Whisper (ESP32 sends 44100Hz)
-        const resampledPath = path.join(UPLOAD_DIR, `${tempId}_16k.wav`);
+        inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+
+        fs.writeFileSync(
+          inputWavPath,
+          Buffer.concat([
+            createWavHeader(fullAudio.length, 44100),
+            fullAudio
+          ])
+        );
+
+        const resampledPath = path.join(
+          UPLOAD_DIR,
+          `${tempId}_16k.wav`
+        );
+
         await new Promise<void>((resolve, reject) => {
           ffmpeg(inputWavPath)
             .noVideo()
-            .audioFilters([`aresample=16000:resampler=soxr:precision=28`])
+            .audioFilters([
+              `aresample=16000:resampler=soxr:precision=28`
+            ])
             .audioCodec("pcm_s16le")
             .audioChannels(1)
             .audioFrequency(16000)
@@ -144,85 +166,136 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             .save(resampledPath);
         });
 
-        // STT
-        const transcription = await sttClient.audio.transcriptions.create({
-          file: fs.createReadStream(resampledPath),
-          model: "whisper-large-v3-turbo"
-        });
+        // =========================
+        // Speech-to-Text
+        // =========================
+        const transcription =
+          await sttClient.audio.transcriptions.create({
+            file: fs.createReadStream(resampledPath),
+            model: "whisper-large-v3-turbo"
+          });
 
-        // Cleanup resampled file
-        if (fs.existsSync(resampledPath)) fs.unlinkSync(resampledPath);
+        if (fs.existsSync(resampledPath)) {
+          fs.unlinkSync(resampledPath);
+        }
 
         const userText = transcription.text?.trim() || "";
+
         if (!userText) {
           ws.send("ERROR: no text");
           return;
         }
+
         console.log("User:", userText);
 
-        // LLM
-        const chat = await llmClient.chat.completions.create({
-          messages: [{
-            role: "system",
-            content: "Respond in JSON {text, volume, music_query} you are Alicia, a quantum AI. No markdown."
-          }, {
-            role: "user", 
-            content: userText
-          }],
-          model: "qwen/qwen3-32b",
-          temperature: 0.6,
-          max_tokens: 300
-        });
+        // =========================
+        // AI Response with Web Search
+        // =========================
+        const chatCompletion =
+          await llmClient.chat.completions.create({
+            messages: [
+              {
+                role: "system",
+                content:
+                  'Respond ONLY in valid JSON format: {"text":"...","volume":number}. You are Alicia, an advanced quantum AI assistant with internet access. Give intelligent, natural, helpful answers. No markdown. No extra commentary.'
+              },
+              {
+                role: "user",
+                content: userText
+              }
+            ],
+            model: "openai/gpt-oss-120b",
+            temperature: 0.6,
+            max_completion_tokens: 300,
+            top_p: 1,
+            reasoning_effort: "medium",
+            stream: false,
+            tools: [
+              {
+                type: "browser_search"
+              }
+            ]
+          });
 
-        const raw = chat.choices?.[0]?.message?.content?.trim() || "{}";
-        let spokenText = "Please repeat.";
-        let musicQuery: string | null = null;
-        
+        const raw =
+          chatCompletion.choices?.[0]?.message?.content?.trim() ||
+          "{}";
+
+        let spokenText =
+          "I'm sorry, I couldn't process that properly.";
+
         try {
           const parsed = JSON.parse(raw);
+
           spokenText = parsed.text || spokenText;
-          musicQuery = parsed.music_query || null;
+
           if (parsed.volume) {
             currentVolume = parseFloat(parsed.volume);
-            ws.send(`VOLUME:${currentVolume.toFixed(2)}`);
+
+            if (!isNaN(currentVolume)) {
+              ws.send(
+                `VOLUME:${currentVolume.toFixed(2)}`
+              );
+            }
           }
-        } catch (e) {
-          // use defaults
+        } catch {
+          spokenText = raw;
         }
 
+        console.log("AI:", spokenText);
+
+        // =========================
+        // Save interaction
+        // =========================
         await storage.createInteraction({
           transcript: userText,
           response: spokenText
         });
 
-        // TTS
+        // =========================
+        // Text-to-Speech
+        // =========================
         const edge = new EdgeTTS();
-        const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
+
+        const tmpMp3 = path.join(
+          AUDIO_DIR,
+          `tts_${Date.now()}.mp3`
+        );
+
         await edge.ttsPromise(spokenText, tmpMp3, {
           voice: "en-US-AriaNeural"
         });
 
         const pcm = await generatePCM(tmpMp3);
-        await streamPCM(ws, pcm, "START_RESPONSE", "FINISH_RESPONSE");
 
-        fs.unlinkSync(tmpMp3);
-        
-        if (musicQuery) {
-          // Handle music...
+        await streamPCM(
+          ws,
+          pcm,
+          "START_RESPONSE",
+          "FINISH_RESPONSE"
+        );
+
+        if (fs.existsSync(tmpMp3)) {
+          fs.unlinkSync(tmpMp3);
         }
-        
       } catch (err) {
-        console.error("Error:", err);
+        console.error("Processing Error:", err);
         ws.send("ERROR");
       } finally {
         isProcessing = false;
-        if (inputWavPath && fs.existsSync(inputWavPath)) {
+
+        if (
+          inputWavPath &&
+          fs.existsSync(inputWavPath)
+        ) {
           fs.unlinkSync(inputWavPath);
         }
       }
     });
 
-    ws.on("close", () => console.log("Disconnected"));
+    ws.on("close", () => {
+      console.log("Disconnected");
+    });
   });
 
   app.get(api.interactions.list.path, async (req, res) => {
