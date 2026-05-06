@@ -8,7 +8,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import { storage } from "./storage";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
