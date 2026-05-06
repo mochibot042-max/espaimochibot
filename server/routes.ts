@@ -122,7 +122,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await new Promise(r => setTimeout(r, 500));
   ws.send("START_RESPONSE");
-  
+
   let seq = 0;
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
@@ -160,7 +160,7 @@ function detectLanguage(text: string): string {
   ];
 
   const lower = text.toLowerCase();
-  const words = lower.split(/\\s+/);
+  const words = lower.split(/\s+/);
   let tagalogCount = 0;
 
   for (const word of words) {
@@ -185,7 +185,7 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
     });
 
     const buffer = Buffer.from(await wav.arrayBuffer());
-    
+
     // Save raw first to check
     const rawPath = outputPath.replace(".wav", "_raw.wav");
     await fs.promises.writeFile(rawPath, buffer);
@@ -196,7 +196,7 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
       // Try to convert directly to PCM - if this works, file is valid
       const pcmPath = outputPath.replace(".wav", "_temp.pcm");
       await convertToPCM(rawPath, pcmPath);
-      
+
       // If we got here, raw file is valid! Just use it
       fs.renameSync(rawPath, outputPath);
       fs.unlinkSync(pcmPath);
@@ -204,7 +204,7 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
       return outputPath;
     } catch (probeErr: any) {
       console.error("[TTS] Groq output invalid, trying fix...", probeErr.message);
-      
+
       // Try to fix with ffmpeg (re-encode)
       const fixedPath = outputPath.replace(".wav", "_fixed.wav");
       try {
@@ -218,7 +218,7 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
             .on("end", res)
             .save(fixedPath);
         });
-        
+
         fs.unlinkSync(rawPath);
         fs.renameSync(fixedPath, outputPath);
         console.log("[TTS] Groq TTS fixed and saved:", outputPath);
@@ -338,8 +338,8 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     console.log("[LANG] Detected:", detectedLang);
 
     const systemPrompt = detectedLang === "tl"
-      ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\\"text\\": \\"iyong sagot dito\\", \\"language\\": \\"tl\\"}. Walang ibang text maliban sa JSON."
-      : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\\"text\\": \\"your answer here\\", \\"language\\": \\"en\\"}. No other text besides JSON.";
+      ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\"text\": \"iyong sagot dito\", \"language\": \"tl\"}. Walang ibang text maliban sa JSON."
+      : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\"text\": \"your answer here\", \"language\": \"en\"}. No other text besides JSON.";
 
     const ai = await Promise.race([
       llmClient.chat.completions.create({
@@ -377,13 +377,13 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     let responseLang = detectedLang;
 
     try {
-      const cleaned = raw.replace(/```json\\s*/g, "").replace(/```\\s*/g, "").trim();
+      const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
       const parsed = JSON.parse(cleaned);
       text = parsed.text || text;
       responseLang = parsed.language || detectedLang;
     } catch (e) {
       console.log("[PARSE ERROR] Falling back to raw text");
-      const jsonMatch = raw.match(/\\{[\\s\\S]*?\\}/);
+      const jsonMatch = raw.match(/\{[\s\S]*?\}/);
       if (jsonMatch) {
         try {
           const parsed = JSON.parse(jsonMatch[0]);
