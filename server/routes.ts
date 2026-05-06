@@ -21,7 +21,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V15: SETTINGS - FAST FOR HOTSPOT
+// V16: SETTINGS - FAST FOR HOTSPOT
 // ============================================================================
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 512;
@@ -62,7 +62,7 @@ function wavHeader(len: number): Buffer {
 }
 
 // ============================================================================
-// PCM GENERATOR
+// PCM GENERATOR - FORCE 16kHz MONO
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -90,20 +90,24 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// RESAMPLE TO 16kHz
+// CONVERT ANY AUDIO TO 16kHz PCM - ROBUST VERSION
 // ============================================================================
-async function resampleTo16k(input: string, output: string): Promise<void> {
+async function convertToPCM(input: string, output: string): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "pan=mono|c0=c0"
+        "pan=mono|c0=c0",
+        "volume=1.2"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
       .audioFrequency(SAMPLE_RATE)
       .format("s16le")
-      .on("error", reject)
+      .on("error", (err) => {
+        console.error("[FFMPEG] Convert error:", err.message);
+        reject(err);
+      })
       .on("end", () => resolve())
       .save(output);
   });
@@ -156,7 +160,7 @@ function detectLanguage(text: string): string {
   ];
 
   const lower = text.toLowerCase();
-  const words = lower.split(/\s+/);
+  const words = lower.split(/\\s+/);
   let tagalogCount = 0;
 
   for (const word of words) {
@@ -168,9 +172,9 @@ function detectLanguage(text: string): string {
 }
 
 // ============================================================================
-// GROQ TTS - PRIMARY
+// GROQ TTS - PRIMARY (FIXED FOR INVALID WAV)
 // ============================================================================
-async function groqTTS(text: string, outputPath: string): Promise<boolean> {
+async function groqTTS(text: string, outputPath: string): Promise<string | null> {
   try {
     console.log("[TTS] Trying Groq TTS...");
     const wav = await ttsClient.audio.speech.create({
@@ -181,58 +185,101 @@ async function groqTTS(text: string, outputPath: string): Promise<boolean> {
     });
 
     const buffer = Buffer.from(await wav.arrayBuffer());
-    await fs.promises.writeFile(outputPath, buffer);
     
-    const resampledPath = outputPath.replace(".wav", "_16k.wav");
-    await resampleTo16k(outputPath, resampledPath);
-    
-    fs.unlinkSync(outputPath);
-    fs.renameSync(resampledPath, outputPath);
-    
-    console.log("[TTS] Groq TTS success + resampled:", outputPath);
-    return true;
+    // Save raw first to check
+    const rawPath = outputPath.replace(".wav", "_raw.wav");
+    await fs.promises.writeFile(rawPath, buffer);
+    console.log("[TTS] Groq raw saved:", rawPath, "size:", buffer.length);
+
+    // Check if valid by trying to probe
+    try {
+      // Try to convert directly to PCM - if this works, file is valid
+      const pcmPath = outputPath.replace(".wav", "_temp.pcm");
+      await convertToPCM(rawPath, pcmPath);
+      
+      // If we got here, raw file is valid! Just use it
+      fs.renameSync(rawPath, outputPath);
+      fs.unlinkSync(pcmPath);
+      console.log("[TTS] Groq TTS success:", outputPath);
+      return outputPath;
+    } catch (probeErr: any) {
+      console.error("[TTS] Groq output invalid, trying fix...", probeErr.message);
+      
+      // Try to fix with ffmpeg (re-encode)
+      const fixedPath = outputPath.replace(".wav", "_fixed.wav");
+      try {
+        await new Promise<void>((res, rej) => {
+          ffmpeg(rawPath)
+            .audioCodec("pcm_s16le")
+            .audioChannels(1)
+            .audioFrequency(24000)  // Orpheus outputs 24kHz
+            .format("wav")
+            .on("error", rej)
+            .on("end", res)
+            .save(fixedPath);
+        });
+        
+        fs.unlinkSync(rawPath);
+        fs.renameSync(fixedPath, outputPath);
+        console.log("[TTS] Groq TTS fixed and saved:", outputPath);
+        return outputPath;
+      } catch (fixErr: any) {
+        console.error("[TTS] Fix failed:", fixErr.message);
+        // Clean up
+        try { fs.unlinkSync(rawPath); } catch {}
+        try { fs.unlinkSync(fixedPath); } catch {}
+        return null;
+      }
+    }
   } catch (e: any) {
     console.error("[TTS] Groq TTS failed:", e.message);
-    return false;
+    return null;
   }
 }
 
 // ============================================================================
 // EDGETTS - FALLBACK
 // ============================================================================
-async function edgeTTS(text: string, outputPath: string, lang: string): Promise<boolean> {
+async function edgeTTS(text: string, outputPath: string, lang: string): Promise<string | null> {
   try {
     console.log("[TTS] Falling back to EdgeTTS...");
     const voice = EDGE_TTS_VOICES[lang] || EDGE_TTS_VOICES["en"];
     const tts = new EdgeTTS();
     await tts.ttsPromise(text, outputPath, { voice });
     console.log("[TTS] EdgeTTS success:", outputPath);
-    return true;
+    return outputPath;
   } catch (e: any) {
     console.error("[TTS] EdgeTTS failed:", e.message);
-    return false;
+    return null;
   }
 }
 
 // ============================================================================
-// GENERATE TTS
+// GENERATE TTS - GROQ PRIMARY -> EDGETTS FALLBACK
 // ============================================================================
 async function generateTTS(text: string, lang: string, id: number): Promise<string | null> {
   const groqPath = path.join(AUDIO_DIR, id + "_groq.wav");
   const edgePath = path.join(AUDIO_DIR, id + "_edge.mp3");
 
-  const groqSuccess = await groqTTS(text, groqPath);
-  if (groqSuccess) {
+  // Try Groq TTS
+  const groqResult = await groqTTS(text, groqPath);
+  if (groqResult) {
+    // Clean up edge path
     try { fs.unlinkSync(edgePath); } catch {}
-    return groqPath;
+    return groqResult;
   }
 
-  const edgeSuccess = await edgeTTS(text, edgePath, lang);
-  if (edgeSuccess) {
+  // Fallback to EdgeTTS
+  const edgeResult = await edgeTTS(text, edgePath, lang);
+  if (edgeResult) {
+    // Clean up groq files
+    const rawPath = groqPath.replace(".wav", "_raw.wav");
     try { fs.unlinkSync(groqPath); } catch {}
-    return edgePath;
+    try { fs.unlinkSync(rawPath); } catch {}
+    return edgeResult;
   }
 
+  // Both failed - clean up
   try { fs.unlinkSync(groqPath); } catch {}
   try { fs.unlinkSync(edgePath); } catch {}
   return null;
@@ -291,8 +338,8 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     console.log("[LANG] Detected:", detectedLang);
 
     const systemPrompt = detectedLang === "tl"
-      ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\"text\": \"iyong sagot dito\", \"language\": \"tl\"}. Walang ibang text maliban sa JSON."
-      : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\"text\": \"your answer here\", \"language\": \"en\"}. No other text besides JSON.";
+      ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\\"text\\": \\"iyong sagot dito\\", \\"language\\": \\"tl\\"}. Walang ibang text maliban sa JSON."
+      : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\\"text\\": \\"your answer here\\", \\"language\\": \\"en\\"}. No other text besides JSON.";
 
     const ai = await Promise.race([
       llmClient.chat.completions.create({
@@ -330,13 +377,13 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     let responseLang = detectedLang;
 
     try {
-      const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+      const cleaned = raw.replace(/```json\\s*/g, "").replace(/```\\s*/g, "").trim();
       const parsed = JSON.parse(cleaned);
       text = parsed.text || text;
       responseLang = parsed.language || detectedLang;
     } catch (e) {
       console.log("[PARSE ERROR] Falling back to raw text");
-      const jsonMatch = raw.match(/\{[\s\S]*?\}/);
+      const jsonMatch = raw.match(/\\{[\\s\\S]*?\\}/);
       if (jsonMatch) {
         try {
           const parsed = JSON.parse(jsonMatch[0]);
@@ -383,7 +430,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V15: ROUTES - ACCEPT CHUNKED UPLOAD
+// V16: ROUTES - ACCEPT CHUNKED UPLOAD
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
@@ -394,14 +441,13 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V15 Chunked Upload");
+    console.log("ESP connected - V16 Groq TTS Fix");
 
     let chunks: Buffer[] = [];
     let processing = false;
     let isRecording = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
-      // Handle text messages
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT:", msg);
@@ -411,7 +457,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           return;
         }
 
-        // START_STREAM = user started speaking
         if (msg === "START_STREAM") {
           console.log("[STREAM] User started speaking");
           isRecording = true;
@@ -419,7 +464,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           return;
         }
 
-        // END_STREAM = user stopped speaking
         if (msg === "END_STREAM") {
           if (!isRecording) return;
           isRecording = false;
@@ -444,7 +488,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         return;
       }
 
-      // Binary data = streaming audio chunks from ESP
       if (isRecording) {
         chunks.push(Buffer.from(data));
 
