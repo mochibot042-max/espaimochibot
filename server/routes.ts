@@ -20,11 +20,22 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V11: SETTINGS - 16kHz ESP32
+// V12: SETTINGS - 16kHz ESP32
 // ============================================================================
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 1024;
 const CHUNK_DELAY_MS = 46;
+
+// ============================================================================
+// TTS VOICE MAP
+// ============================================================================
+const TTS_VOICES: Record<string, string> = {
+  "en": "en-US-AriaNeural",
+  "tl": "fil-PH-BlessicaNeural",
+  "fil": "fil-PH-BlessicaNeural",
+  "tagalog": "fil-PH-BlessicaNeural",
+  "english": "en-US-AriaNeural"
+};
 
 // ============================================================================
 // WAV HEADER
@@ -105,7 +116,37 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 }
 
 // ============================================================================
-// V11: PROCESS AUDIO AND RESPOND
+// V12: DETECT LANGUAGE FROM TEXT
+// ============================================================================
+function detectLanguage(text: string): string {
+  // Common Tagalog words/particles
+  const tagalogMarkers = [
+    "ang", "ng", "sa", "mga", "ko", "mo", "niya", "nila", "naman", "po", "opo",
+    "kumusta", "salamat", "oo", "hindi", "wala", "meron", "dito", "doon", "siya",
+    "tayo", "kayo", "ako", "ikaw", "ka", "ba", "na", "pa", "lang", "din", "rin",
+    "pero", "kasi", "dahil", "kung", "nang", "para", "pag", "kapag", "natin",
+    "atin", "kanila", "kaniya", "sakin", "sayo", "samin", "sainyo", "niyo",
+    "gusto", "ayaw", "maganda", "pangit", "mabuti", "masama", "malaki", "maliit",
+    "mainit", "malamig", "bago", "luma", "bilis", "mabagal", "takbo", "lakad",
+    "kain", "inom", "tulog", "gising", "upo", "tayo", "tawa", "iyak", "takot",
+    "galit", "tuwa", "lungkot", "pagod", "gutom", "uhaw", "pagod", "antok"
+  ];
+
+  const lower = text.toLowerCase();
+  const words = lower.split(/\s+/);
+  let tagalogCount = 0;
+
+  for (const word of words) {
+    if (tagalogMarkers.includes(word)) tagalogCount++;
+  }
+
+  // If more than 30% of words are Tagalog markers, classify as Tagalog
+  const ratio = words.length > 0 ? tagalogCount / words.length : 0;
+  return ratio > 0.15 ? "tl" : "en";
+}
+
+// ============================================================================
+// V12: PROCESS AUDIO AND RESPOND WITH COMPOUND MINI + WEB SEARCH
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
@@ -117,7 +158,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     const id = Date.now();
     const wavPath = path.join(UPLOAD_DIR, id + ".wav");
 
-    // Write WAV with header
     fs.writeFileSync(wavPath, Buffer.concat([
       wavHeader(audioBuffer.length),
       audioBuffer
@@ -125,7 +165,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("[PROCESS] Received audio: " + audioBuffer.length + " bytes");
 
-    // Already 16kHz from ESP32, but resample just in case
     const resampled = path.join(UPLOAD_DIR, id + "_16k.wav");
     await new Promise<void>((res, rej) => {
       ffmpeg(wavPath)
@@ -137,6 +176,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
         .save(resampled);
     });
 
+    // STT
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(resampled),
@@ -155,40 +195,90 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("USER:", userText);
 
+    // Detect language from user input
+    const detectedLang = detectLanguage(userText);
+    console.log("[LANG] Detected:", detectedLang);
+
+    // Build system prompt based on detected language
+    const systemPrompt = detectedLang === "tl"
+      ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\"text\": \"iyong sagot dito\", \"language\": \"tl\"}. Walang ibang text maliban sa JSON."
+      : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\"text\": \"your answer here\", \"language\": \"en\"}. No other text besides JSON.";
+
+    // Compound Mini with web search
     const ai = await Promise.race([
       llmClient.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
+        model: "groq/compound-mini",
         messages: [
-          { role: "system", content: "Return JSON only: {text}" },
+          { role: "system", content: systemPrompt },
           { role: "user", content: userText }
         ],
-        max_tokens: 150,
-        temperature: 0.7
+        temperature: 1,
+        max_completion_tokens: 1024,
+        top_p: 1,
+        stream: false,
+        compound_custom: {
+          tools: {
+            enabled_tools: [
+              "web_search",
+              "code_interpreter",
+              "visit_website"
+            ]
+          }
+        }
       }),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000)
+        setTimeout(() => reject(new Error("LLM_TIMEOUT")), 20000)
       )
     ]);
 
-    const raw = ai.choices[0].message.content || "{}";
-    let text = "Sorry, I didn't understand.";
+    const raw = (ai as any).choices[0].message.content || "{}";
+    console.log("[AI RAW]:", raw);
+
+    let text = detectedLang === "tl"
+      ? "Pasensya na, hindi ko naintindihan. Puwede mo bang ulitin?"
+      : "Sorry, I didn't understand. Could you repeat that?";
+
+    let responseLang = detectedLang;
+
+    // Parse JSON response
     try {
-      const parsed = JSON.parse(raw);
+      // Clean up markdown code blocks if present
+      const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+      const parsed = JSON.parse(cleaned);
       text = parsed.text || text;
-    } catch {
-      text = raw;
+      responseLang = parsed.language || detectedLang;
+    } catch (e) {
+      console.log("[PARSE ERROR] Falling back to raw text");
+      // Fallback: try to extract JSON from raw text
+      const jsonMatch = raw.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          text = parsed.text || text;
+          responseLang = parsed.language || detectedLang;
+        } catch {
+          text = raw;
+        }
+      } else {
+        text = raw;
+      }
     }
+
+    console.log("[AI RESPONSE]:", text);
+    console.log("[RESPONSE LANG]:", responseLang);
 
     await storage.createInteraction({
       transcript: userText,
       response: text
     });
 
+    // Select TTS voice
+    const voice = TTS_VOICES[responseLang] || TTS_VOICES["en"];
+    console.log("[TTS VOICE]:", voice);
+
     const tts = new EdgeTTS();
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
-    await tts.ttsPromise(text, mp3, {
-      voice: "en-US-AriaNeural"
-    });
+    await tts.ttsPromise(text, mp3, { voice });
 
     const pcm = await generatePCM(mp3);
     console.log("[TTS] Generated PCM: " + pcm.length + " bytes");
@@ -209,42 +299,36 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V11: ROUTES - FULL BINARY AUDIO RECEIVE
+// V12: ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
     perMessageDeflate: false,
-    maxPayload: 2 * 1024 * 1024  // 2MB max payload for full audio
+    maxPayload: 2 * 1024 * 1024
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V11 Full Audio Upload");
+    console.log("ESP connected - V12 Auto-Lang + Web Search");
 
-    let audioBuffer: Buffer | null = null;
     let processing = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
-      // Handle text messages
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT:", msg);
 
         if (msg === "READY") {
-          console.log("[WS] ESP ready for streaming");
+          console.log("[WS] ESP ready");
           return;
         }
-
         return;
       }
 
-      // V11: Binary data = FULL AUDIO from ESP
       if (isBinary && !processing) {
         processing = true;
         console.log("[UPLOAD] Received full audio: " + data.length + " bytes");
-
-        // Process the full audio buffer
         await processAndRespond(ws, Buffer.from(data));
         processing = false;
       }
@@ -252,7 +336,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
     ws.on("close", () => {
       console.log("ESP disconnected");
-      audioBuffer = null;
       processing = false;
     });
 
