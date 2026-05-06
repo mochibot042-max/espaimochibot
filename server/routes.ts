@@ -8,7 +8,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import { storage } from "./storage";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
@@ -21,7 +21,7 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V16: SETTINGS - FAST FOR HOTSPOT
+// V19: SETTINGS
 // ============================================================================
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 512;
@@ -62,7 +62,7 @@ function wavHeader(len: number): Buffer {
 }
 
 // ============================================================================
-// PCM GENERATOR - FORCE 16kHz MONO
+// PCM GENERATOR
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -90,24 +90,20 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// CONVERT ANY AUDIO TO 16kHz PCM - ROBUST VERSION
+// RESAMPLE TO 16kHz
 // ============================================================================
-async function convertToPCM(input: string, output: string): Promise<void> {
+async function resampleTo16k(input: string, output: string): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "pan=mono|c0=c0",
-        "volume=1.2"
+        "pan=mono|c0=c0"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
       .audioFrequency(SAMPLE_RATE)
       .format("s16le")
-      .on("error", (err) => {
-        console.error("[FFMPEG] Convert error:", err.message);
-        reject(err);
-      })
+      .on("error", reject)
       .on("end", () => resolve())
       .save(output);
   });
@@ -122,7 +118,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await new Promise(r => setTimeout(r, 500));
   ws.send("START_RESPONSE");
-
+  
   let seq = 0;
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
@@ -172,7 +168,7 @@ function detectLanguage(text: string): string {
 }
 
 // ============================================================================
-// GROQ TTS - PRIMARY (FIXED FOR INVALID WAV)
+// GROQ TTS - PRIMARY
 // ============================================================================
 async function groqTTS(text: string, outputPath: string): Promise<string | null> {
   try {
@@ -185,47 +181,49 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
     });
 
     const buffer = Buffer.from(await wav.arrayBuffer());
-
-    // Save raw first to check
     const rawPath = outputPath.replace(".wav", "_raw.wav");
     await fs.promises.writeFile(rawPath, buffer);
     console.log("[TTS] Groq raw saved:", rawPath, "size:", buffer.length);
 
-    // Check if valid by trying to probe
     try {
-      // Try to convert directly to PCM - if this works, file is valid
       const pcmPath = outputPath.replace(".wav", "_temp.pcm");
-      await convertToPCM(rawPath, pcmPath);
-
-      // If we got here, raw file is valid! Just use it
-      fs.renameSync(rawPath, outputPath);
-      fs.unlinkSync(pcmPath);
+      await new Promise<void>((res, rej) => {
+        ffmpeg(rawPath)
+          .audioCodec("pcm_s16le")
+          .audioChannels(1)
+          .audioFrequency(24000)
+          .format("s16le")
+          .on("error", rej)
+          .on("end", res)
+          .save(pcmPath);
+      });
+      
+      fs.unlinkSync(rawPath);
+      fs.renameSync(pcmPath, outputPath);
       console.log("[TTS] Groq TTS success:", outputPath);
       return outputPath;
     } catch (probeErr: any) {
       console.error("[TTS] Groq output invalid, trying fix...", probeErr.message);
-
-      // Try to fix with ffmpeg (re-encode)
+      
       const fixedPath = outputPath.replace(".wav", "_fixed.wav");
       try {
         await new Promise<void>((res, rej) => {
           ffmpeg(rawPath)
             .audioCodec("pcm_s16le")
             .audioChannels(1)
-            .audioFrequency(24000)  // Orpheus outputs 24kHz
+            .audioFrequency(24000)
             .format("wav")
             .on("error", rej)
             .on("end", res)
             .save(fixedPath);
         });
-
+        
         fs.unlinkSync(rawPath);
         fs.renameSync(fixedPath, outputPath);
-        console.log("[TTS] Groq TTS fixed and saved:", outputPath);
+        console.log("[TTS] Groq TTS fixed:", outputPath);
         return outputPath;
       } catch (fixErr: any) {
         console.error("[TTS] Fix failed:", fixErr.message);
-        // Clean up
         try { fs.unlinkSync(rawPath); } catch {}
         try { fs.unlinkSync(fixedPath); } catch {}
         return null;
@@ -255,38 +253,91 @@ async function edgeTTS(text: string, outputPath: string, lang: string): Promise<
 }
 
 // ============================================================================
-// GENERATE TTS - GROQ PRIMARY -> EDGETTS FALLBACK
+// GENERATE TTS
 // ============================================================================
 async function generateTTS(text: string, lang: string, id: number): Promise<string | null> {
   const groqPath = path.join(AUDIO_DIR, id + "_groq.wav");
   const edgePath = path.join(AUDIO_DIR, id + "_edge.mp3");
 
-  // Try Groq TTS
   const groqResult = await groqTTS(text, groqPath);
   if (groqResult) {
-    // Clean up edge path
     try { fs.unlinkSync(edgePath); } catch {}
     return groqResult;
   }
 
-  // Fallback to EdgeTTS
   const edgeResult = await edgeTTS(text, edgePath, lang);
   if (edgeResult) {
-    // Clean up groq files
-    const rawPath = groqPath.replace(".wav", "_raw.wav");
     try { fs.unlinkSync(groqPath); } catch {}
-    try { fs.unlinkSync(rawPath); } catch {}
+    try { fs.unlinkSync(groqPath.replace(".wav", "_raw.wav")); } catch {}
     return edgeResult;
   }
 
-  // Both failed - clean up
   try { fs.unlinkSync(groqPath); } catch {}
   try { fs.unlinkSync(edgePath); } catch {}
   return null;
 }
 
 // ============================================================================
-// PROCESS AUDIO AND RESPOND
+// V19: WEB SEARCH WITH GROQ COMPOUND MINI - FIXED
+// ============================================================================
+async function webSearchWithGroq(query: string, lang: string): Promise<string> {
+  try {
+    console.log("[WEB_SEARCH] Searching for:", query);
+    
+    // Use compound-mini with explicit web search
+    const searchPrompt = lang === "tl" 
+      ? `Hanapin mo sa internet ang sagot sa tanong na ito: "${query}". Ibigay ang sagot sa Tagalog.`
+      : `Search the internet for: "${query}". Provide a concise answer.`;
+    
+    const response = await llmClient.chat.completions.create({
+      model: "groq/compound-mini",
+      messages: [
+        {
+          role: "system",
+          content: "You are a web search assistant. Use your web_search tool to find current information. Always provide factual, up-to-date answers based on search results."
+        },
+        {
+          role: "user",
+          content: searchPrompt
+        }
+      ],
+      temperature: 0.7,
+      max_completion_tokens: 500,
+      top_p: 1,
+      stream: false,
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "web_search",
+            description: "Search the web for current information",
+            parameters: {
+              type: "object",
+              properties: {
+                query: {
+                  type: "string",
+                  description: "The search query"
+                }
+              },
+              required: ["query"]
+            }
+          }
+        }
+      ],
+      tool_choice: "auto"
+    });
+
+    const content = (response as any).choices[0]?.message?.content || "";
+    console.log("[WEB_SEARCH] Result:", content.substring(0, 200));
+    return content;
+  } catch (e: any) {
+    console.error("[WEB_SEARCH] Failed:", e.message);
+    return "";
+  }
+}
+
+// ============================================================================
+// PROCESS AUDIO AND RESPOND - WITH WEB SEARCH
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
@@ -337,75 +388,83 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     const detectedLang = detectLanguage(userText);
     console.log("[LANG] Detected:", detectedLang);
 
-    const systemPrompt = detectedLang === "tl"
-      ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\"text\": \"iyong sagot dito\", \"language\": \"tl\"}. Walang ibang text maliban sa JSON."
-      : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\"text\": \"your answer here\", \"language\": \"en\"}. No other text besides JSON.";
-
-    const ai = await Promise.race([
-      llmClient.chat.completions.create({
-        model: "groq/compound-mini",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userText }
-        ],
-        temperature: 1,
-        max_completion_tokens: 1024,
-        top_p: 1,
-        stream: false,
-        compound_custom: {
-          tools: {
-            enabled_tools: [
-              "web_search",
-              "code_interpreter",
-              "visit_website"
-            ]
-          }
-        }
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("LLM_TIMEOUT")), 20000)
-      )
-    ]);
-
-    const raw = (ai as any).choices[0].message.content || "{}";
-    console.log("[AI RAW]:", raw);
-
-    let text = detectedLang === "tl"
-      ? "Pasensya na, hindi ko naintindihan. Puwede mo bang ulitin?"
-      : "Sorry, I didn't understand. Could you repeat that?";
-
+    // Check if user is asking about current info / web search
+    const searchKeywords = ["latest", "news", "current", "today", "weather", "price", "who won", "score", "update", "ngayon", "balita", "panahon"];
+    const needsSearch = searchKeywords.some(k => userText.toLowerCase().includes(k.toLowerCase()));
+    
+    let aiResponse = "";
     let responseLang = detectedLang;
 
-    try {
-      const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-      text = parsed.text || text;
-      responseLang = parsed.language || detectedLang;
-    } catch (e) {
-      console.log("[PARSE ERROR] Falling back to raw text");
-      const jsonMatch = raw.match(/\{[\s\S]*?\}/);
-      if (jsonMatch) {
-        try {
-          const parsed = JSON.parse(jsonMatch[0]);
-          text = parsed.text || text;
-          responseLang = parsed.language || detectedLang;
-        } catch {
-          text = raw;
-        }
-      } else {
-        text = raw;
+    if (needsSearch) {
+      console.log("[SEARCH] Web search triggered!");
+      const searchResult = await webSearchWithGroq(userText, detectedLang);
+      if (searchResult) {
+        aiResponse = searchResult;
       }
     }
 
-    console.log("[AI RESPONSE]:", text);
+    // If no search result or not searching, use normal LLM
+    if (!aiResponse) {
+      const systemPrompt = detectedLang === "tl"
+        ? 'Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {"text": "iyong sagot dito", "language": "tl"}. Walang ibang text maliban sa JSON.'
+        : 'You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {"text": "your answer here", "language": "en"}. No other text besides JSON.';
+
+      const ai = await Promise.race([
+        llmClient.chat.completions.create({
+          model: "groq/compound-mini",
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userText }
+          ],
+          temperature: 1,
+          max_completion_tokens: 1024,
+          top_p: 1,
+          stream: false
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("LLM_TIMEOUT")), 20000)
+        )
+      ]);
+
+      const raw = (ai as any).choices[0].message.content || "{}";
+      console.log("[AI RAW]:", raw);
+
+      try {
+        const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+        const parsed = JSON.parse(cleaned);
+        aiResponse = parsed.text || "";
+        responseLang = parsed.language || detectedLang;
+      } catch (e) {
+        const jsonMatch = raw.match(/\{[\s\S]*?\}/);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            aiResponse = parsed.text || raw;
+            responseLang = parsed.language || detectedLang;
+          } catch {
+            aiResponse = raw;
+          }
+        } else {
+          aiResponse = raw;
+        }
+      }
+    }
+
+    if (!aiResponse) {
+      aiResponse = detectedLang === "tl" 
+        ? "Pasensya na, hindi ko naintindihan." 
+        : "Sorry, I didn't understand.";
+    }
+
+    console.log("[AI RESPONSE]:", aiResponse);
     console.log("[RESPONSE LANG]:", responseLang);
 
     await storage.createInteraction({
       transcript: userText,
-      response: text
+      response: aiResponse
     });
 
-    const ttsPath = await generateTTS(text, responseLang, id);
+    const ttsPath = await generateTTS(aiResponse, responseLang, id);
     if (!ttsPath) {
       ws.send("ERROR:TTS_FAILED");
       return;
@@ -430,7 +489,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V16: ROUTES - ACCEPT CHUNKED UPLOAD
+// V19: ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
@@ -441,7 +500,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V16 Groq TTS Fix");
+    console.log("ESP connected - V19 LED FX + Web Search");
 
     let chunks: Buffer[] = [];
     let processing = false;
