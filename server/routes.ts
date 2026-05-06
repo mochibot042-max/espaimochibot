@@ -10,8 +10,10 @@ import { storage } from "./storage";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
+// Multiple Groq clients para sa iba't ibang purpose
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
+const ttsClient = new Groq({ apiKey: GROQ_API_KEY });
 
 const AUDIO_DIR = path.join(process.cwd(), "audio");
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
@@ -20,22 +22,25 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V12: SETTINGS - 16kHz ESP32
+// V13: SETTINGS - 16kHz ESP32
 // ============================================================================
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 1024;
 const CHUNK_DELAY_MS = 46;
 
 // ============================================================================
-// TTS VOICE MAP
+// TTS VOICE MAP - FALLBACK EDGETTS
 // ============================================================================
-const TTS_VOICES: Record<string, string> = {
+const EDGE_TTS_VOICES: Record<string, string> = {
   "en": "en-US-AriaNeural",
   "tl": "fil-PH-BlessicaNeural",
   "fil": "fil-PH-BlessicaNeural",
   "tagalog": "fil-PH-BlessicaNeural",
   "english": "en-US-AriaNeural"
 };
+
+// Groq TTS voice - same voice for all languages (Tagalog + English capable)
+const GROQ_TTS_VOICE = "lulwa";
 
 // ============================================================================
 // WAV HEADER
@@ -59,7 +64,7 @@ function wavHeader(len: number): Buffer {
 }
 
 // ============================================================================
-// PCM GENERATOR
+// PCM GENERATOR - FROM ANY AUDIO FILE
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -116,10 +121,9 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 }
 
 // ============================================================================
-// V12: DETECT LANGUAGE FROM TEXT
+// V13: DETECT LANGUAGE FROM TEXT
 // ============================================================================
 function detectLanguage(text: string): string {
-  // Common Tagalog words/particles
   const tagalogMarkers = [
     "ang", "ng", "sa", "mga", "ko", "mo", "niya", "nila", "naman", "po", "opo",
     "kumusta", "salamat", "oo", "hindi", "wala", "meron", "dito", "doon", "siya",
@@ -128,8 +132,8 @@ function detectLanguage(text: string): string {
     "atin", "kanila", "kaniya", "sakin", "sayo", "samin", "sainyo", "niyo",
     "gusto", "ayaw", "maganda", "pangit", "mabuti", "masama", "malaki", "maliit",
     "mainit", "malamig", "bago", "luma", "bilis", "mabagal", "takbo", "lakad",
-    "kain", "inom", "tulog", "gising", "upo", "tayo", "tawa", "iyak", "takot",
-    "galit", "tuwa", "lungkot", "pagod", "gutom", "uhaw", "pagod", "antok"
+    "kain", "inom", "tulog", "gising", "upo", "tawa", "iyak", "takot",
+    "galit", "tuwa", "lungkot", "pagod", "gutom", "uhaw", "antok"
   ];
 
   const lower = text.toLowerCase();
@@ -140,13 +144,81 @@ function detectLanguage(text: string): string {
     if (tagalogMarkers.includes(word)) tagalogCount++;
   }
 
-  // If more than 30% of words are Tagalog markers, classify as Tagalog
   const ratio = words.length > 0 ? tagalogCount / words.length : 0;
   return ratio > 0.15 ? "tl" : "en";
 }
 
 // ============================================================================
-// V12: PROCESS AUDIO AND RESPOND WITH COMPOUND MINI + WEB SEARCH
+// V13: GROQ TTS - PRIMARY
+// ============================================================================
+async function groqTTS(text: string, outputPath: string): Promise<boolean> {
+  try {
+    console.log("[TTS] Trying Groq TTS...");
+    const wav = await ttsClient.audio.speech.create({
+      model: "canopylabs/orpheus-arabic-saudi",
+      voice: GROQ_TTS_VOICE,
+      response_format: "wav",
+      input: text,
+    });
+
+    const buffer = Buffer.from(await wav.arrayBuffer());
+    await fs.promises.writeFile(outputPath, buffer);
+    console.log("[TTS] Groq TTS success:", outputPath);
+    return true;
+  } catch (e: any) {
+    console.error("[TTS] Groq TTS failed:", e.message);
+    return false;
+  }
+}
+
+// ============================================================================
+// V13: EDGETTS - FALLBACK
+// ============================================================================
+async function edgeTTS(text: string, outputPath: string, lang: string): Promise<boolean> {
+  try {
+    console.log("[TTS] Falling back to EdgeTTS...");
+    const voice = EDGE_TTS_VOICES[lang] || EDGE_TTS_VOICES["en"];
+    const tts = new EdgeTTS();
+    await tts.ttsPromise(text, outputPath, { voice });
+    console.log("[TTS] EdgeTTS success:", outputPath);
+    return true;
+  } catch (e: any) {
+    console.error("[TTS] EdgeTTS failed:", e.message);
+    return false;
+  }
+}
+
+// ============================================================================
+// V13: GENERATE TTS AUDIO (GROQ PRIMARY -> EDGETTS FALLBACK)
+// ============================================================================
+async function generateTTS(text: string, lang: string, id: number): Promise<string | null> {
+  const groqPath = path.join(AUDIO_DIR, id + "_groq.wav");
+  const edgePath = path.join(AUDIO_DIR, id + "_edge.mp3");
+
+  // Try Groq TTS first
+  const groqSuccess = await groqTTS(text, groqPath);
+  if (groqSuccess) {
+    // Clean up edge path if exists
+    try { fs.unlinkSync(edgePath); } catch {}
+    return groqPath;
+  }
+
+  // Fallback to EdgeTTS
+  const edgeSuccess = await edgeTTS(text, edgePath, lang);
+  if (edgeSuccess) {
+    // Clean up groq path if exists
+    try { fs.unlinkSync(groqPath); } catch {}
+    return edgePath;
+  }
+
+  // Both failed
+  try { fs.unlinkSync(groqPath); } catch {}
+  try { fs.unlinkSync(edgePath); } catch {}
+  return null;
+}
+
+// ============================================================================
+// V13: PROCESS AUDIO AND RESPOND
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
@@ -242,14 +314,12 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     // Parse JSON response
     try {
-      // Clean up markdown code blocks if present
       const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
       const parsed = JSON.parse(cleaned);
       text = parsed.text || text;
       responseLang = parsed.language || detectedLang;
     } catch (e) {
       console.log("[PARSE ERROR] Falling back to raw text");
-      // Fallback: try to extract JSON from raw text
       const jsonMatch = raw.match(/\{[\s\S]*?\}/);
       if (jsonMatch) {
         try {
@@ -272,20 +342,20 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       response: text
     });
 
-    // Select TTS voice
-    const voice = TTS_VOICES[responseLang] || TTS_VOICES["en"];
-    console.log("[TTS VOICE]:", voice);
+    // Generate TTS - Groq primary, EdgeTTS fallback
+    const ttsPath = await generateTTS(text, responseLang, id);
+    if (!ttsPath) {
+      ws.send("ERROR:TTS_FAILED");
+      return;
+    }
 
-    const tts = new EdgeTTS();
-    const mp3 = path.join(AUDIO_DIR, id + ".mp3");
-    await tts.ttsPromise(text, mp3, { voice });
-
-    const pcm = await generatePCM(mp3);
+    const pcm = await generatePCM(ttsPath);
     console.log("[TTS] Generated PCM: " + pcm.length + " bytes");
     await streamPCM(ws, pcm);
 
+    // Cleanup
     try {
-      fs.unlinkSync(mp3);
+      fs.unlinkSync(ttsPath);
       fs.unlinkSync(wavPath);
       fs.unlinkSync(resampled);
     } catch (e) {
@@ -299,7 +369,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V12: ROUTES
+// V13: ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
@@ -310,7 +380,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V12 Auto-Lang + Web Search");
+    console.log("ESP connected - V13 Groq TTS + Fallback");
 
     let processing = false;
 
