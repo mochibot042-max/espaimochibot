@@ -10,7 +10,6 @@ import { storage } from "./storage";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
-// Multiple Groq clients para sa iba't ibang purpose
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 const ttsClient = new Groq({ apiKey: GROQ_API_KEY });
@@ -22,11 +21,11 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V13: SETTINGS - 16kHz ESP32
+// V14: SETTINGS - FASTER FOR HOTSPOT
 // ============================================================================
 const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 1024;
-const CHUNK_DELAY_MS = 46;
+const CHUNK_SIZE = 512;         // SMALLER chunks
+const CHUNK_DELAY_MS = 15;      // FASTER delay (was 46ms)
 
 // ============================================================================
 // TTS VOICE MAP - FALLBACK EDGETTS
@@ -39,7 +38,6 @@ const EDGE_TTS_VOICES: Record<string, string> = {
   "english": "en-US-AriaNeural"
 };
 
-// Groq TTS voice - same voice for all languages (Tagalog + English capable)
 const GROQ_TTS_VOICE = "lulwa";
 
 // ============================================================================
@@ -64,7 +62,7 @@ function wavHeader(len: number): Buffer {
 }
 
 // ============================================================================
-// PCM GENERATOR - FROM ANY AUDIO FILE
+// PCM GENERATOR - FORCE 16kHz MONO
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -92,14 +90,35 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM PCM BACK TO ESP
+// RESAMPLE ANY AUDIO TO 16kHz MONO - FOR GROQ TTS OUTPUT
+// ============================================================================
+async function resampleTo16k(input: string, output: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    ffmpeg(input)
+      .audioFilters([
+        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+        "pan=mono|c0=c0"
+      ])
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(SAMPLE_RATE)
+      .format("s16le")
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(output);
+  });
+}
+
+// ============================================================================
+// STREAM PCM BACK TO ESP - FASTER
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300));
+  await new Promise(r => setTimeout(r, 500));  // LONGER wait for ESP to prepare
   ws.send("START_RESPONSE");
+  
   let seq = 0;
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
@@ -121,7 +140,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 }
 
 // ============================================================================
-// V13: DETECT LANGUAGE FROM TEXT
+// DETECT LANGUAGE
 // ============================================================================
 function detectLanguage(text: string): string {
   const tagalogMarkers = [
@@ -149,7 +168,7 @@ function detectLanguage(text: string): string {
 }
 
 // ============================================================================
-// V13: GROQ TTS - PRIMARY
+// GROQ TTS - PRIMARY
 // ============================================================================
 async function groqTTS(text: string, outputPath: string): Promise<boolean> {
   try {
@@ -163,7 +182,16 @@ async function groqTTS(text: string, outputPath: string): Promise<boolean> {
 
     const buffer = Buffer.from(await wav.arrayBuffer());
     await fs.promises.writeFile(outputPath, buffer);
-    console.log("[TTS] Groq TTS success:", outputPath);
+    
+    // Check if we need resampling
+    const resampledPath = outputPath.replace(".wav", "_16k.wav");
+    await resampleTo16k(outputPath, resampledPath);
+    
+    // Replace original with resampled
+    fs.unlinkSync(outputPath);
+    fs.renameSync(resampledPath, outputPath);
+    
+    console.log("[TTS] Groq TTS success + resampled to 16kHz:", outputPath);
     return true;
   } catch (e: any) {
     console.error("[TTS] Groq TTS failed:", e.message);
@@ -172,7 +200,7 @@ async function groqTTS(text: string, outputPath: string): Promise<boolean> {
 }
 
 // ============================================================================
-// V13: EDGETTS - FALLBACK
+// EDGETTS - FALLBACK
 // ============================================================================
 async function edgeTTS(text: string, outputPath: string, lang: string): Promise<boolean> {
   try {
@@ -189,36 +217,31 @@ async function edgeTTS(text: string, outputPath: string, lang: string): Promise<
 }
 
 // ============================================================================
-// V13: GENERATE TTS AUDIO (GROQ PRIMARY -> EDGETTS FALLBACK)
+// GENERATE TTS
 // ============================================================================
 async function generateTTS(text: string, lang: string, id: number): Promise<string | null> {
   const groqPath = path.join(AUDIO_DIR, id + "_groq.wav");
   const edgePath = path.join(AUDIO_DIR, id + "_edge.mp3");
 
-  // Try Groq TTS first
   const groqSuccess = await groqTTS(text, groqPath);
   if (groqSuccess) {
-    // Clean up edge path if exists
     try { fs.unlinkSync(edgePath); } catch {}
     return groqPath;
   }
 
-  // Fallback to EdgeTTS
   const edgeSuccess = await edgeTTS(text, edgePath, lang);
   if (edgeSuccess) {
-    // Clean up groq path if exists
     try { fs.unlinkSync(groqPath); } catch {}
     return edgePath;
   }
 
-  // Both failed
   try { fs.unlinkSync(groqPath); } catch {}
   try { fs.unlinkSync(edgePath); } catch {}
   return null;
 }
 
 // ============================================================================
-// V13: PROCESS AUDIO AND RESPOND
+// PROCESS AUDIO AND RESPOND
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
@@ -248,7 +271,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
         .save(resampled);
     });
 
-    // STT
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(resampled),
@@ -267,16 +289,13 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("USER:", userText);
 
-    // Detect language from user input
     const detectedLang = detectLanguage(userText);
     console.log("[LANG] Detected:", detectedLang);
 
-    // Build system prompt based on detected language
     const systemPrompt = detectedLang === "tl"
       ? "Ikaw ay isang Pilipinong AI assistant. Sumagot ka sa Tagalog/Filipino. Ang response mo ay DAPAT JSON format lamang: {\"text\": \"iyong sagot dito\", \"language\": \"tl\"}. Walang ibang text maliban sa JSON."
       : "You are a helpful AI assistant. Respond in English. Your response MUST be JSON format only: {\"text\": \"your answer here\", \"language\": \"en\"}. No other text besides JSON.";
 
-    // Compound Mini with web search
     const ai = await Promise.race([
       llmClient.chat.completions.create({
         model: "groq/compound-mini",
@@ -312,7 +331,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     let responseLang = detectedLang;
 
-    // Parse JSON response
     try {
       const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
       const parsed = JSON.parse(cleaned);
@@ -342,7 +360,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       response: text
     });
 
-    // Generate TTS - Groq primary, EdgeTTS fallback
     const ttsPath = await generateTTS(text, responseLang, id);
     if (!ttsPath) {
       ws.send("ERROR:TTS_FAILED");
@@ -353,7 +370,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     console.log("[TTS] Generated PCM: " + pcm.length + " bytes");
     await streamPCM(ws, pcm);
 
-    // Cleanup
     try {
       fs.unlinkSync(ttsPath);
       fs.unlinkSync(wavPath);
@@ -369,7 +385,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V13: ROUTES
+// V14: ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
@@ -380,7 +396,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V13 Groq TTS + Fallback");
+    console.log("ESP connected - V14 Smooth Hotspot");
 
     let processing = false;
 
