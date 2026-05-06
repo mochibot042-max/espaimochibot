@@ -20,11 +20,11 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V5: REAL-TIME STREAMING SETTINGS
+// V11: SETTINGS - 16kHz ESP32
 // ============================================================================
-const SAMPLE_RATE = 44100;
-const CHUNK_SIZE = 2048;
-const CHUNK_DELAY_MS = 23;
+const SAMPLE_RATE = 16000;
+const CHUNK_SIZE = 1024;
+const CHUNK_DELAY_MS = 46;
 
 // ============================================================================
 // WAV HEADER
@@ -82,7 +82,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 200));
+  await new Promise(r => setTimeout(r, 300));
   ws.send("START_RESPONSE");
   let seq = 0;
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
@@ -105,7 +105,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 }
 
 // ============================================================================
-// V5: PROCESS AUDIO AND RESPOND
+// V11: PROCESS AUDIO AND RESPOND
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
@@ -117,11 +117,15 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     const id = Date.now();
     const wavPath = path.join(UPLOAD_DIR, id + ".wav");
 
+    // Write WAV with header
     fs.writeFileSync(wavPath, Buffer.concat([
       wavHeader(audioBuffer.length),
       audioBuffer
     ]));
 
+    console.log("[PROCESS] Received audio: " + audioBuffer.length + " bytes");
+
+    // Already 16kHz from ESP32, but resample just in case
     const resampled = path.join(UPLOAD_DIR, id + "_16k.wav");
     await new Promise<void>((res, rej) => {
       ffmpeg(wavPath)
@@ -205,22 +209,21 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V5: ROUTES WITH REAL-TIME STREAMING SUPPORT
+// V11: ROUTES - FULL BINARY AUDIO RECEIVE
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
     perMessageDeflate: false,
-    maxPayload: 1024 * 1024
+    maxPayload: 2 * 1024 * 1024  // 2MB max payload for full audio
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V5 Real-Time Streaming");
+    console.log("ESP connected - V11 Full Audio Upload");
 
-    let chunks: Buffer[] = [];
+    let audioBuffer: Buffer | null = null;
     let processing = false;
-    let isRecording = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       // Handle text messages
@@ -233,58 +236,24 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           return;
         }
 
-        // V5: START_STREAM = user started speaking
-        if (msg === "START_STREAM") {
-          console.log("[STREAM] User started speaking");
-          isRecording = true;
-          chunks = [];
-          return;
-        }
-
-        // V5: END_STREAM = user stopped speaking
-        if (msg === "END_STREAM") {
-          if (!isRecording) return;
-          isRecording = false;
-
-          if (processing) return;
-          processing = true;
-
-          console.log("[STREAM] User stopped speaking, processing...");
-
-          // Combine all chunks
-          const audio = Buffer.concat(chunks);
-          chunks = [];
-
-          console.log("[STREAM] Total audio received: " + audio.length + " bytes");
-
-          // Process in background
-          processAndRespond(ws, audio).finally(() => {
-            processing = false;
-          });
-
-          return;
-        }
-
         return;
       }
 
-      // V5: Binary data = streaming audio chunks from ESP
-      if (isRecording) {
-        chunks.push(Buffer.from(data));
+      // V11: Binary data = FULL AUDIO from ESP
+      if (isBinary && !processing) {
+        processing = true;
+        console.log("[UPLOAD] Received full audio: " + data.length + " bytes");
 
-        // Optional: Log chunk received
-        if (chunks.length % 10 === 0) {
-          const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-          console.log("[STREAM] Received " + chunks.length + " chunks, " + totalBytes + " bytes");
-        }
+        // Process the full audio buffer
+        await processAndRespond(ws, Buffer.from(data));
+        processing = false;
       }
     });
 
     ws.on("close", () => {
       console.log("ESP disconnected");
-      chunks = [];
+      audioBuffer = null;
       processing = false;
-      isRecording = false;
     });
 
     ws.on("error", (err) => {
