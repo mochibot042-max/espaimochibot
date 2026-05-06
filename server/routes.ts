@@ -21,14 +21,14 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V14: SETTINGS - FASTER FOR HOTSPOT
+// V15: SETTINGS - FAST FOR HOTSPOT
 // ============================================================================
 const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 512;         // SMALLER chunks
-const CHUNK_DELAY_MS = 15;      // FASTER delay (was 46ms)
+const CHUNK_SIZE = 512;
+const CHUNK_DELAY_MS = 15;
 
 // ============================================================================
-// TTS VOICE MAP - FALLBACK EDGETTS
+// TTS VOICE MAP
 // ============================================================================
 const EDGE_TTS_VOICES: Record<string, string> = {
   "en": "en-US-AriaNeural",
@@ -62,7 +62,7 @@ function wavHeader(len: number): Buffer {
 }
 
 // ============================================================================
-// PCM GENERATOR - FORCE 16kHz MONO
+// PCM GENERATOR
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -90,7 +90,7 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// RESAMPLE ANY AUDIO TO 16kHz MONO - FOR GROQ TTS OUTPUT
+// RESAMPLE TO 16kHz
 // ============================================================================
 async function resampleTo16k(input: string, output: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -110,13 +110,13 @@ async function resampleTo16k(input: string, output: string): Promise<void> {
 }
 
 // ============================================================================
-// STREAM PCM BACK TO ESP - FASTER
+// STREAM PCM BACK TO ESP
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 500));  // LONGER wait for ESP to prepare
+  await new Promise(r => setTimeout(r, 500));
   ws.send("START_RESPONSE");
   
   let seq = 0;
@@ -183,15 +183,13 @@ async function groqTTS(text: string, outputPath: string): Promise<boolean> {
     const buffer = Buffer.from(await wav.arrayBuffer());
     await fs.promises.writeFile(outputPath, buffer);
     
-    // Check if we need resampling
     const resampledPath = outputPath.replace(".wav", "_16k.wav");
     await resampleTo16k(outputPath, resampledPath);
     
-    // Replace original with resampled
     fs.unlinkSync(outputPath);
     fs.renameSync(resampledPath, outputPath);
     
-    console.log("[TTS] Groq TTS success + resampled to 16kHz:", outputPath);
+    console.log("[TTS] Groq TTS success + resampled:", outputPath);
     return true;
   } catch (e: any) {
     console.error("[TTS] Groq TTS failed:", e.message);
@@ -385,7 +383,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V14: ROUTES
+// V15: ROUTES - ACCEPT CHUNKED UPLOAD
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
@@ -396,11 +394,14 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V14 Smooth Hotspot");
+    console.log("ESP connected - V15 Chunked Upload");
 
+    let chunks: Buffer[] = [];
     let processing = false;
+    let isRecording = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
+      // Handle text messages
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT:", msg);
@@ -409,20 +410,56 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           console.log("[WS] ESP ready");
           return;
         }
+
+        // START_STREAM = user started speaking
+        if (msg === "START_STREAM") {
+          console.log("[STREAM] User started speaking");
+          isRecording = true;
+          chunks = [];
+          return;
+        }
+
+        // END_STREAM = user stopped speaking
+        if (msg === "END_STREAM") {
+          if (!isRecording) return;
+          isRecording = false;
+
+          if (processing) return;
+          processing = true;
+
+          console.log("[STREAM] User stopped speaking, processing...");
+
+          const audio = Buffer.concat(chunks);
+          chunks = [];
+
+          console.log("[STREAM] Total audio received: " + audio.length + " bytes");
+
+          processAndRespond(ws, audio).finally(() => {
+            processing = false;
+          });
+
+          return;
+        }
+
         return;
       }
 
-      if (isBinary && !processing) {
-        processing = true;
-        console.log("[UPLOAD] Received full audio: " + data.length + " bytes");
-        await processAndRespond(ws, Buffer.from(data));
-        processing = false;
+      // Binary data = streaming audio chunks from ESP
+      if (isRecording) {
+        chunks.push(Buffer.from(data));
+
+        if (chunks.length % 20 === 0) {
+          const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+          console.log("[STREAM] Received " + chunks.length + " chunks, " + totalBytes + " bytes");
+        }
       }
     });
 
     ws.on("close", () => {
       console.log("ESP disconnected");
+      chunks = [];
       processing = false;
+      isRecording = false;
     });
 
     ws.on("error", (err) => {
