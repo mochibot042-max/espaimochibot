@@ -8,7 +8,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import { storage } from "./storage";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
@@ -22,7 +22,7 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 512;
-const CHUNK_DELAY_MS = 15;
+const CHUNK_DELAY_MS = 20;
 
 const EDGE_TTS_VOICES: Record<string, string> = {
   "en": "en-US-AriaNeural",
@@ -52,16 +52,21 @@ function wavHeader(len: number): Buffer {
   return b;
 }
 
+// ============================================================================
+// IMPROVED PCM GENERATION - DC OFFSET REMOVAL + NOISE FILTERING
+// ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=16000",
+        "highpass=f=120",           // Higher highpass to remove more DC/sub-bass
+        "lowpass=f=8000",           // Lower lowpass to reduce hiss
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "volume=1.2",
-        "dynaudnorm=p=0.95:g=15"
+        "volume=1.0",               // Slightly lower to prevent clipping
+        "dynaudnorm=p=0.90:g=15",   // More aggressive normalization
+        "afftdn=nf=-25",            // FFT noise reduction
+        "adeclick",                 // Remove click/pop artifacts
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
@@ -69,28 +74,101 @@ async function generatePCM(input: string): Promise<Buffer> {
       .format("s16le")
       .on("error", reject)
       .on("end", () => {
-        const pcm = fs.readFileSync(tmp);
+        let pcm = fs.readFileSync(tmp);
         fs.unlinkSync(tmp);
+        
+        // Remove DC offset from entire buffer
+        pcm = removeDCOffset(pcm);
+        
+        // Apply fade in/out to prevent pop/click
+        pcm = applyFadeInOut(pcm, 200); // 200 samples fade
+        
         resolve(pcm);
       })
       .save(tmp);
   });
 }
 
+// Remove DC offset by calculating mean and subtracting
+function removeDCOffset(pcm: Buffer): Buffer {
+  const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+  let sum = 0;
+  
+  for (let i = 0; i < samples.length; i++) {
+    sum += samples[i];
+  }
+  
+  const mean = Math.round(sum / samples.length);
+  
+  if (Math.abs(mean) > 10) { // Only adjust if significant offset
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] -= mean;
+    }
+  }
+  
+  return pcm;
+}
+
+// Apply fade in/out to prevent pops
+function applyFadeInOut(pcm: Buffer, fadeSamples: number): Buffer {
+  const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+  const fadeLen = Math.min(fadeSamples, Math.floor(samples.length / 4));
+  
+  // Fade in
+  for (let i = 0; i < fadeLen; i++) {
+    const factor = i / fadeLen;
+    samples[i] = Math.round(samples[i] * factor);
+  }
+  
+  // Fade out
+  for (let i = 0; i < fadeLen; i++) {
+    const idx = samples.length - 1 - i;
+    const factor = i / fadeLen;
+    samples[idx] = Math.round(samples[idx] * factor);
+  }
+  
+  return pcm;
+}
+
+// ============================================================================
+// IMPROVED STREAMING - WITH END SILENCE PAD
+// ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
-  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
+  
+  // Add 500ms silence at end to prevent cut-off noise
+  const silenceBytes = Math.floor(SAMPLE_RATE * 0.5 * 2); // 500ms * 16bit
+  const silenceBuffer = Buffer.alloc(silenceBytes, 0);
+  const paddedPCM = Buffer.concat([pcm, silenceBuffer]);
+  
+  const totalChunks = Math.ceil(paddedPCM.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 500));
+  await new Promise(r => setTimeout(r, 300)); // Reduced delay
+  
+  // Send START_RESPONSE only when ESP confirms READY
+  // But for compatibility, send it after short delay
+  await new Promise(r => setTimeout(r, 100));
   ws.send("START_RESPONSE");
   
   let seq = 0;
-  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
+  for (let i = 0; i < paddedPCM.length; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
-    const chunk = pcm.subarray(i, i + CHUNK_SIZE);
-    const packet = Buffer.allocUnsafe(2 + chunk.length);
-    packet.writeUInt16BE(seq & 0xFFFF, 0);
-    chunk.copy(packet, 2);
+    const chunk = paddedPCM.subarray(i, i + CHUNK_SIZE);
+    
+    // Pad last chunk with zeros if needed
+    let packet: Buffer;
+    if (chunk.length < CHUNK_SIZE) {
+      const padded = Buffer.alloc(CHUNK_SIZE);
+      chunk.copy(padded);
+      packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      padded.copy(packet, 2);
+    } else {
+      packet = Buffer.allocUnsafe(2 + chunk.length);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      chunk.copy(packet, 2);
+    }
+    
     try {
       ws.send(packet, { binary: true });
     } catch (e) {
@@ -100,8 +178,10 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     seq++;
     await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
+  
+  // Send explicit stop signal
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks");
+  console.log("[STREAM] Sent " + seq + " chunks + silence pad");
 }
 
 function detectLanguage(text: string): string {
@@ -130,13 +210,12 @@ function detectLanguage(text: string): string {
 }
 
 // ============================================================================
-// REAL WEB SEARCH USING SERPER.DEV (FREE TIER) OR DUCKDUCKGO
+// REAL WEB SEARCH USING DUCKDUCKGO
 // ============================================================================
 async function webSearch(query: string): Promise<string> {
   try {
     console.log("[WEB_SEARCH] Searching:", query);
     
-    // Try DuckDuckGo Lite (no API key needed)
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     
     const response = await fetch(searchUrl, {
@@ -147,7 +226,6 @@ async function webSearch(query: string): Promise<string> {
     
     const html = await response.text();
     
-    // Extract snippets from results
     const snippets: string[] = [];
     const resultRegex = /<a class="result__a"[^>]*>.*?<\/a>.*?<a class="result__snippet"[^>]*>(.*?)<\/a>/gs;
     let match;
@@ -188,6 +266,12 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
       const pcmPath = outputPath.replace(".wav", "_temp.pcm");
       await new Promise<void>((res, rej) => {
         ffmpeg(rawPath)
+          .audioFilters([
+            "highpass=f=120",
+            "lowpass=f=8000",
+            "volume=1.0",
+            "dynaudnorm=p=0.90:g=15"
+          ])
           .audioCodec("pcm_s16le")
           .audioChannels(1)
           .audioFrequency(24000)
@@ -204,6 +288,10 @@ async function groqTTS(text: string, outputPath: string): Promise<string | null>
       const fixedPath = outputPath.replace(".wav", "_fixed.wav");
       await new Promise<void>((res, rej) => {
         ffmpeg(rawPath)
+          .audioFilters([
+            "highpass=f=120",
+            "lowpass=f=8000"
+          ])
           .audioCodec("pcm_s16le")
           .audioChannels(1)
           .audioFrequency(24000)
@@ -259,19 +347,18 @@ async function generateTTS(text: string, lang: string, id: number): Promise<stri
 }
 
 // ============================================================================
-// CHECK IF VOLUME COMMAND
+// VOLUME COMMAND PARSER
 // ============================================================================
 function parseVolumeCommand(text: string): number | null {
   const lower = text.toLowerCase();
   
-  // Match patterns like "set volume to 50", "volume 10 percent", "mute", "unmute"
   const volumeMatch = lower.match(/(?:set\s+)?volume\s+(?:to\s+)?(\d+)(?:\s*percent?)?/);
   if (volumeMatch) {
     return parseInt(volumeMatch[1]) / 100.0;
   }
   
-  if (lower.includes("mute") && !lower.includes("unmute")) return -1; // Mute signal
-  if (lower.includes("unmute")) return -2; // Unmute signal
+  if (lower.includes("mute") && !lower.includes("unmute")) return -1;
+  if (lower.includes("unmute")) return -2;
   
   return null;
 }
@@ -325,7 +412,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("USER:", userText);
 
-    // CHECK FOR VOLUME COMMAND FIRST
     const volCmd = parseVolumeCommand(userText);
     if (volCmd !== null) {
       if (volCmd === -1) {
@@ -340,7 +426,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
         await generateTTSAndSend(ws, `Volume set to ${volPercent} percent`, "en", id);
       }
       
-      // Cleanup
       try {
         fs.unlinkSync(wavPath);
         fs.unlinkSync(resampled);
@@ -351,7 +436,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     const detectedLang = detectLanguage(userText);
     console.log("[LANG] Detected:", detectedLang);
 
-    // CHECK IF NEEDS WEB SEARCH
     const searchKeywords = ["latest", "news", "current", "today", "weather", "price", "who won", "score", "update", "balita", "panahon", "presyo", "nanalo"];
     const needsSearch = searchKeywords.some(k => userText.toLowerCase().includes(k.toLowerCase()));
     
@@ -362,7 +446,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       console.log("[SEARCH] Triggered!");
       const searchResults = await webSearch(userText);
       
-      // Use LLM to summarize search results
       const searchPrompt = detectedLang === "tl"
         ? `Batay sa mga resulta ng paghahanap: "${searchResults}". Sumagot sa Tagalog sa tanong na ito: "${userText}"`
         : `Based on these search results: "${searchResults}". Answer this question: "${userText}"`;
@@ -379,7 +462,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       
       aiResponse = (ai as any).choices[0].message.content || "";
     } else {
-      // Normal response
       const systemPrompt = detectedLang === "tl"
         ? 'Sumagot ka sa Tagalog. JSON format: {"text": "sagot", "language": "tl"}'
         : 'Respond in English. JSON format: {"text": "answer", "language": "en"}';
@@ -425,7 +507,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     await generateTTSAndSend(ws, aiResponse, responseLang, id);
 
-    // Cleanup
     try {
       fs.unlinkSync(wavPath);
       fs.unlinkSync(resampled);
@@ -437,7 +518,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   }
 }
 
-// Helper to generate TTS and send
 async function generateTTSAndSend(ws: WebSocket, text: string, lang: string, id: number) {
   const ttsPath = await generateTTS(text, lang, id);
   if (!ttsPath) {
@@ -466,7 +546,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V20 Web Search + Volume");
+    console.log("ESP connected - V21 Anti-Shhh Edition");
 
     let chunks: Buffer[] = [];
     let processing = false;
