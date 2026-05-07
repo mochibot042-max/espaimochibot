@@ -8,11 +8,42 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import { storage } from "./storage";
 
+// ============================================================================
+// PIPER TTS SETUP - WASM BASED, NO SYSTEM INSTALL NEEDED
+// ============================================================================
+// Piper WASM works in Node.js without any system installation
+let piperTTS: any = null;
+
+async function initPiper() {
+  try {
+    // Dynamic import para hindi mag-crash kung wala pa
+    const { Piper } = await import("piper-wasm");
+    piperTTS = new Piper();
+    
+    // Download voices on first run (auto-cached)
+    // English voice
+    await piperTTS.loadVoice(
+      "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx",
+      "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
+    );
+    
+    // Tagalog/Filipino - use en for now, or find tl voice
+    // Note: Piper has limited Tagalog support, fallback to English
+    
+    console.log("[PIPER] WASM TTS initialized successfully!");
+    return true;
+  } catch (e: any) {
+    console.error("[PIPER] Failed to initialize:", e.message);
+    console.log("[PIPER] Will fallback to EdgeTTS only");
+    piperTTS = null;
+    return false;
+  }
+}
+
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
-const ttsClient = new Groq({ apiKey: GROQ_API_KEY });
 
 const AUDIO_DIR = path.join(process.cwd(), "audio");
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
@@ -31,8 +62,6 @@ const EDGE_TTS_VOICES: Record<string, string> = {
   "tagalog": "fil-PH-BlessicaNeural",
   "english": "en-US-AriaNeural"
 };
-
-const GROQ_TTS_VOICE = "lulwa";
 
 function wavHeader(len: number): Buffer {
   const b = Buffer.alloc(44);
@@ -53,20 +82,129 @@ function wavHeader(len: number): Buffer {
 }
 
 // ============================================================================
-// IMPROVED PCM GENERATION - DC OFFSET REMOVAL + NOISE FILTERING
+// PIPER TTS FUNCTION - WASM BASED
+// ============================================================================
+async function piperTTSGenerate(text: string, outputPath: string, lang: string): Promise<string | null> {
+  try {
+    if (!piperTTS) {
+      console.log("[PIPER] Not initialized, skipping...");
+      return null;
+    }
+    
+    console.log("[PIPER] Generating TTS for:", text.substring(0, 50) + "...");
+    
+    // Use appropriate voice based on language
+    const voiceUrl = lang === "tl" || lang === "fil" || lang === "tagalog"
+      ? "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx"  // Fallback to English for Tagalog
+      : "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx";
+    
+    // Generate raw PCM using Piper WASM
+    const pcmBuffer = await piperTTS.synthesize(text, {
+      speakerId: 0,
+      lengthScale: 1.0,
+      noiseScale: 0.667,
+      noiseW: 0.8
+    });
+    
+    // Convert PCM to WAV
+    const wavBuffer = Buffer.concat([
+      wavHeader(pcmBuffer.length),
+      Buffer.from(pcmBuffer)
+    ]);
+    
+    await fs.promises.writeFile(outputPath, wavBuffer);
+    
+    // Process with ffmpeg for cleanup
+    const cleanPath = outputPath.replace(".wav", "_clean.wav");
+    await new Promise<void>((res, rej) => {
+      ffmpeg(outputPath)
+        .audioFilters([
+          "highpass=f=120",
+          "lowpass=f=8000",
+          "volume=1.0",
+          "dynaudnorm=p=0.90:g=15"
+        ])
+        .audioCodec("pcm_s16le")
+        .audioChannels(1)
+        .audioFrequency(SAMPLE_RATE)
+        .format("wav")
+        .on("error", (err) => {
+          // If ffmpeg fails, just use raw wav
+          console.log("[PIPER] ffmpeg cleanup failed, using raw:", err.message);
+          fs.promises.rename(outputPath, cleanPath).then(() => res()).catch(rej);
+        })
+        .on("end", () => {
+          fs.unlinkSync(outputPath);
+          fs.renameSync(cleanPath, outputPath);
+          res();
+        })
+        .save(cleanPath);
+    });
+    
+    return outputPath;
+  } catch (e: any) {
+    console.error("[PIPER] TTS failed:", e.message);
+    return null;
+  }
+}
+
+// ============================================================================
+// EDGE TTS FALLBACK
+// ============================================================================
+async function edgeTTS(text: string, outputPath: string, lang: string): Promise<string | null> {
+  try {
+    console.log("[TTS] EdgeTTS fallback...");
+    const voice = EDGE_TTS_VOICES[lang] || EDGE_TTS_VOICES["en"];
+    const tts = new EdgeTTS();
+    await tts.ttsPromise(text, outputPath, { voice });
+    return outputPath;
+  } catch (e: any) {
+    console.error("[TTS] EdgeTTS failed:", e.message);
+    return null;
+  }
+}
+
+// ============================================================================
+// MASTER TTS FUNCTION - PIPER PRIMARY, EDGE FALLBACK
+// ============================================================================
+async function generateTTS(text: string, lang: string, id: number): Promise<string | null> {
+  const piperPath = path.join(AUDIO_DIR, id + "_piper.wav");
+  const edgePath = path.join(AUDIO_DIR, id + "_edge.mp3");
+
+  // Try Piper first (WASM-based, no install needed)
+  const piperResult = await piperTTSGenerate(text, piperPath, lang);
+  if (piperResult) {
+    try { fs.unlinkSync(edgePath); } catch {}
+    return piperResult;
+  }
+
+  // Fallback to EdgeTTS
+  const edgeResult = await edgeTTS(text, edgePath, lang);
+  if (edgeResult) {
+    try { fs.unlinkSync(piperPath); } catch {}
+    return edgeResult;
+  }
+
+  try { fs.unlinkSync(piperPath); } catch {}
+  try { fs.unlinkSync(edgePath); } catch {}
+  return null;
+}
+
+// ============================================================================
+// PCM GENERATION WITH ANTI-SHHH PROCESSING
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=120",           // Higher highpass to remove more DC/sub-bass
-        "lowpass=f=8000",           // Lower lowpass to reduce hiss
+        "highpass=f=120",
+        "lowpass=f=8000",
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "volume=1.0",               // Slightly lower to prevent clipping
-        "dynaudnorm=p=0.90:g=15",   // More aggressive normalization
-        "afftdn=nf=-25",            // FFT noise reduction
-        "adeclick",                 // Remove click/pop artifacts
+        "volume=1.0",
+        "dynaudnorm=p=0.90:g=15",
+        "afftdn=nf=-25",
+        "adeclick"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
@@ -76,78 +214,56 @@ async function generatePCM(input: string): Promise<Buffer> {
       .on("end", () => {
         let pcm = fs.readFileSync(tmp);
         fs.unlinkSync(tmp);
-        
-        // Remove DC offset from entire buffer
         pcm = removeDCOffset(pcm);
-        
-        // Apply fade in/out to prevent pop/click
-        pcm = applyFadeInOut(pcm, 200); // 200 samples fade
-        
+        pcm = applyFadeInOut(pcm, 200);
         resolve(pcm);
       })
       .save(tmp);
   });
 }
 
-// Remove DC offset by calculating mean and subtracting
 function removeDCOffset(pcm: Buffer): Buffer {
   const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
   let sum = 0;
-  
-  for (let i = 0; i < samples.length; i++) {
-    sum += samples[i];
-  }
-  
+  for (let i = 0; i < samples.length; i++) sum += samples[i];
   const mean = Math.round(sum / samples.length);
   
-  if (Math.abs(mean) > 10) { // Only adjust if significant offset
-    for (let i = 0; i < samples.length; i++) {
-      samples[i] -= mean;
-    }
+  if (Math.abs(mean) > 10) {
+    for (let i = 0; i < samples.length; i++) samples[i] -= mean;
   }
-  
   return pcm;
 }
 
-// Apply fade in/out to prevent pops
 function applyFadeInOut(pcm: Buffer, fadeSamples: number): Buffer {
   const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
   const fadeLen = Math.min(fadeSamples, Math.floor(samples.length / 4));
   
-  // Fade in
   for (let i = 0; i < fadeLen; i++) {
     const factor = i / fadeLen;
     samples[i] = Math.round(samples[i] * factor);
   }
   
-  // Fade out
   for (let i = 0; i < fadeLen; i++) {
     const idx = samples.length - 1 - i;
     const factor = i / fadeLen;
     samples[idx] = Math.round(samples[idx] * factor);
   }
-  
   return pcm;
 }
 
 // ============================================================================
-// IMPROVED STREAMING - WITH END SILENCE PAD
+// STREAMING WITH SILENCE PAD
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   
-  // Add 500ms silence at end to prevent cut-off noise
-  const silenceBytes = Math.floor(SAMPLE_RATE * 0.5 * 2); // 500ms * 16bit
+  const silenceBytes = Math.floor(SAMPLE_RATE * 0.5 * 2);
   const silenceBuffer = Buffer.alloc(silenceBytes, 0);
   const paddedPCM = Buffer.concat([pcm, silenceBuffer]);
   
   const totalChunks = Math.ceil(paddedPCM.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300)); // Reduced delay
-  
-  // Send START_RESPONSE only when ESP confirms READY
-  // But for compatibility, send it after short delay
-  await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 300));
   ws.send("START_RESPONSE");
   
   let seq = 0;
@@ -155,7 +271,6 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     if (ws.readyState !== ws.OPEN) return;
     const chunk = paddedPCM.subarray(i, i + CHUNK_SIZE);
     
-    // Pad last chunk with zeros if needed
     let packet: Buffer;
     if (chunk.length < CHUNK_SIZE) {
       const padded = Buffer.alloc(CHUNK_SIZE);
@@ -179,7 +294,6 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
   
-  // Send explicit stop signal
   ws.send("FINISH_RESPONSE");
   console.log("[STREAM] Sent " + seq + " chunks + silence pad");
 }
@@ -210,20 +324,15 @@ function detectLanguage(text: string): string {
 }
 
 // ============================================================================
-// REAL WEB SEARCH USING DUCKDUCKGO
+// WEB SEARCH
 // ============================================================================
 async function webSearch(query: string): Promise<string> {
   try {
     console.log("[WEB_SEARCH] Searching:", query);
-    
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    
     const response = await fetch(searchUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      }
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
     });
-    
     const html = await response.text();
     
     const snippets: string[] = [];
@@ -234,10 +343,7 @@ async function webSearch(query: string): Promise<string> {
       if (snippet.length > 20) snippets.push(snippet);
     }
     
-    if (snippets.length === 0) {
-      return "No search results found.";
-    }
-    
+    if (snippets.length === 0) return "No search results found.";
     return snippets.join(". ");
   } catch (e: any) {
     console.error("[WEB_SEARCH] Error:", e.message);
@@ -246,120 +352,14 @@ async function webSearch(query: string): Promise<string> {
 }
 
 // ============================================================================
-// GROQ TTS
-// ============================================================================
-async function groqTTS(text: string, outputPath: string): Promise<string | null> {
-  try {
-    console.log("[TTS] Groq TTS...");
-    const wav = await ttsClient.audio.speech.create({
-      model: "canopylabs/orpheus-arabic-saudi",
-      voice: GROQ_TTS_VOICE,
-      response_format: "wav",
-      input: text,
-    });
-
-    const buffer = Buffer.from(await wav.arrayBuffer());
-    const rawPath = outputPath.replace(".wav", "_raw.wav");
-    await fs.promises.writeFile(rawPath, buffer);
-
-    try {
-      const pcmPath = outputPath.replace(".wav", "_temp.pcm");
-      await new Promise<void>((res, rej) => {
-        ffmpeg(rawPath)
-          .audioFilters([
-            "highpass=f=120",
-            "lowpass=f=8000",
-            "volume=1.0",
-            "dynaudnorm=p=0.90:g=15"
-          ])
-          .audioCodec("pcm_s16le")
-          .audioChannels(1)
-          .audioFrequency(24000)
-          .format("s16le")
-          .on("error", rej)
-          .on("end", res)
-          .save(pcmPath);
-      });
-      
-      fs.unlinkSync(rawPath);
-      fs.renameSync(pcmPath, outputPath);
-      return outputPath;
-    } catch {
-      const fixedPath = outputPath.replace(".wav", "_fixed.wav");
-      await new Promise<void>((res, rej) => {
-        ffmpeg(rawPath)
-          .audioFilters([
-            "highpass=f=120",
-            "lowpass=f=8000"
-          ])
-          .audioCodec("pcm_s16le")
-          .audioChannels(1)
-          .audioFrequency(24000)
-          .format("wav")
-          .on("error", rej)
-          .on("end", res)
-          .save(fixedPath);
-      });
-      
-      fs.unlinkSync(rawPath);
-      fs.renameSync(fixedPath, outputPath);
-      return outputPath;
-    }
-  } catch (e: any) {
-    console.error("[TTS] Groq failed:", e.message);
-    return null;
-  }
-}
-
-async function edgeTTS(text: string, outputPath: string, lang: string): Promise<string | null> {
-  try {
-    console.log("[TTS] EdgeTTS...");
-    const voice = EDGE_TTS_VOICES[lang] || EDGE_TTS_VOICES["en"];
-    const tts = new EdgeTTS();
-    await tts.ttsPromise(text, outputPath, { voice });
-    return outputPath;
-  } catch (e: any) {
-    console.error("[TTS] EdgeTTS failed:", e.message);
-    return null;
-  }
-}
-
-async function generateTTS(text: string, lang: string, id: number): Promise<string | null> {
-  const groqPath = path.join(AUDIO_DIR, id + "_groq.wav");
-  const edgePath = path.join(AUDIO_DIR, id + "_edge.mp3");
-
-  const groqResult = await groqTTS(text, groqPath);
-  if (groqResult) {
-    try { fs.unlinkSync(edgePath); } catch {}
-    return groqResult;
-  }
-
-  const edgeResult = await edgeTTS(text, edgePath, lang);
-  if (edgeResult) {
-    try { fs.unlinkSync(groqPath); } catch {}
-    try { fs.unlinkSync(groqPath.replace(".wav", "_raw.wav")); } catch {}
-    return edgeResult;
-  }
-
-  try { fs.unlinkSync(groqPath); } catch {}
-  try { fs.unlinkSync(edgePath); } catch {}
-  return null;
-}
-
-// ============================================================================
 // VOLUME COMMAND PARSER
 // ============================================================================
 function parseVolumeCommand(text: string): number | null {
   const lower = text.toLowerCase();
-  
   const volumeMatch = lower.match(/(?:set\s+)?volume\s+(?:to\s+)?(\d+)(?:\s*percent?)?/);
-  if (volumeMatch) {
-    return parseInt(volumeMatch[1]) / 100.0;
-  }
-  
+  if (volumeMatch) return parseInt(volumeMatch[1]) / 100.0;
   if (lower.includes("mute") && !lower.includes("unmute")) return -1;
   if (lower.includes("unmute")) return -2;
-  
   return null;
 }
 
@@ -399,9 +399,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
         file: fs.createReadStream(resampled),
         model: "whisper-large-v3-turbo"
       }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000)
-      )
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
 
     const userText = stt.text?.trim();
@@ -426,10 +424,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
         await generateTTSAndSend(ws, `Volume set to ${volPercent} percent`, "en", id);
       }
       
-      try {
-        fs.unlinkSync(wavPath);
-        fs.unlinkSync(resampled);
-      } catch {}
+      try { fs.unlinkSync(wavPath); fs.unlinkSync(resampled); } catch {}
       return;
     }
 
@@ -507,10 +502,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     await generateTTSAndSend(ws, aiResponse, responseLang, id);
 
-    try {
-      fs.unlinkSync(wavPath);
-      fs.unlinkSync(resampled);
-    } catch {}
+    try { fs.unlinkSync(wavPath); fs.unlinkSync(resampled); } catch {}
 
   } catch (e: any) {
     console.error("[PROCESS] Error:", e);
@@ -529,15 +521,16 @@ async function generateTTSAndSend(ws: WebSocket, text: string, lang: string, id:
   console.log("[TTS] PCM: " + pcm.length + " bytes");
   await streamPCM(ws, pcm);
 
-  try {
-    fs.unlinkSync(ttsPath);
-  } catch {}
+  try { fs.unlinkSync(ttsPath); } catch {}
 }
 
 // ============================================================================
 // ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
+  // Initialize Piper WASM on startup
+  await initPiper();
+  
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
@@ -546,7 +539,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V21 Anti-Shhh Edition");
+    console.log("ESP connected - V23 Piper TTS Edition");
 
     let chunks: Buffer[] = [];
     let processing = false;
@@ -572,7 +565,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         if (msg === "END_STREAM") {
           if (!isRecording) return;
           isRecording = false;
-
           if (processing) return;
           processing = true;
 
@@ -583,10 +575,8 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           processAndRespond(ws, audio).finally(() => {
             processing = false;
           });
-
           return;
         }
-
         return;
       }
 
