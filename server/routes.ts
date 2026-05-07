@@ -11,7 +11,7 @@ import axios from "axios";
 import { spawn } from "child_process";
 
 /* ---------------- API KEY SETUP ---------------- */
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 /* ---------------- GROQ CLIENTS ---------------- */
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
