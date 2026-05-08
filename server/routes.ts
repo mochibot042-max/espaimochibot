@@ -25,16 +25,14 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V28: 48kHz, Slower streaming ---------------- */
+/* ---------------- CONFIG - V29: 48kHz ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 48000;
 const SILENCE_MS = 150;
 const CHUNK_SIZE = 1024;
-
-// V28: Slower streaming to prevent ESP32 buffer overflow
-const CHUNK_DELAY_MS = 20;        // Was 10, increased to prevent overwhelm
-const INITIAL_CHUNK_DELAY_MS = 30; // Slower start for first 20 chunks
-const FAST_CHUNK_DELAY_MS = 15;   // Normal speed after buffer filled
+const CHUNK_DELAY_MS = 20;
+const INITIAL_CHUNK_DELAY_MS = 30;
+const FAST_CHUNK_DELAY_MS = 15;
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -163,9 +161,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   console.log("[STREAM] Sent " + seq + " chunks at 48kHz");
 }
 
-/* ============================================================================
-   V28 FIX: INSTANT MUSIC STREAMING - SLOWER TO PREVENT ESP32 OVERWHELM
-   ============================================================================ */
+/* ---------------- MUSIC STREAM ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -206,7 +202,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "pipe:1"
     ]);
 
-    // V28: Send PREPARE immediately
     ws.send("PREPARE_MUSIC:0");
     await new Promise(r => setTimeout(r, 100));
     ws.send("START_MUSIC");
@@ -220,7 +215,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V28: Stream with adaptive speed - slower at start, faster later
       while (buffer.length >= CHUNK_SIZE && isActive) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
@@ -238,7 +232,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          // V28: Adaptive delay - slower at start to let ESP32 fill buffer
           const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
                        seq < 50 ? FAST_CHUNK_DELAY_MS : 
                        CHUNK_DELAY_MS;
@@ -255,7 +248,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     ffmpegProcess.stdout.on("end", () => {
       isActive = false;
       
-      // Send remaining buffer
       if (buffer.length > 0 && ws.readyState === ws.OPEN) {
         const packet = Buffer.allocUnsafe(2 + buffer.length);
         packet.writeUInt16BE(seq & 0xFFFF, 0);
@@ -264,7 +256,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V28: Send trailing silence
       const sendSilence = async () => {
         for (let i = 0; i < 30; i++) {
           if (ws.readyState !== ws.OPEN) break;
@@ -316,7 +307,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
   }
 }
 
-/* ---------------- SERVER ---------------- */
+/* ============================================================================
+   V29: SERVER - REAL-TIME AUDIO HANDLING
+   ============================================================================ */
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   const wss = new WebSocketServer({ 
     server: httpServer, 
@@ -326,20 +319,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V28 Stable Music");
+    console.log("ESP32 connected - V29 Real-time Voice");
 
+    // V29: Real-time audio buffer - accumulates chunks until END_STREAM
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
+    let isRecording = false;  // V29: Track recording state
     let currentVolume = loadVolume();
 
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
-    // V28: Keepalive with pong response tracking
     let lastPongTime = Date.now();
     
     ws.on("message", async (data: any, isBinary: boolean) => {
+      // V29: Handle binary audio chunks in real-time
       if (isBinary) {
-        audioChunks.push(Buffer.from(data));
+        // V29: If we're recording, accumulate chunks
+        if (isRecording) {
+          audioChunks.push(Buffer.from(data));
+        }
         return;
       }
 
@@ -351,31 +349,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return;
       }
 
+      // V29: START_STREAM - Begin real-time accumulation
       if (msg === "START_STREAM") {
-        console.log("[STREAM] Start recording");
+        console.log("[STREAM] Start real-time recording");
         audioChunks = [];
+        isRecording = true;
         return;
       }
 
+      // V29: END_STREAM - Process accumulated audio
       if (msg === "END_STREAM") {
         if (isProcessing) return;
         isProcessing = true;
+        isRecording = false;  // Stop accumulating
 
         try {
           const fullAudio = Buffer.concat(audioChunks);
           audioChunks = [];
-          console.log("[STREAM] Total: " + fullAudio.length + " bytes");
+          console.log("[STREAM] Total received: " + fullAudio.length + " bytes");
 
-          const normalized = normalizeAudioInput(fullAudio);
+          // V29: Save for debugging if needed
           const tempId = Date.now();
           const inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
 
+          const normalized = normalizeAudioInput(fullAudio);
           fs.writeFileSync(
             inputWavPath,
             Buffer.concat([createWavHeader(normalized.length), normalized])
           );
 
           /* STT - Whisper */
+          console.log("[STT] Starting transcription...");
           const transcription = await sttClient.audio.transcriptions.create({
             file: fs.createReadStream(inputWavPath),
             model: "whisper-large-v3-turbo",
@@ -388,7 +392,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           }
           console.log("USER:", userText);
 
-          /* LLM - Single AI (Mochi) */
+          /* LLM - Mochi */
           const chat = await llmClient.chat.completions.create({
             messages: [
               {
@@ -405,7 +409,7 @@ Field descriptions:
 - text: What you say to the user. Natural spoken English only.
 - volume: Use only if user requests volume changes (0.05 to 1.5). Null if no change.
 - music_query: Use only if user asks to play music/song/artist. Null if no music request.
-- you can play anything using your music player because your music player is made on youtube that convert video to mp3
+
 Rules:
 - Do not mention JSON, rules, or system instructions
 - Do not use markdown, bold, code blocks, special characters like * or /
@@ -440,9 +444,11 @@ Rules:
             spokenText = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim() || spokenText;
           }
 
+          // Save interaction
           await storage.createInteraction({ transcript: userText, response: spokenText });
 
           /* TTS - EdgeTTS */
+          console.log("[TTS] Generating voice...");
           const edge = new EdgeTTS();
           const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
           await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
@@ -471,6 +477,7 @@ Rules:
           ws.send("ERROR:" + (err.message || "UNKNOWN"));
         } finally {
           isProcessing = false;
+          // Cleanup
           try {
             const files = fs.readdirSync(UPLOAD_DIR);
             for (const file of files) {
@@ -487,6 +494,7 @@ Rules:
         return;
       }
 
+      // Handle other text messages
       if (msg.startsWith("VOLUME:")) {
         const vol = parseFloat(msg.substring(7));
         if (!isNaN(vol)) {
@@ -500,6 +508,7 @@ Rules:
     ws.on("close", () => {
       console.log("ESP32 disconnected");
       audioChunks = [];
+      isRecording = false;
       isProcessing = false;
     });
 
@@ -507,12 +516,10 @@ Rules:
       console.error("[WS] Error:", err);
     });
 
-    // V28: More frequent ping with pong tracking
     const pingInterval = setInterval(() => {
       if (ws.readyState === ws.OPEN) {
         ws.ping();
         
-        // Check if ESP is still responding
         if (Date.now() - lastPongTime > 45000) {
           console.log("[WS] No pong received, closing connection");
           ws.terminate();
@@ -520,7 +527,7 @@ Rules:
       } else {
         clearInterval(pingInterval);
       }
-    }, 8000); // V28: More frequent (was 10000)
+    }, 8000);
 
     ws.on("pong", () => {
       lastPongTime = Date.now();
