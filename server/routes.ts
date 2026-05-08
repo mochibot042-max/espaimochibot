@@ -9,6 +9,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
 import axios from "axios";
 import { spawn } from "child_process";
+import { Readable } from "stream";
 
 /* ---------------- API KEY SETUP ---------------- */
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
@@ -25,12 +26,12 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V26: 48kHz ---------------- */
+/* ---------------- CONFIG - V27: 48kHz ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 48000;   // V26: 48kHz (was 16000)
-const SILENCE_MS = 150;             // V26: Slightly more silence padding
-const CHUNK_SIZE = 1024;            // V26: Mas malaki (was 512)
-const CHUNK_DELAY_MS = 10;          // V26: Mas mabilis (was 15)
+const TARGET_SAMPLE_RATE = 48000;
+const SILENCE_MS = 150;
+const CHUNK_SIZE = 1024;
+const CHUNK_DELAY_MS = 10;
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -75,7 +76,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- GENERATE PCM - V26: 48kHz optimized ---------------- */
+/* ---------------- GENERATE PCM - V27: 48kHz ---------------- */
 async function generatePCM(inputPath: string): Promise<Buffer> {
   const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
 
@@ -83,13 +84,13 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
     ffmpeg(inputPath)
       .noVideo()
       .audioFilters([
-        "highpass=f=80",                    // V26: Lower highpass para sa 48kHz
-        "lowpass=f=20000",                  // V26: Higher lowpass para sa 48kHz
+        "highpass=f=80",
+        "lowpass=f=20000",
         `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
         "pan=mono|c0=c0",
         "volume=0.90",
-        "dynaudnorm=p=0.95:g=15",           // V26: Slightly less aggressive
-        "afftdn=nf=-30"                     // V26: Less noise reduction
+        "dynaudnorm=p=0.95:g=15",
+        "afftdn=nf=-30"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
@@ -100,7 +101,6 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
         let pcm = fs.readFileSync(tmpRaw);
         fs.unlinkSync(tmpRaw);
 
-        // Remove DC offset
         const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
         let sum = 0;
         for (let i = 0; i < samples.length; i++) sum += samples[i];
@@ -109,7 +109,6 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
           for (let i = 0; i < samples.length; i++) samples[i] -= mean;
         }
 
-        // Add silence padding at end
         const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
         const silence = Buffer.alloc(silenceBytes, 0);
         const finalPCM = Buffer.concat([pcm, silence]);
@@ -120,7 +119,7 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
   });
 }
 
-/* ---------------- STREAM PCM TO ESP32 - V26: 48kHz ---------------- */
+/* ---------------- STREAM PCM TO ESP32 ---------------- */
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   
@@ -161,13 +160,16 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   console.log("[STREAM] Sent " + seq + " chunks at 48kHz");
 }
 
-/* ---------------- MUSIC STREAM - V26: 48kHz ---------------- */
+/* ============================================================================
+   V27 FIX: INSTANT MUSIC STREAMING - PIPE DIRECTLY, NO FULL DOWNLOAD
+   ============================================================================ */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
     
     const search = await axios.get(
-      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`
+      `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`,
+      { timeout: 10000 }
     );
     
     if (!search.data?.length) {
@@ -179,7 +181,8 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     console.log("[MUSIC] Found:", video.title);
 
     const apiRes = await axios.get(
-      `https://mostakim.onrender.com/m/sing?url=${video.url}`
+      `https://mostakim.onrender.com/m/sing?url=${video.url}`,
+      { timeout: 10000 }
     );
     
     if (!apiRes.data?.url) {
@@ -187,102 +190,127 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       return;
     }
 
-    console.log("[MUSIC] Downloading audio...");
-    const audioResponse = await axios({
-      url: apiRes.data.url,
-      method: "GET",
-      responseType: "arraybuffer",
-      timeout: 60000
-    });
+    console.log("[MUSIC] Starting instant stream...");
 
-    const audioBuffer = Buffer.from(audioResponse.data);
-    console.log("[MUSIC] Downloaded", audioBuffer.length, "bytes");
-
-    // V26: Process through ffmpeg to 48kHz PCM
+    // V27 FIX: Start ffmpeg IMMEDIATELY with streaming input
+    // No waiting for full download - pipe as data arrives
+    
     const ffmpegProcess = spawn("ffmpeg", [
-      "-i", "pipe:0",
+      "-i", apiRes.data.url,        // Direct URL input - ffmpeg handles streaming
       "-f", "s16le",
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
-      "-af", "highpass=f=60,lowpass=f=20000,volume=0.85",  // V26: Wider freq range
+      "-af", "highpass=f=60,lowpass=f=20000,volume=0.85",
+      "-bufsize", "256k",           // V27: Buffer size for smooth streaming
+      "-maxrate", "500k",           // V27: Limit bitrate
       "pipe:1"
     ]);
 
-    let pcmBuffer = Buffer.alloc(0);
-    
-    ffmpegProcess.stdout.on("data", (chunk: Buffer) => {
-      pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+    // V27: Send PREPARE immediately - don't wait for anything
+    ws.send("PREPARE_MUSIC:0");     // 0 = unknown chunk count for streaming
+    await new Promise(r => setTimeout(r, 100)); // Minimal delay
+    ws.send("START_MUSIC");
+
+    let buffer = Buffer.alloc(0);
+    let seq = 0;
+    let isActive = true;
+    let hasStarted = false;
+
+    ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
+      if (!isActive || ws.readyState !== ws.OPEN) return;
+      
+      buffer = Buffer.concat([buffer, chunk]);
+      
+      // V27: Stream immediately - don't wait for large buffer
+      while (buffer.length >= CHUNK_SIZE && isActive) {
+        if (ws.readyState !== ws.OPEN) {
+          isActive = false;
+          return;
+        }
+        
+        const sendChunk = buffer.slice(0, CHUNK_SIZE);
+        buffer = buffer.slice(CHUNK_SIZE);
+        
+        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        sendChunk.copy(packet, 2);
+        
+        try {
+          ws.send(packet, { binary: true });
+          seq++;
+          
+          // V27: First few chunks faster, then normal pace
+          if (seq < 10) {
+            await new Promise(r => setTimeout(r, 5)); // Faster start
+          } else {
+            await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+          }
+        } catch (e) {
+          console.error("[MUSIC] Send error:", e);
+          isActive = false;
+          return;
+        }
+      }
+    });
+
+    ffmpegProcess.stdout.on("end", () => {
+      isActive = false;
+      
+      // Send remaining buffer
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+        const packet = Buffer.allocUnsafe(2 + buffer.length);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        buffer.copy(packet, 2);
+        ws.send(packet, { binary: true });
+        seq++;
+      }
+      
+      // Send trailing silence to ensure playback finishes
+      const trailingSilenceChunks = 30;
+      const sendSilence = async () => {
+        for (let i = 0; i < trailingSilenceChunks; i++) {
+          if (ws.readyState !== ws.OPEN) break;
+          const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+          silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
+          silencePacket.fill(0, 2);
+          ws.send(silencePacket, { binary: true });
+          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+        }
+        
+        if (ws.readyState === ws.OPEN) {
+          ws.send("FINISH_MUSIC");
+        }
+        console.log("[MUSIC] Stream finished, sent " + seq + " chunks");
+      };
+      
+      sendSilence();
     });
 
     ffmpegProcess.stderr.on("data", (data) => {
-      // ffmpeg progress
-    });
-
-    ffmpegProcess.stdin.write(audioBuffer);
-    ffmpegProcess.stdin.end();
-
-    await new Promise<void>((resolve, reject) => {
-      ffmpegProcess.on("close", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error("FFmpeg exited with code " + code));
+      // Parse ffmpeg progress if needed
+      const str = data.toString();
+      if (str.includes("time=")) {
+        // Extract time for progress tracking
+        const match = str.match(/time=(\d+:\d+:\d+\.\d+)/);
+        if (match) {
+          console.log("[MUSIC] FFmpeg progress:", match[1]);
         }
-      });
-      ffmpegProcess.on("error", reject);
+      }
     });
 
-    console.log("[MUSIC] PCM ready:", pcmBuffer.length, "bytes at 48kHz");
-
-    const totalChunks = Math.ceil(pcmBuffer.length / CHUNK_SIZE);
-    ws.send("PREPARE_MUSIC:" + totalChunks);
-    await new Promise(r => setTimeout(r, 500));
-    ws.send("START_MUSIC");
-
-    let seq = 0;
-    for (let i = 0; i < pcmBuffer.length; i += CHUNK_SIZE) {
-      if (ws.readyState !== ws.OPEN) {
-        console.log("[MUSIC] WebSocket closed during stream");
-        return;
+    ffmpegProcess.on("error", (err) => {
+      console.error("[MUSIC] FFmpeg error:", err);
+      isActive = false;
+      if (ws.readyState === ws.OPEN) {
+        ws.send("ERROR:MUSIC_FAILED");
       }
-      
-      const chunk = pcmBuffer.slice(i, i + CHUNK_SIZE);
-      
-      let packet: Buffer;
-      if (chunk.length < CHUNK_SIZE) {
-        const padded = Buffer.alloc(CHUNK_SIZE);
-        chunk.copy(padded);
-        packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        padded.copy(packet, 2);
-      } else {
-        packet = Buffer.allocUnsafe(2 + chunk.length);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        chunk.copy(packet, 2);
+    });
+
+    ffmpegProcess.on("close", (code) => {
+      if (code !== 0 && code !== null) {
+        console.error("[MUSIC] FFmpeg exited with code:", code);
       }
-
-      ws.send(packet, { binary: true });
-      seq++;
-      await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
-    }
-
-    // Trailing silence
-    const trailingSilenceChunks = 30;
-    for (let i = 0; i < trailingSilenceChunks; i++) {
-      if (ws.readyState !== ws.OPEN) break;
-      const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-      silencePacket.writeUInt16BE(seq & 0xFFFF, 0);
-      silencePacket.fill(0, 2);
-      ws.send(silencePacket, { binary: true });
-      seq++;
-      await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
-    }
-
-    if (ws.readyState === ws.OPEN) {
-      ws.send("FINISH_MUSIC");
-    }
-    
-    console.log("[MUSIC] Finished, sent " + seq + " chunks at 48kHz");
+    });
 
   } catch (err: any) {
     console.error("[MUSIC] Stream error:", err.message);
@@ -298,11 +326,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     server: httpServer, 
     path: "/ws/audio",
     perMessageDeflate: false,
-    maxPayload: 4 * 1024 * 1024   // V26: Mas malaki (was 2MB) para sa 48kHz
+    maxPayload: 4 * 1024 * 1024
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V26 48kHz High Quality");
+    console.log("ESP32 connected - V27 Instant Music");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -433,9 +461,10 @@ Rules:
             console.log("[VOL] Changed to:", currentVolume);
           }
 
-          /* Handle Music Request */
+          /* Handle Music Request - V27: Faster transition */
           if (musicQuery) {
-            await new Promise(r => setTimeout(r, 2000));
+            // V27: Minimal delay before music - TTS already has trailing silence
+            await new Promise(r => setTimeout(r, 500));
             downloadSongStream(musicQuery, ws);
           }
 
