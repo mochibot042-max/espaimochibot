@@ -25,16 +25,16 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V30: Mas mabagal na streaming ---------------- */
+/* ---------------- CONFIG - V31: Mas mabagal + Proper FINISH ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 48000;
 const SILENCE_MS = 150;
 const CHUNK_SIZE = 1024;
 
-// V30: Mas mabagal para hindi ma-overwhelm ang ESP32
-const CHUNK_DELAY_MS = 35;        // V30: Was 20, mas mabagal
-const INITIAL_CHUNK_DELAY_MS = 50; // V30: Was 30, mas mabagal start
-const FAST_CHUNK_DELAY_MS = 25;   // V30: Was 15, mas mabagal
+// V31: Mas mabagal para hindi ma-overwhelm ang ESP32
+const CHUNK_DELAY_MS = 40;        // V31: Was 35, mas mabagal
+const INITIAL_CHUNK_DELAY_MS = 60; // V31: Was 50, mas mabagal start
+const FAST_CHUNK_DELAY_MS = 30;   // V31: Was 25, mas mabagal
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -164,7 +164,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 }
 
 /* ============================================================================
-   V30: MUSIC STREAM - Mas mabagal, may flow control
+   V31: MUSIC STREAM - Proper FINISH timing + Slower streaming
    ============================================================================ */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
@@ -213,23 +213,17 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let isActive = true;
-    let isPaused = false;  // V30: Flow control flag
+    let isPaused = false;
+    let chunkCount = 0;
 
-    // V30: Handle PAUSE/RESUME messages from ESP32
-    const originalOnMessage = ws.on;
-    
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       
-      // V30: If paused, don't accumulate too much
-      if (isPaused) {
-        // Just drop data while paused, ffmpeg will handle backpressure
-        return;
-      }
+      if (isPaused) return;  // Drop data while paused
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V30: Process one chunk at a time, slower
+      // V31: Process one chunk at a time, slower
       while (buffer.length >= CHUNK_SIZE && isActive && !isPaused) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
@@ -246,8 +240,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         try {
           ws.send(packet, { binary: true });
           seq++;
+          chunkCount++;
           
-          // V30: Mas mabagal na delay
+          // V31: Mas mabagal na adaptive delay
           const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
                        seq < 50 ? FAST_CHUNK_DELAY_MS : 
                        CHUNK_DELAY_MS;
@@ -261,19 +256,24 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       }
     });
 
+    // V31: Wait for ffmpeg to actually finish before sending FINISH
     ffmpegProcess.stdout.on("end", () => {
-      isActive = false;
+      console.log("[MUSIC] FFmpeg stdout ended, waiting for buffer drain...");
       
-      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
-        const packet = Buffer.allocUnsafe(2 + buffer.length);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        buffer.copy(packet, 2);
-        ws.send(packet, { binary: true });
-        seq++;
-      }
-      
-      const sendSilence = async () => {
-        for (let i = 0; i < 30; i++) {
+      // V31: Send remaining buffer
+      const drainAndFinish = async () => {
+        if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+          const packet = Buffer.allocUnsafe(2 + buffer.length);
+          packet.writeUInt16BE(seq & 0xFFFF, 0);
+          buffer.copy(packet, 2);
+          ws.send(packet, { binary: true });
+          seq++;
+          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+        }
+        
+        // V31: Send trailing silence to ensure smooth end
+        console.log("[MUSIC] Sending trailing silence...");
+        for (let i = 0; i < 40; i++) {  // V31: 40 chunks (~1.5s at 40ms)
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
@@ -282,13 +282,14 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
         }
         
+        // V31: NOW send FINISH - after all audio sent
         if (ws.readyState === ws.OPEN) {
           ws.send("FINISH_MUSIC");
         }
-        console.log("[MUSIC] Stream finished, sent " + seq + " chunks");
+        console.log("[MUSIC] Finished, sent " + chunkCount + " audio chunks + silence");
       };
       
-      sendSilence();
+      drainAndFinish();
     });
 
     ffmpegProcess.stderr.on("data", (data) => {
@@ -324,7 +325,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 }
 
 /* ============================================================================
-   V30: SERVER - Real-time Audio + Flow Control
+   V31: SERVER - Real-time Audio + Flow Control
    ============================================================================ */
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   const wss = new WebSocketServer({ 
@@ -335,37 +336,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V30 Flow Control");
+    console.log("ESP32 connected - V31 Smooth Playback");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
     let isRecording = false;
     let currentVolume = loadVolume();
-    let isPaused = false;  // V30: Server-side pause flag
 
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
     let lastPongTime = Date.now();
     
     ws.on("message", async (data: any, isBinary: boolean) => {
-      // V30: Handle PAUSE/RESUME from ESP32
-      if (!isBinary) {
-        const msg = data.toString();
-        
-        if (msg === "PAUSE") {
-          console.log("[FLOW] ESP requested PAUSE");
-          isPaused = true;
-          return;
-        }
-        
-        if (msg === "RESUME") {
-          console.log("[FLOW] ESP requested RESUME");
-          isPaused = false;
-          return;
-        }
-      }
-      
-      // V30: Handle binary audio chunks
       if (isBinary) {
         if (isRecording) {
           audioChunks.push(Buffer.from(data));
