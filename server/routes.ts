@@ -25,20 +25,16 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V32: Smooth AI Streaming ---------------- */
+/* ---------------- CONFIG - V28: 48kHz, Slower streaming ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 48000;
 const SILENCE_MS = 150;
 const CHUNK_SIZE = 1024;
 
-// V32: Mas mababang delay para sa AI response (mas smooth)
-const AI_CHUNK_DELAY_MS = 28;        // V32: Mas mabilis para hindi choppy
-const AI_INITIAL_DELAY_MS = 45;      // V32: Mas mabilis na start
-const AI_FAST_DELAY_MS = 22;         // V32: Mas mabilis para sa unang chunks
-
-// V32: Mas mabagal para sa music (hindi naman chopy ang music)
-const MUSIC_CHUNK_DELAY_MS = 45;
-const MUSIC_INITIAL_DELAY_MS = 60;
+// V28: Slower streaming to prevent ESP32 buffer overflow
+const CHUNK_DELAY_MS = 20;        // Was 10, increased to prevent overwhelm
+const INITIAL_CHUNK_DELAY_MS = 30; // Slower start for first 20 chunks
+const FAST_CHUNK_DELAY_MS = 15;   // Normal speed after buffer filled
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -83,8 +79,10 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- GENERATE PCM (Async) ---------------- */
-async function generatePCM(inputPath: string, outputPath: string): Promise<void> {
+/* ---------------- GENERATE PCM ---------------- */
+async function generatePCM(inputPath: string): Promise<Buffer> {
+  const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
+
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .noVideo()
@@ -102,98 +100,71 @@ async function generatePCM(inputPath: string, outputPath: string): Promise<void>
       .audioFrequency(TARGET_SAMPLE_RATE)
       .format("s16le")
       .on("error", reject)
-      .on("end", () => resolve())
-      .save(outputPath);
+      .on("end", () => {
+        let pcm = fs.readFileSync(tmpRaw);
+        fs.unlinkSync(tmpRaw);
+
+        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+        let sum = 0;
+        for (let i = 0; i < samples.length; i++) sum += samples[i];
+        const mean = Math.round(sum / samples.length);
+        if (Math.abs(mean) > 10) {
+          for (let i = 0; i < samples.length; i++) samples[i] -= mean;
+        }
+
+        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
+        const silence = Buffer.alloc(silenceBytes, 0);
+        const finalPCM = Buffer.concat([pcm, silence]);
+
+        resolve(finalPCM);
+      })
+      .save(tmpRaw);
   });
 }
 
-/* ---------------- STREAM PCM TO ESP32 - V32: Smooth + Flow Control ---------------- */
-async function streamPCM(ws: WebSocket, pcmPath: string) {
+/* ---------------- STREAM PCM TO ESP32 ---------------- */
+async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
-
-  // V32: Get file stats for total chunks
-  const stats = fs.statSync(pcmPath);
-  const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
   
+  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 200)); // V32: Mas mabilis na prepare
+  await new Promise(r => setTimeout(r, 300));
   ws.send("START_RESPONSE");
 
-  // V32: Stream directly from file (no memory load)
-  const fd = fs.openSync(pcmPath, 'r');
   let seq = 0;
-  let position = 0;
-  let isPaused = false;
+  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
+    if (ws.readyState !== ws.OPEN) return;
+    const chunk = pcm.slice(i, i + CHUNK_SIZE);
 
-  // V32: Handle PAUSE/RESUME from ESP32
-  const pauseHandler = (data: any, isBinary: boolean) => {
-    if (!isBinary) {
-      const msg = data.toString();
-      if (msg === "PAUSE") isPaused = true;
-      if (msg === "RESUME") isPaused = false;
+    let packet: Buffer;
+    if (chunk.length < CHUNK_SIZE) {
+      const padded = Buffer.alloc(CHUNK_SIZE);
+      chunk.copy(padded);
+      packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      padded.copy(packet, 2);
+    } else {
+      packet = Buffer.allocUnsafe(2 + chunk.length);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      chunk.copy(packet, 2);
     }
-  };
-  
-  ws.on('message', pauseHandler);
 
-  try {
-    while (position < stats.size) {
-      if (ws.readyState !== ws.OPEN) break;
-      
-      // V32: Respect ESP32 pause signal
-      if (isPaused) {
-        await new Promise(r => setTimeout(r, 50));
-        continue;
-      }
-
-      const chunk = Buffer.alloc(CHUNK_SIZE);
-      const bytesRead = fs.readSync(fd, chunk, 0, CHUNK_SIZE, position);
-      
-      if (bytesRead === 0) break;
-      position += bytesRead;
-
-      let packet: Buffer;
-      if (bytesRead < CHUNK_SIZE) {
-        const padded = Buffer.alloc(CHUNK_SIZE);
-        chunk.copy(padded, 0, 0, bytesRead);
-        packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        padded.copy(packet, 2);
-      } else {
-        packet = Buffer.allocUnsafe(2 + bytesRead);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        chunk.copy(packet, 2, 0, bytesRead);
-      }
-
-      try {
-        ws.send(packet, { binary: true });
-      } catch (e) {
-        console.error("[STREAM] Send failed:", e);
-        break;
-      }
-
-      seq++;
-      
-      // V32: Adaptive delay - mas mabilis sa simula para i-fill ang ESP32 buffer agad
-      const delay = seq < 15 ? AI_INITIAL_DELAY_MS : 
-                   seq < 40 ? AI_FAST_DELAY_MS : 
-                   AI_CHUNK_DELAY_MS;
-      
-      await new Promise(r => setTimeout(r, delay));
+    try {
+      ws.send(packet, { binary: true });
+    } catch (e) {
+      console.error("[STREAM] Send failed:", e);
+      return;
     }
-  } finally {
-    fs.closeSync(fd);
-    ws.off('message', pauseHandler);
+    seq++;
+    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
 
-  if (ws.readyState === ws.OPEN) {
-    ws.send("FINISH_RESPONSE");
-  }
+  ws.send("FINISH_RESPONSE");
   console.log("[STREAM] Sent " + seq + " chunks at 48kHz");
 }
 
 /* ============================================================================
-   V32: MUSIC STREAM - Mas mabagal pero stable
+   V28 FIX: INSTANT MUSIC STREAMING - SLOWER TO PREVENT ESP32 OVERWHELM
    ============================================================================ */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
@@ -222,7 +193,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       return;
     }
 
-    console.log("[MUSIC] Starting stream...");
+    console.log("[MUSIC] Starting instant stream...");
 
     const ffmpegProcess = spawn("ffmpeg", [
       "-i", apiRes.data.url,
@@ -235,6 +206,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "pipe:1"
     ]);
 
+    // V28: Send PREPARE immediately
     ws.send("PREPARE_MUSIC:0");
     await new Promise(r => setTimeout(r, 100));
     ws.send("START_MUSIC");
@@ -242,27 +214,14 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let isActive = true;
-    let isPaused = false;
-    let chunkCount = 0;
-
-    // V32: Handle PAUSE/RESUME
-    const pauseHandler = (data: any, isBinary: boolean) => {
-      if (!isBinary) {
-        const msg = data.toString();
-        if (msg === "PAUSE") isPaused = true;
-        if (msg === "RESUME") isPaused = false;
-      }
-    };
-    
-    ws.on('message', pauseHandler);
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
-      if (isPaused) return;
-
+      
       buffer = Buffer.concat([buffer, chunk]);
       
-      while (buffer.length >= CHUNK_SIZE && isActive && !isPaused) {
+      // V28: Stream with adaptive speed - slower at start, faster later
+      while (buffer.length >= CHUNK_SIZE && isActive) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
           return;
@@ -278,10 +237,12 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         try {
           ws.send(packet, { binary: true });
           seq++;
-          chunkCount++;
           
-          // V32: Music delay (mas mabagal, stable)
-          const delay = seq < 20 ? MUSIC_INITIAL_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
+          // V28: Adaptive delay - slower at start to let ESP32 fill buffer
+          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
+                       seq < 50 ? FAST_CHUNK_DELAY_MS : 
+                       CHUNK_DELAY_MS;
+          
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
           console.error("[MUSIC] Send error:", e);
@@ -292,49 +253,53 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     });
 
     ffmpegProcess.stdout.on("end", () => {
-      const drainAndFinish = async () => {
-        if (buffer.length > 0 && ws.readyState === ws.OPEN) {
-          const packet = Buffer.allocUnsafe(2 + buffer.length);
-          packet.writeUInt16BE(seq & 0xFFFF, 0);
-          buffer.copy(packet, 2);
-          ws.send(packet, { binary: true });
-          seq++;
-          await new Promise(r => setTimeout(r, MUSIC_CHUNK_DELAY_MS));
-        }
-        
-        // V32: Trailing silence
+      isActive = false;
+      
+      // Send remaining buffer
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+        const packet = Buffer.allocUnsafe(2 + buffer.length);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        buffer.copy(packet, 2);
+        ws.send(packet, { binary: true });
+        seq++;
+      }
+      
+      // V28: Send trailing silence
+      const sendSilence = async () => {
         for (let i = 0; i < 30; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
           silencePacket.fill(0, 2);
           ws.send(silencePacket, { binary: true });
-          await new Promise(r => setTimeout(r, MUSIC_CHUNK_DELAY_MS));
+          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
         }
         
         if (ws.readyState === ws.OPEN) {
           ws.send("FINISH_MUSIC");
         }
-        ws.off('message', pauseHandler);
-        console.log("[MUSIC] Finished, sent " + chunkCount + " chunks");
+        console.log("[MUSIC] Stream finished, sent " + seq + " chunks");
       };
       
-      drainAndFinish();
+      sendSilence();
     });
 
     ffmpegProcess.stderr.on("data", (data) => {
       const str = data.toString();
       if (str.includes("time=")) {
         const match = str.match(/time=(\d+:\d+:\d+\.\d+)/);
-        if (match) console.log("[MUSIC] FFmpeg progress:", match[1]);
+        if (match) {
+          console.log("[MUSIC] FFmpeg progress:", match[1]);
+        }
       }
     });
 
     ffmpegProcess.on("error", (err) => {
       console.error("[MUSIC] FFmpeg error:", err);
       isActive = false;
-      ws.off('message', pauseHandler);
-      if (ws.readyState === ws.OPEN) ws.send("ERROR:MUSIC_FAILED");
+      if (ws.readyState === ws.OPEN) {
+        ws.send("ERROR:MUSIC_FAILED");
+      }
     });
 
     ffmpegProcess.on("close", (code) => {
@@ -345,13 +310,13 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 
   } catch (err: any) {
     console.error("[MUSIC] Stream error:", err.message);
-    if (ws.readyState === ws.OPEN) ws.send("ERROR:MUSIC_FAILED");
+    if (ws.readyState === ws.OPEN) {
+      ws.send("ERROR:MUSIC_FAILED");
+    }
   }
 }
 
-/* ============================================================================
-   V32: SERVER - Real-time Audio + Flow Control
-   ============================================================================ */
+/* ---------------- SERVER ---------------- */
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   const wss = new WebSocketServer({ 
     server: httpServer, 
@@ -361,20 +326,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V32 Smooth AI Streaming");
+    console.log("ESP32 connected - V28 Stable Music");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
-    let isRecording = false;
     let currentVolume = loadVolume();
 
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
+    // V28: Keepalive with pong response tracking
     let lastPongTime = Date.now();
     
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (isBinary) {
-        if (isRecording) audioChunks.push(Buffer.from(data));
+        audioChunks.push(Buffer.from(data));
         return;
       }
 
@@ -387,34 +352,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       if (msg === "START_STREAM") {
-        console.log("[STREAM] Start real-time recording");
+        console.log("[STREAM] Start recording");
         audioChunks = [];
-        isRecording = true;
         return;
       }
 
       if (msg === "END_STREAM") {
         if (isProcessing) return;
         isProcessing = true;
-        isRecording = false;
 
         try {
           const fullAudio = Buffer.concat(audioChunks);
           audioChunks = [];
-          console.log("[STREAM] Total received: " + fullAudio.length + " bytes");
-
-          const tempId = Date.now();
-          const inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
-          const pcmPath = path.join(AUDIO_DIR, `tts_${tempId}.pcm`);
+          console.log("[STREAM] Total: " + fullAudio.length + " bytes");
 
           const normalized = normalizeAudioInput(fullAudio);
+          const tempId = Date.now();
+          const inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
+
           fs.writeFileSync(
             inputWavPath,
             Buffer.concat([createWavHeader(normalized.length), normalized])
           );
 
           /* STT - Whisper */
-          console.log("[STT] Starting transcription...");
           const transcription = await sttClient.audio.transcriptions.create({
             file: fs.createReadStream(inputWavPath),
             model: "whisper-large-v3-turbo",
@@ -427,7 +388,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           }
           console.log("USER:", userText);
 
-          /* LLM - Mochi */
+          /* LLM - Single AI (Mochi) */
           const chat = await llmClient.chat.completions.create({
             messages: [
               {
@@ -482,25 +443,14 @@ Rules:
           await storage.createInteraction({ transcript: userText, response: spokenText });
 
           /* TTS - EdgeTTS */
-          console.log("[TTS] Generating voice...");
           const edge = new EdgeTTS();
           const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
           await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
 
-          /* V32: Convert to PCM file (async) */
-          console.log("[TTS] Converting to PCM...");
-          await generatePCM(tmpMp3, pcmPath);
-          
-          // V32: Clean up MP3 immediately
+          const pcm = await generatePCM(tmpMp3);
+          await streamPCM(ws, pcm);
+
           fs.unlinkSync(tmpMp3);
-          fs.unlinkSync(inputWavPath); // Clean up WAV too
-
-          /* V32: Stream PCM directly from file (memory efficient + smooth) */
-          console.log("[TTS] Streaming to ESP32...");
-          await streamPCM(ws, pcmPath);
-
-          // V32: Clean up PCM after streaming
-          try { fs.unlinkSync(pcmPath); } catch {}
 
           /* Handle Volume Change */
           if (newVolume !== null) {
@@ -521,6 +471,18 @@ Rules:
           ws.send("ERROR:" + (err.message || "UNKNOWN"));
         } finally {
           isProcessing = false;
+          try {
+            const files = fs.readdirSync(UPLOAD_DIR);
+            for (const file of files) {
+              if (file.startsWith("tmp-")) {
+                const fpath = path.join(UPLOAD_DIR, file);
+                const stat = fs.statSync(fpath);
+                if (Date.now() - stat.mtimeMs > 60000) {
+                  fs.unlinkSync(fpath);
+                }
+              }
+            }
+          } catch {}
         }
         return;
       }
@@ -538,7 +500,6 @@ Rules:
     ws.on("close", () => {
       console.log("ESP32 disconnected");
       audioChunks = [];
-      isRecording = false;
       isProcessing = false;
     });
 
@@ -546,9 +507,12 @@ Rules:
       console.error("[WS] Error:", err);
     });
 
+    // V28: More frequent ping with pong tracking
     const pingInterval = setInterval(() => {
       if (ws.readyState === ws.OPEN) {
         ws.ping();
+        
+        // Check if ESP is still responding
         if (Date.now() - lastPongTime > 45000) {
           console.log("[WS] No pong received, closing connection");
           ws.terminate();
@@ -556,7 +520,7 @@ Rules:
       } else {
         clearInterval(pingInterval);
       }
-    }, 8000);
+    }, 8000); // V28: More frequent (was 10000)
 
     ws.on("pong", () => {
       lastPongTime = Date.now();
