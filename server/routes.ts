@@ -25,16 +25,17 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V28: 48kHz, Slower streaming ---------------- */
+/* ---------------- CONFIG - V29: Adaptive streaming for TTS ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 48000;
-const SILENCE_MS = 150;
+const SILENCE_MS = 400;           // V29: Increased from 150ms for smoother fade-out
 const CHUNK_SIZE = 1024;
 
-// V28: Slower streaming to prevent ESP32 buffer overflow
-const CHUNK_DELAY_MS = 20;        // Was 10, increased to prevent overwhelm
-const INITIAL_CHUNK_DELAY_MS = 30; // Slower start for first 20 chunks
-const FAST_CHUNK_DELAY_MS = 15;   // Normal speed after buffer filled
+// V29: Adaptive delays - slower start to fill ESP32 buffer, then faster
+const INITIAL_CHUNK_DELAY_MS = 35;  // V29: Slower start for first 20 chunks
+const FAST_CHUNK_DELAY_MS = 18;     // V29: Medium speed for next 30 chunks  
+const NORMAL_CHUNK_DELAY_MS = 12;   // V29: Faster after buffer is filled
+const MUSIC_CHUNK_DELAY_MS = 20;    // Keep music as-is
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -79,50 +80,124 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- GENERATE PCM ---------------- */
-async function generatePCM(inputPath: string): Promise<Buffer> {
-  const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
+/* ---------------- V29: REAL-TIME PCM STREAM (No more blocking file load) ---------------- */
+async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
+  if (ws.readyState !== ws.OPEN) return;
 
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .noVideo()
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=20000",
-        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
-        "pan=mono|c0=c0",
-        "volume=0.90",
-        "dynaudnorm=p=0.95:g=15",
-        "afftdn=nf=-30"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => {
-        let pcm = fs.readFileSync(tmpRaw);
-        fs.unlinkSync(tmpRaw);
+  return new Promise<void>((resolve, reject) => {
+    const ffmpegProcess = spawn("ffmpeg", [
+      "-i", inputPath,
+      "-f", "s16le",
+      "-ac", "1",
+      "-ar", TARGET_SAMPLE_RATE.toString(),
+      "-af", "highpass=f=80,lowpass=f=20000,volume=0.90,dynaudnorm=p=0.95:g=15,afftdn=nf=-30",
+      "-bufsize", "256k",
+      "-maxrate", "500k",
+      "pipe:1"
+    ]);
 
-        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
-        let sum = 0;
-        for (let i = 0; i < samples.length; i++) sum += samples[i];
-        const mean = Math.round(sum / samples.length);
-        if (Math.abs(mean) > 10) {
-          for (let i = 0; i < samples.length; i++) samples[i] -= mean;
+    // V29: Send prepare immediately para ma-ready ang ESP32
+    ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
+    
+    let isActive = true;
+    let buffer = Buffer.alloc(0);
+    let seq = 0;
+    let hasStarted = false;
+
+    ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
+      if (!isActive || ws.readyState !== ws.OPEN) return;
+      
+      if (!hasStarted) {
+        await new Promise(r => setTimeout(r, 100));
+        ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
+        hasStarted = true;
+      }
+      
+      buffer = Buffer.concat([buffer, chunk]);
+      
+      // V29: Stream with adaptive speed - fill buffer first then speed up
+      while (buffer.length >= CHUNK_SIZE && isActive) {
+        if (ws.readyState !== ws.OPEN) {
+          isActive = false;
+          return;
         }
+        
+        const sendChunk = buffer.slice(0, CHUNK_SIZE);
+        buffer = buffer.slice(CHUNK_SIZE);
+        
+        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        sendChunk.copy(packet, 2);
+        
+        try {
+          ws.send(packet, { binary: true });
+          seq++;
+          
+          // V29: Adaptive delay - critical fix for choppy audio
+          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
+                       seq < 50 ? FAST_CHUNK_DELAY_MS : 
+                       NORMAL_CHUNK_DELAY_MS;
+          
+          await new Promise(r => setTimeout(r, delay));
+        } catch (e) {
+          console.error("[STREAM] Send error:", e);
+          isActive = false;
+          return;
+        }
+      }
+    });
 
-        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
-        const silence = Buffer.alloc(silenceBytes, 0);
-        const finalPCM = Buffer.concat([pcm, silence]);
+    ffmpegProcess.stdout.on("end", async () => {
+      isActive = false;
+      
+      // Send remaining buffer
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+        const packet = Buffer.allocUnsafe(2 + buffer.length);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        buffer.copy(packet, 2);
+        ws.send(packet, { binary: true });
+        seq++;
+      }
+      
+      // V29: Trailing silence for smooth fade-out
+      const silencePackets = isMusic ? 30 : 50; // More silence for TTS
+      for (let i = 0; i < silencePackets; i++) {
+        if (ws.readyState !== ws.OPEN) break;
+        const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
+        silencePacket.fill(0, 2);
+        ws.send(silencePacket, { binary: true });
+        await new Promise(r => setTimeout(r, NORMAL_CHUNK_DELAY_MS));
+      }
+      
+      if (ws.readyState === ws.OPEN) {
+        ws.send(isMusic ? "FINISH_MUSIC" : "FINISH_RESPONSE");
+      }
+      
+      console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} finished, sent ${seq} chunks`);
+      resolve();
+    });
 
-        resolve(finalPCM);
-      })
-      .save(tmpRaw);
+    ffmpegProcess.stderr.on("data", (data) => {
+      const str = data.toString();
+      if (str.includes("time=")) {
+        const match = str.match(/time=(\d+:\d+:\d+\.\d+)/);
+        if (match) console.log("[FFMPEG] Progress:", match[1]);
+      }
+    });
+
+    ffmpegProcess.on("error", (err) => {
+      console.error("[FFMPEG] Error:", err);
+      isActive = false;
+      if (ws.readyState === ws.OPEN) {
+        ws.send("ERROR:STREAM_FAILED");
+      }
+      reject(err);
+    });
   });
 }
 
-/* ---------------- STREAM PCM TO ESP32 ---------------- */
+/* ---------------- V29: LEGACY STREAM PCM (Keep for fallback) ---------------- */
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   
@@ -156,16 +231,19 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
       return;
     }
     seq++;
-    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+    
+    // V29: Adaptive delay
+    const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
+                 seq < 50 ? FAST_CHUNK_DELAY_MS : 
+                 NORMAL_CHUNK_DELAY_MS;
+    await new Promise(r => setTimeout(r, delay));
   }
 
   ws.send("FINISH_RESPONSE");
   console.log("[STREAM] Sent " + seq + " chunks at 48kHz");
 }
 
-/* ============================================================================
-   V28 FIX: INSTANT MUSIC STREAMING - SLOWER TO PREVENT ESP32 OVERWHELM
-   ============================================================================ */
+/* ---------------- MUSIC STREAM (Updated to use same adaptive delays) ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -206,7 +284,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "pipe:1"
     ]);
 
-    // V28: Send PREPARE immediately
     ws.send("PREPARE_MUSIC:0");
     await new Promise(r => setTimeout(r, 100));
     ws.send("START_MUSIC");
@@ -220,7 +297,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V28: Stream with adaptive speed - slower at start, faster later
       while (buffer.length >= CHUNK_SIZE && isActive) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
@@ -238,10 +314,10 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          // V28: Adaptive delay - slower at start to let ESP32 fill buffer
+          // V29: Use same adaptive delays as TTS
           const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
                        seq < 50 ? FAST_CHUNK_DELAY_MS : 
-                       CHUNK_DELAY_MS;
+                       MUSIC_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
@@ -255,7 +331,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     ffmpegProcess.stdout.on("end", () => {
       isActive = false;
       
-      // Send remaining buffer
       if (buffer.length > 0 && ws.readyState === ws.OPEN) {
         const packet = Buffer.allocUnsafe(2 + buffer.length);
         packet.writeUInt16BE(seq & 0xFFFF, 0);
@@ -264,7 +339,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V28: Send trailing silence
       const sendSilence = async () => {
         for (let i = 0; i < 30; i++) {
           if (ws.readyState !== ws.OPEN) break;
@@ -272,7 +346,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
           silencePacket.fill(0, 2);
           ws.send(silencePacket, { binary: true });
-          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+          await new Promise(r => setTimeout(r, MUSIC_CHUNK_DELAY_MS));
         }
         
         if (ws.readyState === ws.OPEN) {
@@ -326,7 +400,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V28 Stable Music");
+    console.log("ESP32 connected - V29 Adaptive TTS");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -334,7 +408,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
-    // V28: Keepalive with pong response tracking
     let lastPongTime = Date.now();
     
     ws.on("message", async (data: any, isBinary: boolean) => {
@@ -447,8 +520,8 @@ Rules:
           const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
           await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
 
-          const pcm = await generatePCM(tmpMp3);
-          await streamPCM(ws, pcm);
+          // V29: REAL-TIME STREAMING - No more blocking file load!
+          await streamPCMRealtime(ws, tmpMp3, false);
 
           fs.unlinkSync(tmpMp3);
 
@@ -507,12 +580,10 @@ Rules:
       console.error("[WS] Error:", err);
     });
 
-    // V28: More frequent ping with pong tracking
     const pingInterval = setInterval(() => {
       if (ws.readyState === ws.OPEN) {
         ws.ping();
         
-        // Check if ESP is still responding
         if (Date.now() - lastPongTime > 45000) {
           console.log("[WS] No pong received, closing connection");
           ws.terminate();
@@ -520,7 +591,7 @@ Rules:
       } else {
         clearInterval(pingInterval);
       }
-    }, 8000); // V28: More frequent (was 10000)
+    }, 8000);
 
     ws.on("pong", () => {
       lastPongTime = Date.now();
