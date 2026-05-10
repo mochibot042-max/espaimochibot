@@ -266,8 +266,12 @@ Return JSON: {"text":"your response"}`;
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   // AUTO PUSH SCHEMA ON STARTUP
-  await pushSchema();
-  console.log("[SERVER] Database ready");
+  try {
+    await pushSchema();
+    console.log("[SERVER] Database ready");
+  } catch (e: any) {
+    console.error("[SERVER] Database init failed:", e.message);
+  }
 
   const wss = new WebSocketServer({
     server: httpServer,
@@ -294,10 +298,15 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         // User identification
         if (msg.startsWith("USER:")) {
           const userName = msg.replace("USER:", "").trim();
-          const user = await storage.getOrCreateUser(userName);
-          currentUserId = user.id;
-          console.log("[USER] Identified as:", userName, "ID:", user.id);
-          ws.send("USER_CONFIRMED:" + user.name);
+          try {
+            const user = await storage.getOrCreateUser(userName);
+            currentUserId = user.id;
+            console.log("[USER] Identified as:", userName, "ID:", user.id);
+            ws.send("USER_CONFIRMED:" + user.name);
+          } catch (e: any) {
+            console.error("[USER] Error:", e.message);
+            ws.send("ERROR:USER_FAILED");
+          }
         }
         
         return;
@@ -310,8 +319,14 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
       // Auto-create anonymous user if none
       if (!currentUserId) {
-        const anon = await storage.getOrCreateUser("anon_" + Date.now());
-        currentUserId = anon.id;
+        try {
+          const anon = await storage.getOrCreateUser("anon_" + Date.now());
+          currentUserId = anon.id;
+        } catch (e: any) {
+          console.error("[USER] Anon error:", e.message);
+          ws.send("ERROR:DB_FAILED");
+          return;
+        }
       }
 
       const audioBuffer = Buffer.from(data);
