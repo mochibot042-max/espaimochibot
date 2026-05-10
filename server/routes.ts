@@ -25,17 +25,16 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V50: COMPLETE REWRITE ---------------- */
+/* ---------------- CONFIG - V31: Mas mabagal + Proper FINISH ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 16000;
+const TARGET_SAMPLE_RATE = 48000;
+const SILENCE_MS = 150;
 const CHUNK_SIZE = 1024;
 
-// V50: MAS MABAGAL NA DELAYS para hindi bumilis at hindi maubos agad
-const INITIAL_CHUNK_DELAY_MS = 90;   // Tumaas from 80
-const NORMAL_CHUNK_DELAY_MS = 95;    // Tumaas from 85
-const MUSIC_CHUNK_DELAY_MS = 92;     // Tumaas from 82
-
-const PREBUFFER_CHUNKS = 16;         // Tumaas from 12
+// V31: Mas mabagal para hindi ma-overwhelm ang ESP32
+const CHUNK_DELAY_MS = 40;        // V31: Was 35, mas mabagal
+const INITIAL_CHUNK_DELAY_MS = 60; // V31: Was 50, mas mabagal start
+const FAST_CHUNK_DELAY_MS = 30;   // V31: Was 25, mas mabagal
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -80,125 +79,93 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V50: REAL-TIME PCM STREAM - COMPLETE REWRITE ---------------- */
-async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
-  if (ws.readyState !== ws.OPEN) return;
+/* ---------------- GENERATE PCM ---------------- */
+async function generatePCM(inputPath: string): Promise<Buffer> {
+  const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
 
-  return new Promise<void>((resolve, reject) => {
-    const ffmpegProcess = spawn("ffmpeg", [
-      "-i", inputPath,
-      "-f", "s16le",
-      "-ac", "1",
-      "-ar", TARGET_SAMPLE_RATE.toString(),
-      "-af", "highpass=f=80,lowpass=f=7500,volume=0.95,dynaudnorm=p=0.95:g=15,afftdn=nf=-25",
-      "-bufsize", "64k",
-      "-maxrate", "128k",
-      "pipe:1"
-    ]);
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .noVideo()
+      .audioFilters([
+        "highpass=f=80",
+        "lowpass=f=20000",
+        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
+        "pan=mono|c0=c0",
+        "volume=0.90",
+        "dynaudnorm=p=0.95:g=15",
+        "afftdn=nf=-30"
+      ])
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(TARGET_SAMPLE_RATE)
+      .format("s16le")
+      .on("error", reject)
+      .on("end", () => {
+        let pcm = fs.readFileSync(tmpRaw);
+        fs.unlinkSync(tmpRaw);
 
-    // V50: Send PREPARE only once
-    ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
-    
-    let isActive = true;
-    let buffer = Buffer.alloc(0);
-    let seq = 0;
-    let startSent = false;
-
-    ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
-      if (!isActive || ws.readyState !== ws.OPEN) return;
-      
-      buffer = Buffer.concat([buffer, chunk]);
-      
-      // V50: Send START only once, strictly
-      if (!startSent && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
-        startSent = true;
-        await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
-        if (ws.readyState === ws.OPEN) {
-          ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
-          console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent ONCE`);
+        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+        let sum = 0;
+        for (let i = 0; i < samples.length; i++) sum += samples[i];
+        const mean = Math.round(sum / samples.length);
+        if (Math.abs(mean) > 10) {
+          for (let i = 0; i < samples.length; i++) samples[i] -= mean;
         }
-      }
-      
-      while (buffer.length >= CHUNK_SIZE && isActive) {
-        if (ws.readyState !== ws.OPEN) {
-          isActive = false;
-          return;
-        }
-        
-        const sendChunk = buffer.slice(0, CHUNK_SIZE);
-        buffer = buffer.slice(CHUNK_SIZE);
-        
-        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        sendChunk.copy(packet, 2);
-        
-        try {
-          ws.send(packet, { binary: true });
-          seq++;
-          
-          // V50: MAS MABAGAL NA DELAYS
-          const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : 
-                       isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
-          
-          await new Promise(r => setTimeout(r, delay));
-        } catch (e) {
-          console.error("[STREAM] Send error:", e);
-          isActive = false;
-          return;
-        }
-      }
-    });
 
-    ffmpegProcess.stdout.on("end", async () => {
-      isActive = false;
-      
-      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
-        const packet = Buffer.allocUnsafe(2 + buffer.length);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        buffer.copy(packet, 2);
-        ws.send(packet, { binary: true });
-        seq++;
-      }
-      
-      // V50: MAS MARAMING SILENCE para hindi agad maubos
-      const silencePackets = isMusic ? 200 : 250;
-      for (let i = 0; i < silencePackets; i++) {
-        if (ws.readyState !== ws.OPEN) break;
-        const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-        silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
-        silencePacket.fill(0, 2);
-        ws.send(silencePacket, { binary: true });
-        await new Promise(r => setTimeout(r, isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS));
-      }
-      
-      if (ws.readyState === ws.OPEN) {
-        ws.send(isMusic ? "FINISH_MUSIC" : "FINISH_RESPONSE");
-      }
-      
-      console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} finished, sent ${seq} chunks`);
-      resolve();
-    });
+        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
+        const silence = Buffer.alloc(silenceBytes, 0);
+        const finalPCM = Buffer.concat([pcm, silence]);
 
-    ffmpegProcess.stderr.on("data", (data) => {
-      const str = data.toString();
-      if (str.includes("time=")) {
-        const match = str.match(/time=(\d+:\d+:\d+\.\d+)/);
-        if (match) console.log("[FFMPEG] Progress:", match[1]);
-      }
-    });
-
-    ffmpegProcess.on("error", (err) => {
-      console.error("[FFMPEG] Error:", err);
-      isActive = false;
-      if (ws.readyState === ws.OPEN) {
-        ws.send("ERROR:STREAM_FAILED");
-      }
-      reject(err);
-    });
+        resolve(finalPCM);
+      })
+      .save(tmpRaw);
   });
 }
 
-/* ---------------- MUSIC STREAM - V50 ---------------- */
+/* ---------------- STREAM PCM TO ESP32 ---------------- */
+async function streamPCM(ws: WebSocket, pcm: Buffer) {
+  if (ws.readyState !== ws.OPEN) return;
+  
+  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
+  ws.send("PREPARE_RESPONSE:" + totalChunks);
+  await new Promise(r => setTimeout(r, 300));
+  ws.send("START_RESPONSE");
+
+  let seq = 0;
+  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
+    if (ws.readyState !== ws.OPEN) return;
+    const chunk = pcm.slice(i, i + CHUNK_SIZE);
+
+    let packet: Buffer;
+    if (chunk.length < CHUNK_SIZE) {
+      const padded = Buffer.alloc(CHUNK_SIZE);
+      chunk.copy(padded);
+      packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      padded.copy(packet, 2);
+    } else {
+      packet = Buffer.allocUnsafe(2 + chunk.length);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      chunk.copy(packet, 2);
+    }
+
+    try {
+      ws.send(packet, { binary: true });
+    } catch (e) {
+      console.error("[STREAM] Send failed:", e);
+      return;
+    }
+    seq++;
+    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+  }
+
+  ws.send("FINISH_RESPONSE");
+  console.log("[STREAM] Sent " + seq + " chunks at 48kHz");
+}
+
+/* ============================================================================
+   V31: MUSIC STREAM - Proper FINISH timing + Slower streaming
+   ============================================================================ */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -217,7 +184,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     console.log("[MUSIC] Found:", video.title);
 
     const apiRes = await axios.get(
-      `https://mostakim.onrender.com/mostakim/sing?url=${video.url}`,
+      `https://mostakim.onrender.com/m/sing?url=${video.url}`,
       { timeout: 10000 }
     );
     
@@ -226,34 +193,38 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       return;
     }
 
-    console.log("[MUSIC] Starting instant stream...");
+    console.log("[MUSIC] Starting stream...");
 
     const ffmpegProcess = spawn("ffmpeg", [
       "-i", apiRes.data.url,
       "-f", "s16le",
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
-      "-af", "highpass=f=60,lowpass=f=7500,volume=0.90",
-      "-bufsize", "64k",
-      "-maxrate", "128k",
+      "-af", "highpass=f=60,lowpass=f=20000,volume=0.85",
+      "-bufsize", "256k",
+      "-maxrate", "500k",
       "pipe:1"
     ]);
 
-    // V50: Send PREPARE and START only once
     ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
+    await new Promise(r => setTimeout(r, 100));
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let isActive = true;
+    let isPaused = false;
+    let chunkCount = 0;
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       
+      if (isPaused) return;  // Drop data while paused
+      
       buffer = Buffer.concat([buffer, chunk]);
       
-      while (buffer.length >= CHUNK_SIZE && isActive) {
+      // V31: Process one chunk at a time, slower
+      while (buffer.length >= CHUNK_SIZE && isActive && !isPaused) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
           return;
@@ -269,8 +240,12 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         try {
           ws.send(packet, { binary: true });
           seq++;
+          chunkCount++;
           
-          const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
+          // V31: Mas mabagal na adaptive delay
+          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
+                       seq < 50 ? FAST_CHUNK_DELAY_MS : 
+                       CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
@@ -281,35 +256,40 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       }
     });
 
+    // V31: Wait for ffmpeg to actually finish before sending FINISH
     ffmpegProcess.stdout.on("end", () => {
-      isActive = false;
+      console.log("[MUSIC] FFmpeg stdout ended, waiting for buffer drain...");
       
-      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
-        const packet = Buffer.allocUnsafe(2 + buffer.length);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        buffer.copy(packet, 2);
-        ws.send(packet, { binary: true });
-        seq++;
-      }
-      
-      // V50: MAS MARAMING SILENCE
-      const sendSilence = async () => {
-        for (let i = 0; i < 200; i++) {
+      // V31: Send remaining buffer
+      const drainAndFinish = async () => {
+        if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+          const packet = Buffer.allocUnsafe(2 + buffer.length);
+          packet.writeUInt16BE(seq & 0xFFFF, 0);
+          buffer.copy(packet, 2);
+          ws.send(packet, { binary: true });
+          seq++;
+          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+        }
+        
+        // V31: Send trailing silence to ensure smooth end
+        console.log("[MUSIC] Sending trailing silence...");
+        for (let i = 0; i < 40; i++) {  // V31: 40 chunks (~1.5s at 40ms)
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
           silencePacket.fill(0, 2);
           ws.send(silencePacket, { binary: true });
-          await new Promise(r => setTimeout(r, MUSIC_CHUNK_DELAY_MS));
+          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
         }
         
+        // V31: NOW send FINISH - after all audio sent
         if (ws.readyState === ws.OPEN) {
           ws.send("FINISH_MUSIC");
         }
-        console.log("[MUSIC] Stream finished, sent " + seq + " chunks");
+        console.log("[MUSIC] Finished, sent " + chunkCount + " audio chunks + silence");
       };
       
-      sendSilence();
+      drainAndFinish();
     });
 
     ffmpegProcess.stderr.on("data", (data) => {
@@ -344,18 +324,10 @@ async function downloadSongStream(query: string, ws: WebSocket) {
   }
 }
 
-/* ---------------- SERVER ---------------- */
+/* ============================================================================
+   V31: SERVER - Real-time Audio + Flow Control
+   ============================================================================ */
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  
-  app.get("/ping", (req, res) => {
-    res.json({ status: "alive", timestamp: Date.now(), clients: wss.clients.size });
-  });
-  
-  app.get("/wake", (req, res) => {
-    console.log("[WAKE] Server wake-up call received");
-    res.json({ status: "awake", ready: true });
-  });
-
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
@@ -364,80 +336,61 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V50 Complete Fix");
+    console.log("ESP32 connected - V31 Smooth Playback");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
+    let isRecording = false;
     let currentVolume = loadVolume();
 
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
     let lastPongTime = Date.now();
-    let isAlive = true;
-    
-    const keepAliveInterval = setInterval(() => {
-      if (!isAlive) {
-        console.log("[WS] Connection dead, terminating");
-        clearInterval(keepAliveInterval);
-        ws.terminate();
-        return;
-      }
-      
-      isAlive = false;
-      if (ws.readyState === ws.OPEN) {
-        ws.ping();
-      }
-    }, 3000);
-    
-    ws.on("pong", () => {
-      isAlive = true;
-      lastPongTime = Date.now();
-    });
     
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (isBinary) {
-        audioChunks.push(Buffer.from(data));
+        if (isRecording) {
+          audioChunks.push(Buffer.from(data));
+        }
         return;
       }
 
       const msg = data.toString();
       console.log("[WS] TEXT:", msg);
 
-      if (msg === "PING_KEEPALIVE") {
-        ws.send("PONG_KEEPALIVE");
-        return;
-      }
-
       if (msg === "READY") {
-        console.log("[WS] ESP ready - acknowledged");
+        console.log("[WS] ESP ready");
         return;
       }
 
       if (msg === "START_STREAM") {
-        console.log("[STREAM] Start recording");
+        console.log("[STREAM] Start real-time recording");
         audioChunks = [];
+        isRecording = true;
         return;
       }
 
       if (msg === "END_STREAM") {
         if (isProcessing) return;
         isProcessing = true;
+        isRecording = false;
 
         try {
           const fullAudio = Buffer.concat(audioChunks);
           audioChunks = [];
-          console.log("[STREAM] Total: " + fullAudio.length + " bytes");
+          console.log("[STREAM] Total received: " + fullAudio.length + " bytes");
 
-          const normalized = normalizeAudioInput(fullAudio);
           const tempId = Date.now();
           const inputWavPath = path.join(UPLOAD_DIR, `${tempId}.wav`);
 
+          const normalized = normalizeAudioInput(fullAudio);
           fs.writeFileSync(
             inputWavPath,
             Buffer.concat([createWavHeader(normalized.length), normalized])
           );
 
           /* STT - Whisper */
+          console.log("[STT] Starting transcription...");
           const transcription = await sttClient.audio.transcriptions.create({
             file: fs.createReadStream(inputWavPath),
             model: "whisper-large-v3-turbo",
@@ -505,11 +458,13 @@ Rules:
           await storage.createInteraction({ transcript: userText, response: spokenText });
 
           /* TTS - EdgeTTS */
+          console.log("[TTS] Generating voice...");
           const edge = new EdgeTTS();
           const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
           await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
 
-          await streamPCMRealtime(ws, tmpMp3, false);
+          const pcm = await generatePCM(tmpMp3);
+          await streamPCM(ws, pcm);
 
           fs.unlinkSync(tmpMp3);
 
@@ -560,14 +515,30 @@ Rules:
 
     ws.on("close", () => {
       console.log("ESP32 disconnected");
-      clearInterval(keepAliveInterval);
       audioChunks = [];
+      isRecording = false;
       isProcessing = false;
     });
 
     ws.on("error", (err) => {
       console.error("[WS] Error:", err);
-      clearInterval(keepAliveInterval);
+    });
+
+    const pingInterval = setInterval(() => {
+      if (ws.readyState === ws.OPEN) {
+        ws.ping();
+        
+        if (Date.now() - lastPongTime > 45000) {
+          console.log("[WS] No pong received, closing connection");
+          ws.terminate();
+        }
+      } else {
+        clearInterval(pingInterval);
+      }
+    }, 8000);
+
+    ws.on("pong", () => {
+      lastPongTime = Date.now();
     });
   });
 
