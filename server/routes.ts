@@ -6,7 +6,7 @@ import fs from "fs";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
-import { storage, pushSchema } from "./storage.js";
+import { storage, pushSchema, verifySchema } from "./storage.js";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
@@ -268,9 +268,17 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   // AUTO PUSH SCHEMA ON STARTUP
   try {
     await pushSchema();
+    
+    // Verify schema was created
+    const isValid = await verifySchema();
+    if (!isValid) {
+      throw new Error("Schema verification failed");
+    }
+    
     console.log("[SERVER] Database ready");
   } catch (e: any) {
     console.error("[SERVER] Database init failed:", e.message);
+    // Continue running - baka may existing tables na
   }
 
   const wss = new WebSocketServer({
