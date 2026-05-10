@@ -25,17 +25,17 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V50: COMPLETE REWRITE ---------------- */
+/* ---------------- CONFIG - V55: MOBILE DATA FIX ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 1024;
 
-// V50: MAS MABAGAL NA DELAYS para hindi bumilis at hindi maubos agad
-const INITIAL_CHUNK_DELAY_MS = 90;   // Tumaas from 80
-const NORMAL_CHUNK_DELAY_MS = 95;    // Tumaas from 85
-const MUSIC_CHUNK_DELAY_MS = 92;     // Tumaas from 82
+// V55: MAS MABAGAL PARA SA MOBILE DATA (TM/Globe)
+const INITIAL_CHUNK_DELAY_MS = 120;   // Tumaas from 90
+const NORMAL_CHUNK_DELAY_MS = 110;    // Tumaas from 95
+const MUSIC_CHUNK_DELAY_MS = 115;     // Tumaas from 92
 
-const PREBUFFER_CHUNKS = 16;         // Tumaas from 12
+const PREBUFFER_CHUNKS = 24;          // Tumaas from 16 para mas maraming buffer bago mag-start
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -80,7 +80,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V50: REAL-TIME PCM STREAM - COMPLETE REWRITE ---------------- */
+/* ---------------- V55: REAL-TIME PCM STREAM - MOBILE DATA FIX ---------------- */
 async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
   if (ws.readyState !== ws.OPEN) return;
 
@@ -91,28 +91,30 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
       "-af", "highpass=f=80,lowpass=f=7500,volume=0.95,dynaudnorm=p=0.95:g=15,afftdn=nf=-25",
-      "-bufsize", "64k",
-      "-maxrate", "128k",
+      "-bufsize", "128k",         // V55: Tumaas from 64k
+      "-maxrate", "256k",         // V55: Tumaas from 128k
       "pipe:1"
     ]);
 
-    // V50: Send PREPARE only once
-    ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
+    // V55: Send PREPARE with actual estimated chunks
+    ws.send(isMusic ? "PREPARE_MUSIC:2000" : "PREPARE_RESPONSE:2000");
     
     let isActive = true;
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let startSent = false;
+    let chunkCount = 0;
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       
       buffer = Buffer.concat([buffer, chunk]);
+      chunkCount++;
       
-      // V50: Send START only once, strictly
+      // V55: Send START after PREBUFFER_CHUNKS, pero wait for READY muna from ESP
       if (!startSent && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
         startSent = true;
-        await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
+        await new Promise(r => setTimeout(r, 600)); // V55: Tumaas from 400ms para sure na naka-prebuffer
         if (ws.readyState === ws.OPEN) {
           ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
           console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent ONCE`);
@@ -136,7 +138,7 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
           ws.send(packet, { binary: true });
           seq++;
           
-          // V50: MAS MABAGAL NA DELAYS
+          // V55: MAS MABAGAL NA DELAYS PARA SA MOBILE DATA
           const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : 
                        isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
           
@@ -160,8 +162,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
         seq++;
       }
       
-      // V50: MAS MARAMING SILENCE para hindi agad maubos
-      const silencePackets = isMusic ? 200 : 250;
+      // V55: MAS MARAMING SILENCE PARA HINDI AGAD MAUBOS
+      const silencePackets = isMusic ? 300 : 350;
       for (let i = 0; i < silencePackets; i++) {
         if (ws.readyState !== ws.OPEN) break;
         const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
@@ -198,14 +200,14 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
   });
 }
 
-/* ---------------- MUSIC STREAM - V50 ---------------- */
+/* ---------------- MUSIC STREAM - V55 MOBILE DATA FIX ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
     
     const search = await axios.get(
       `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`,
-      { timeout: 10000 }
+      { timeout: 15000 }  // V55: Tumaas timeout
     );
     
     if (!search.data?.length) {
@@ -218,7 +220,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 
     const apiRes = await axios.get(
       `https://mostakim.onrender.com/mostakim/sing?url=${video.url}`,
-      { timeout: 10000 }
+      { timeout: 15000 }  // V55: Tumaas timeout
     );
     
     if (!apiRes.data?.url) {
@@ -234,14 +236,14 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
       "-af", "highpass=f=60,lowpass=f=7500,volume=0.90",
-      "-bufsize", "64k",
-      "-maxrate", "128k",
+      "-bufsize", "128k",    // V55: Tumaas
+      "-maxrate", "256k",    // V55: Tumaas
       "pipe:1"
     ]);
 
-    // V50: Send PREPARE and START only once
-    ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
+    // V55: Send PREPARE and START only once
+    ws.send("PREPARE_MUSIC:2000");
+    await new Promise(r => setTimeout(r, 600)); // V55: Tumaas
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
@@ -292,9 +294,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V50: MAS MARAMING SILENCE
+      // V55: MAS MARAMING SILENCE
       const sendSilence = async () => {
-        for (let i = 0; i < 200; i++) {
+        for (let i = 0; i < 300; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
@@ -324,7 +326,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 
     ffmpegProcess.on("error", (err) => {
       console.error("[MUSIC] FFmpeg error:", err);
-      isActive = false;
+      isAlive = false;
       if (ws.readyState === ws.OPEN) {
         ws.send("ERROR:MUSIC_FAILED");
       }
@@ -364,7 +366,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V50 Complete Fix");
+    console.log("ESP32 connected - V55 Mobile Data Fix");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -375,6 +377,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let lastPongTime = Date.now();
     let isAlive = true;
     
+    // V55: MAS MABILIS NA PING INTERVAL PARA SA MOBILE DATA
     const keepAliveInterval = setInterval(() => {
       if (!isAlive) {
         console.log("[WS] Connection dead, terminating");
@@ -387,7 +390,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (ws.readyState === ws.OPEN) {
         ws.ping();
       }
-    }, 3000);
+    }, 5000);  // V55: Tumaas from 3s para hindi masyadong aggressive sa mobile data
     
     ws.on("pong", () => {
       isAlive = true;
