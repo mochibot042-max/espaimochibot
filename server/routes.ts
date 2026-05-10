@@ -25,17 +25,17 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V48: FIX FAST PLAYBACK + DISCONNECT ---------------- */
+/* ---------------- CONFIG - V50: COMPLETE REWRITE ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 1024;
 
-// V48: MAS MABAGAL NA DELAYS para hindi bumilis ang playback
-const INITIAL_CHUNK_DELAY_MS = 80;   // Tumaas from 60
-const NORMAL_CHUNK_DELAY_MS = 85;    // Tumaas from 75
-const MUSIC_CHUNK_DELAY_MS = 82;     // Tumaas from 70
+// V50: MAS MABAGAL NA DELAYS para hindi bumilis at hindi maubos agad
+const INITIAL_CHUNK_DELAY_MS = 90;   // Tumaas from 80
+const NORMAL_CHUNK_DELAY_MS = 95;    // Tumaas from 85
+const MUSIC_CHUNK_DELAY_MS = 92;     // Tumaas from 82
 
-const PREBUFFER_CHUNKS = 12;         // Tumaas from 8 para mas stable start
+const PREBUFFER_CHUNKS = 16;         // Tumaas from 12
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -80,7 +80,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V48: REAL-TIME PCM STREAM - STRICT START + SLOWER PACING ---------------- */
+/* ---------------- V50: REAL-TIME PCM STREAM - COMPLETE REWRITE ---------------- */
 async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
   if (ws.readyState !== ws.OPEN) return;
 
@@ -96,7 +96,7 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       "pipe:1"
     ]);
 
-    // V48: Send PREPARE only once
+    // V50: Send PREPARE only once
     ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
     
     let isActive = true;
@@ -109,10 +109,10 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V48: Send START only once, strictly
+      // V50: Send START only once, strictly
       if (!startSent && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
         startSent = true;
-        await new Promise(r => setTimeout(r, 300)); // V48: Tumaas from 200ms
+        await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
         if (ws.readyState === ws.OPEN) {
           ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
           console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent ONCE`);
@@ -136,8 +136,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
           ws.send(packet, { binary: true });
           seq++;
           
-          // V48: MAS MABAGAL NA DELAYS para hindi maubos agad ang queue
-          const delay = seq < 40 ? INITIAL_CHUNK_DELAY_MS : 
+          // V50: MAS MABAGAL NA DELAYS
+          const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : 
                        isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
@@ -160,8 +160,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
         seq++;
       }
       
-      // V48: MAS MARAMING SILENCE para hindi agad maubos
-      const silencePackets = isMusic ? 150 : 180;
+      // V50: MAS MARAMING SILENCE para hindi agad maubos
+      const silencePackets = isMusic ? 200 : 250;
       for (let i = 0; i < silencePackets; i++) {
         if (ws.readyState !== ws.OPEN) break;
         const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
@@ -198,7 +198,7 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
   });
 }
 
-/* ---------------- MUSIC STREAM - V48 ---------------- */
+/* ---------------- MUSIC STREAM - V50 ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -239,9 +239,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "pipe:1"
     ]);
 
-    // V48: Send PREPARE and START only once
+    // V50: Send PREPARE and START only once
     ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 300)); // V48: Tumaas from 200ms
+    await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
@@ -270,7 +270,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          const delay = seq < 40 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
+          const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
@@ -292,9 +292,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V48: MAS MARAMING SILENCE
+      // V50: MAS MARAMING SILENCE
       const sendSilence = async () => {
-        for (let i = 0; i < 150; i++) {
+        for (let i = 0; i < 200; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
@@ -364,7 +364,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V48 Fix Fast Playback");
+    console.log("ESP32 connected - V50 Complete Fix");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
