@@ -20,20 +20,48 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V6: FILE UPLOAD SETTINGS
+// V7: MUST MATCH ESP DAC RATE - 16kHz
 // ============================================================================
-const SAMPLE_RATE = 44100;
-const CHUNK_SIZE = 2048;
-const CHUNK_DELAY_MS = 23;
+const SAMPLE_RATE = 16000;  // CHANGED: Was 44100, now matches ESP
+const CHUNK_SIZE = 512;     // SMALLER: better for mobile internet
+const CHUNK_DELAY_MS = 32;  // Slightly longer for stability
 
 // ============================================================================
-// STREAM PCM BACK TO ESP (unchanged - still streaming for playback)
+// PCM GENERATOR - OUTPUTS 16kHz to match ESP
+// ============================================================================
+async function generatePCM(input: string): Promise<Buffer> {
+  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
+  return new Promise((resolve, reject) => {
+    ffmpeg(input)
+      .audioFilters([
+        "highpass=f=80",
+        "lowpass=f=8000",        // Nyquist for 16kHz
+        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+        "volume=1.0",            // Reduced to prevent clipping
+        "dynaudnorm=p=0.95:g=15"
+      ])
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(SAMPLE_RATE)  // 16kHz output
+      .format("s16le")
+      .on("error", reject)
+      .on("end", () => {
+        const pcm = fs.readFileSync(tmp);
+        fs.unlinkSync(tmp);
+        resolve(pcm);
+      })
+      .save(tmp);
+  });
+}
+
+// ============================================================================
+// STREAM PCM BACK TO ESP - 16kHz MATCH
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 200));
+  await new Promise(r => setTimeout(r, 300));  // Longer prep time
   ws.send("START_RESPONSE");
   let seq = 0;
   for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
@@ -52,81 +80,43 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks, total " + pcm.length + " bytes");
+  console.log("[STREAM] Sent " + seq + " chunks, " + pcm.length + " bytes");
 }
 
 // ============================================================================
-// PCM GENERATOR
-// ============================================================================
-async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
-  return new Promise((resolve, reject) => {
-    ffmpeg(input)
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=16000",
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "volume=1.2",
-        "dynaudnorm=p=0.95:g=15"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => {
-        const pcm = fs.readFileSync(tmp);
-        fs.unlinkSync(tmp);
-        resolve(pcm);
-      })
-      .save(tmp);
-  });
-}
-
-// ============================================================================
-// V6: PROCESS UPLOADED WAV FILE
+// V7: PROCESS UPLOADED WAV FILE
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
-    // Check minimum size (WAV header + some data)
     if (audioBuffer.length < 1000) {
       ws.send("ERROR:AUDIO_TOO_SHORT");
       return;
     }
 
-    // Validate WAV header
+    // Validate WAV
     const riff = audioBuffer.slice(0, 4).toString();
     const wave = audioBuffer.slice(8, 12).toString();
     if (riff !== "RIFF" || wave !== "WAVE") {
-      console.error("[UPLOAD] Invalid WAV header:", riff, wave);
-      ws.send("ERROR:INVALID_AUDIO_FORMAT");
+      console.error("[UPLOAD] Bad WAV:", riff, wave);
+      ws.send("ERROR:INVALID_FORMAT");
       return;
     }
 
+    // Parse sample rate from WAV header
+    const wavSampleRate = audioBuffer.readUInt32LE(24);
+    console.log("[UPLOAD] WAV sample rate:", wavSampleRate, "Hz");
+
     const id = Date.now();
     const wavPath = path.join(UPLOAD_DIR, id + ".wav");
-
-    // Save the uploaded WAV directly (no need to rebuild)
     fs.writeFileSync(wavPath, audioBuffer);
-    console.log("[UPLOAD] Saved WAV:", audioBuffer.length, "bytes");
+    console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes");
 
-    // Resample to 16kHz for STT
-    const resampled = path.join(UPLOAD_DIR, id + "_16k.wav");
-    await new Promise<void>((res, rej) => {
-      ffmpeg(wavPath)
-        .audioFrequency(16000)
-        .audioChannels(1)
-        .format("wav")
-        .on("end", res)
-        .on("error", rej)
-        .save(resampled);
-    });
-
-    // STT
+    // STT - use file directly (already 16kHz from ESP)
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
-        file: fs.createReadStream(resampled),
-        model: "whisper-large-v3-turbo"
+        file: fs.createReadStream(wavPath),
+        model: "whisper-large-v3-turbo",
+        language: "en"  // Optional: specify language
       }),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000)
@@ -146,10 +136,10 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       llmClient.chat.completions.create({
         model: "llama-3.3-70b-versatile",
         messages: [
-          { role: "system", content: "Return JSON only: {text}" },
+          { role: "system", content: "You are a helpful voice assistant. Keep responses short and natural. Return JSON: {\"text\":\"your response\"}" },
           { role: "user", content: userText }
         ],
-        max_tokens: 150,
+        max_tokens: 120,      // Shorter for faster TTS
         temperature: 0.7
       }),
       new Promise<never>((_, reject) =>
@@ -163,8 +153,10 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       const parsed = JSON.parse(raw);
       text = parsed.text || text;
     } catch {
-      text = raw;
+      text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
     }
+
+    console.log("AI:", text);
 
     await storage.createInteraction({
       transcript: userText,
@@ -175,71 +167,66 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     const tts = new EdgeTTS();
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
     await tts.ttsPromise(text, mp3, {
-      voice: "en-US-AriaNeural"
+      voice: "en-US-AriaNeural",
+      rate: "+10%"  // Slightly faster for mobile
     });
 
-    // Generate PCM and stream back
+    // Generate 16kHz PCM (matches ESP DAC)
     const pcm = await generatePCM(mp3);
-    console.log("[TTS] Generated PCM: " + pcm.length + " bytes");
+    console.log("[TTS] PCM:", pcm.length, "bytes @", SAMPLE_RATE, "Hz");
+
+    // Stream back
     await streamPCM(ws, pcm);
 
     // Cleanup
     try {
       fs.unlinkSync(mp3);
       fs.unlinkSync(wavPath);
-      fs.unlinkSync(resampled);
     } catch (e) {
-      console.error("[CLEANUP] Error:", e);
+      // Ignore cleanup errors
     }
 
   } catch (e: any) {
-    console.error("[PROCESS] Error:", e);
+    console.error("[PROCESS] Error:", e.message);
     ws.send("ERROR:" + (e.message || "UNKNOWN"));
   }
 }
 
 // ============================================================================
-// V6: ROUTES WITH FILE UPLOAD SUPPORT
+// V7: ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
     perMessageDeflate: false,
-    maxPayload: 1024 * 1024  // 1MB max for file upload
+    maxPayload: 512 * 1024  // 512KB max (plenty for 4-second WAV)
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V6 File Upload Mode");
+    console.log("ESP connected - V7 Mobile");
 
     let processing = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
-      // Handle text messages
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT:", msg);
-
         if (msg === "READY") {
           console.log("[WS] ESP ready");
-          return;
         }
-
         return;
       }
 
-      // V6: Binary data = complete WAV file upload
       if (processing) {
-        console.log("[UPLOAD] Already processing, ignoring");
+        console.log("[UPLOAD] Busy, ignoring");
         return;
       }
 
       const audioBuffer = Buffer.from(data);
-      console.log("[UPLOAD] Received WAV file:", audioBuffer.length, "bytes");
+      console.log("[UPLOAD] WAV:", audioBuffer.length, "bytes");
 
       processing = true;
-
-      // Process in background
       processAndRespond(ws, audioBuffer).finally(() => {
         processing = false;
       });
@@ -251,16 +238,17 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     });
 
     ws.on("error", (err) => {
-      console.error("[WS] Error:", err);
+      console.error("[WS] Error:", err.message);
     });
 
+    // Ping every 15s to keep connection alive on mobile
     const pingInterval = setInterval(() => {
       if (ws.readyState === ws.OPEN) {
         ws.ping();
       } else {
         clearInterval(pingInterval);
       }
-    }, 10000);
+    }, 15000);
   });
 
   return httpServer;
