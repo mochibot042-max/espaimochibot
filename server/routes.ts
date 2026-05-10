@@ -21,24 +21,26 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG
+// AUDIO CONFIG — OPTIMIZED FOR MUSIC
 // ============================================================================
 const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 512;
-const SEND_INTERVAL_MS = 16;
+const CHUNK_SIZE = 512;           // 32ms per chunk @ 16kHz
+const CHUNK_DURATION_MS = 32;     // Actual duration of each chunk
+const TARGET_BUFFER_MS = 500;     // Target 500ms buffer on client
+const PREBUFFER_CHUNKS = 16;      // Send 16 chunks before saying START
 
 // ============================================================================
-// YOUTUBE MUSIC CONFIG
+// YOUTUBE API
 // ============================================================================
 const YT_SEARCH_API = "https://mostakim.onrender.com/mostakim/ytSearch?search=";
 const YT_DOWNLOAD_API = "https://mostakim.onrender.com/m/sing?url=";
 
 // ============================================================================
-// DEBOUNCE & DEDUPLICATION
+// DEBOUNCE
 // ============================================================================
 const RECENT_REQUESTS = new Map<number, number>();
 const DEBOUNCE_MS = 3000;
-const ACTIVE_STREAMS = new Map<string, boolean>(); // Track active music streams
+const ACTIVE_STREAMS = new Map<string, boolean>();
 
 function isDuplicate(userId: number): boolean {
   const now = Date.now();
@@ -92,7 +94,6 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 function extractMusicCommand(text: string): { action: "play" | "stop" | "none"; query: string | null } {
   const lower = text.toLowerCase();
   
-  // Stop patterns
   const stopPatterns = [
     /stop\s+(?:the\s+)?music/i,
     /stop\s+(?:the\s+)?song/i,
@@ -104,7 +105,6 @@ function extractMusicCommand(text: string): { action: "play" | "stop" | "none"; 
     if (pattern.test(lower)) return { action: "stop", query: null };
   }
   
-  // Play patterns
   const playPatterns = [
     /play\s+(?:me\s+)?(?:a\s+)?(?:song\s+)?(?:called\s+)?(.+)/i,
     /play\s+(?:the\s+)?song\s+(.+)/i,
@@ -125,7 +125,7 @@ function extractMusicCommand(text: string): { action: "play" | "stop" | "none"; 
 }
 
 // ============================================================================
-// PCM GENERATION
+// PCM GENERATION (For TTS)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -154,9 +154,9 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM PCM
+// TTS STREAM (Tuloy-tuloy na streaming)
 // ============================================================================
-async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
+async function streamTTS(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
   
   const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
@@ -181,7 +181,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     
     ws.send(packet, { binary: true });
     seq++;
-    await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
+    await new Promise(r => setTimeout(r, CHUNK_DURATION_MS));
   }
   
   await new Promise(r => setTimeout(r, 500));
@@ -195,16 +195,16 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// YOUTUBE MUSIC STREAMING - DOWNLOAD & STREAM REALTIME
+// MUSIC STREAM — PRE-BUFFERED FOR SMOOTH PLAYBACK
 // ============================================================================
 async function streamYouTubeMusic(ws: WebSocket, query: string, sessionId: string) {
   const streamKey = ws.url || "unknown";
   ACTIVE_STREAMS.set(streamKey, true);
   
   try {
-    // Step 1: Search YouTube
+    // Step 1: Search
     console.log("[MUSIC] Searching for:", query);
-    ws.send("MUSIC_STATUS:Searching for " + query);
+    ws.send("MUSIC_STATUS:Searching...");
     
     const searchUrl = YT_SEARCH_API + encodeURIComponent(query);
     const searchRes = await axios.get(searchUrl, { timeout: 10000 });
@@ -217,11 +217,11 @@ async function streamYouTubeMusic(ws: WebSocket, query: string, sessionId: strin
     
     const song = searchRes.data[0];
     console.log("[MUSIC] Found:", song.title);
-    ws.send("MUSIC_STATUS:Found " + song.title);
+    ws.send("MUSIC_STATUS:Found: " + song.title);
     
     // Step 2: Get download URL
     const downloadUrl = YT_DOWNLOAD_API + encodeURIComponent(song.url);
-    console.log("[MUSIC] Getting download URL...");
+    console.log("[MUSIC] Getting stream URL...");
     
     const downloadRes = await axios.get(downloadUrl, { timeout: 15000 });
     
@@ -232,11 +232,11 @@ async function streamYouTubeMusic(ws: WebSocket, query: string, sessionId: strin
     }
     
     const mp3Url = downloadRes.data.url.trim();
-    console.log("[MUSIC] Streaming from:", mp3Url);
-    ws.send("MUSIC_STATUS:Playing " + song.title);
+    console.log("[MUSIC] Streaming:", song.title);
+    ws.send("MUSIC_STATUS:Buffering...");
     
-    // Step 3: Stream directly via ffmpeg (no full download)
-    await streamFromURL(ws, mp3Url, sessionId, streamKey);
+    // Step 3: Stream with pre-buffering
+    await streamMusicWithPrebuffer(ws, mp3Url, sessionId, streamKey, song.title);
     
   } catch (e: any) {
     console.error("[MUSIC] Error:", e.message);
@@ -247,35 +247,41 @@ async function streamYouTubeMusic(ws: WebSocket, query: string, sessionId: strin
 }
 
 // ============================================================================
-// STREAM FROM URL - REALTIME CONVERSION
+// PRE-BUFFERED MUSIC STREAMING
 // ============================================================================
-async function streamFromURL(ws: WebSocket, url: string, sessionId: string, streamKey: string) {
+async function streamMusicWithPrebuffer(
+  ws: WebSocket, 
+  url: string, 
+  sessionId: string, 
+  streamKey: string,
+  songTitle: string
+) {
   return new Promise<void>((resolve, reject) => {
     if (ws.readyState !== ws.OPEN) {
       resolve();
       return;
     }
     
-    // Send start signals
-    ws.send("SESSION:" + sessionId);
-    ws.send("START_MUSIC");
-    
+    let prebuffer: Buffer[] = [];
+    let prebufferComplete = false;
     let seq = 0;
-    let buffer = Buffer.alloc(0);
-    const TARGET_BUFFER = CHUNK_SIZE * 8; // 8 chunks buffer
+    let streamEnded = false;
+    let startTime = Date.now();
     
-    // Use ffmpeg to stream convert
+    // Send session
+    ws.send("SESSION:" + sessionId);
+    
+    // Start ffmpeg
     const ffmpegProcess = ffmpeg(url)
       .inputOptions([
-        '-re', // Read at native frame rate
-        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        '-re',
+        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        '-thread_queue_size', '512'
       ])
       .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=8000",
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.85",
+        "volume=0.9",
         "dynaudnorm=p=0.95:g=15"
       ])
       .audioCodec("pcm_s16le")
@@ -283,34 +289,24 @@ async function streamFromURL(ws: WebSocket, url: string, sessionId: string, stre
       .audioFrequency(SAMPLE_RATE)
       .format("s16le")
       .on('error', (err) => {
-        console.error("[MUSIC STREAM] Error:", err.message);
+        console.error("[MUSIC] FFmpeg error:", err.message);
+        streamEnded = true;
         if (ws.readyState === ws.OPEN) {
-          ws.send("ERROR:STREAM_FAILED");
           ws.send("FINISH_MUSIC");
         }
-        reject(err);
+        resolve();
       })
       .on('end', () => {
-        console.log("[MUSIC STREAM] Finished");
-        if (ws.readyState === ws.OPEN) {
-          ws.send("FINISH_MUSIC");
-        }
-        resolve();
+        console.log("[MUSIC] FFmpeg finished");
+        streamEnded = true;
       });
     
-    // Pipe ffmpeg output and chunk it
     const stream = ffmpegProcess.pipe();
+    let buffer = Buffer.alloc(0);
     
+    // Collect prebuffer first
     stream.on('data', (chunk: Buffer) => {
-      // Check if stream was cancelled
       if (!ACTIVE_STREAMS.get(streamKey)) {
-        ffmpegProcess.kill('SIGKILL');
-        stream.destroy();
-        resolve();
-        return;
-      }
-      
-      if (ws.readyState !== ws.OPEN) {
         ffmpegProcess.kill('SIGKILL');
         stream.destroy();
         resolve();
@@ -319,28 +315,118 @@ async function streamFromURL(ws: WebSocket, url: string, sessionId: string, stre
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // Send complete chunks
-      while (buffer.length >= CHUNK_SIZE) {
-        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-        packet.writeUInt16BE(seq & 0xFFFF, 0);
-        packet.set(buffer.subarray(0, CHUNK_SIZE), 2);
+      // Collect chunks into prebuffer
+      while (buffer.length >= CHUNK_SIZE && prebuffer.length < PREBUFFER_CHUNKS) {
+        const chunkData = buffer.subarray(0, CHUNK_SIZE);
+        prebuffer.push(Buffer.from(chunkData));
+        buffer = buffer.subarray(CHUNK_SIZE);
+      }
+      
+      // Once prebuffer is full, start sending
+      if (prebuffer.length >= PREBUFFER_CHUNKS && !prebufferComplete) {
+        prebufferComplete = true;
+        console.log("[MUSIC] Prebuffer ready:", prebuffer.length, "chunks");
+        ws.send("PREPARE_RESPONSE:" + 0); // Unknown total for music
+        ws.send("START_MUSIC");
+        ws.send("MUSIC_STATUS:Playing: " + songTitle);
         
-        try {
-          ws.send(packet, { binary: true });
-        } catch (e) {
-          ffmpegProcess.kill('SIGKILL');
-          stream.destroy();
+        // Start draining prebuffer
+        drainPrebuffer();
+      }
+    });
+    
+    // Drain prebuffer then continue with live stream
+    async function drainPrebuffer() {
+      // Send all prebuffered chunks
+      for (const chunk of prebuffer) {
+        if (!ACTIVE_STREAMS.get(streamKey) || ws.readyState !== ws.OPEN) {
           resolve();
           return;
         }
         
-        buffer = buffer.subarray(CHUNK_SIZE);
+        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        packet.set(chunk, 2);
+        
+        try {
+          ws.send(packet, { binary: true });
+        } catch (e) {
+          resolve();
+          return;
+        }
+        
         seq++;
+        
+        // Adaptive delay based on buffer health
+        const elapsed = Date.now() - startTime;
+        const expectedTime = seq * CHUNK_DURATION_MS;
+        const delay = expectedTime - elapsed;
+        
+        if (delay > 0) {
+          await new Promise(r => setTimeout(r, delay));
+        }
       }
+      
+      prebuffer = []; // Clear prebuffer
+      
+      // Continue with live stream
+      continueLiveStream();
+    }
+    
+    async function continueLiveStream() {
+      // Process remaining buffer
+      while (buffer.length >= CHUNK_SIZE) {
+        if (!ACTIVE_STREAMS.get(streamKey) || ws.readyState !== ws.OPEN) {
+          resolve();
+          return;
+        }
+        
+        const chunk = buffer.subarray(0, CHUNK_SIZE);
+        buffer = buffer.subarray(CHUNK_SIZE);
+        
+        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        packet.set(chunk, 2);
+        
+        try {
+          ws.send(packet, { binary: true });
+        } catch (e) {
+          resolve();
+          return;
+        }
+        
+        seq++;
+        
+        // Adaptive timing
+        const elapsed = Date.now() - startTime;
+        const expectedTime = seq * CHUNK_DURATION_MS;
+        const delay = expectedTime - elapsed;
+        
+        if (delay > 0) {
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+      
+      // If stream ended and buffer consumed, finish
+      if (streamEnded && buffer.length < CHUNK_SIZE) {
+        console.log("[MUSIC] Stream complete, sent", seq, "chunks");
+        if (ws.readyState === ws.OPEN) {
+          ws.send("FINISH_MUSIC");
+        }
+        resolve();
+        return;
+      }
+      
+      // Wait for more data
+      setTimeout(continueLiveStream, 10);
+    }
+    
+    stream.on('end', () => {
+      // Handled in data handler
     });
     
     stream.on('error', (err) => {
-      console.error("[MUSIC STREAM] Stream error:", err.message);
+      console.error("[MUSIC] Stream error:", err.message);
       if (ws.readyState === ws.OPEN) {
         ws.send("FINISH_MUSIC");
       }
@@ -407,7 +493,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
       return;
     } else if (musicCmd.action === "stop") {
       console.log("[MUSIC] Stop command");
-      // Stop any active stream
       const streamKey = ws.url || "unknown";
       ACTIVE_STREAMS.set(streamKey, false);
       ws.send("FINISH_MUSIC");
@@ -481,7 +566,7 @@ Return JSON: {"text":"your response"}`;
     const pcm = await generatePCM(mp3);
     console.log("[TTS] PCM:", pcm.length, "bytes, ID:", uniqueId);
 
-    await streamPCM(ws, pcm, uniqueId);
+    await streamTTS(ws, pcm, uniqueId);
 
     processingComplete = true;
 
@@ -522,7 +607,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - Voice AI + Music Player");
+    console.log("ESP connected - Voice AI + Smooth Music");
 
     let processing = false;
     let currentUserId: number | null = null;
@@ -554,7 +639,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           }
         }
 
-        // Handle music stop from client
         if (msg === "STOP_MUSIC") {
           const streamKey = ws.url || "unknown";
           ACTIVE_STREAMS.set(streamKey, false);
