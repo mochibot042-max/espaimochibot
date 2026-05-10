@@ -20,102 +20,65 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V13: ADD SILENCE PADDING TO PREVENT HISS
+// V14: 500ms SILENCE TAIL + FADE OUT
 // ============================================================================
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 2048;
 const SEND_INTERVAL_MS = 58;
 
-// Silence padding: 200ms before and after audio
-const SILENCE_PADDING_MS = 200;
-const SILENCE_SAMPLES = (SAMPLE_RATE * SILENCE_PADDING_MS) / 1000;  // 3200 samples
-const SILENCE_BYTES = SILENCE_SAMPLES * 2;  // 6400 bytes
+// 500ms silence tail = 8000 samples = 16000 bytes
+const SILENCE_TAIL_MS = 500;
+const SILENCE_TAIL_BYTES = (SAMPLE_RATE * 2 * SILENCE_TAIL_MS) / 1000;  // 16000
 
 // ============================================================================
-// PCM GENERATOR WITH SILENCE PADDING
+// PCM WITH SILENCE TAIL AND FADE
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
-  const tmpPadded = path.join(AUDIO_DIR, "padded_" + Date.now() + ".pcm");
+  const tmp = path.join(AUDIO_DIR, "proc_" + Date.now() + ".pcm");
   
   return new Promise((resolve, reject) => {
-    // First: generate raw PCM
-    ffmpeg(input)
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=8000",
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.85",
-        "dynaudnorm=p=0.95:g=15"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => {
-        // Read raw PCM
-        const rawPCM = fs.readFileSync(tmp);
-        fs.unlinkSync(tmp);
-        
-        // Create silence padding
-        const silence = Buffer.alloc(SILENCE_BYTES, 0);
-        
-        // Combine: silence + audio + silence
-        const padded = Buffer.concat([silence, rawPCM, silence]);
-        
-        // Fade in/out to prevent clicks
-        // We'll let ffmpeg do this in one pass instead
-        
-        resolve(padded);
-      })
-      .save(tmp);
+    // Get duration first
+    ffmpeg.ffprobe(input, (err, metadata) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      
+      const duration = metadata.format.duration || 5.0;
+      const fadeStart = Math.max(0, duration - 0.3);  // Fade out last 300ms
+      
+      ffmpeg(input)
+        .audioFilters([
+          "highpass=f=80",
+          "lowpass=f=8000",
+          "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+          "aformat=sample_fmts=s16:channel_layouts=mono",
+          // Fade in 50ms
+          "afade=t=in:ss=0:d=0.05",
+          // Fade out 300ms (smooth ending)
+          "afade=t=out:st=" + fadeStart + ":d=0.3",
+          "dynaudnorm=p=0.95:g=15",
+          "volume=0.85"
+        ])
+        .audioCodec("pcm_s16le")
+        .audioChannels(1)
+        .audioFrequency(SAMPLE_RATE)
+        .format("s16le")
+        .on("error", reject)
+        .on("end", () => {
+          const rawPCM = fs.readFileSync(tmp);
+          fs.unlinkSync(tmp);
+          
+          // Add 500ms silence tail (prevents cut-off hiss)
+          const silence = Buffer.alloc(SILENCE_TAIL_BYTES, 0);
+          const finalPCM = Buffer.concat([rawPCM, silence]);
+          
+          console.log("[PCM] Raw: " + rawPCM.length + " + tail: " + silence.length + " = " + finalPCM.length);
+          resolve(finalPCM);
+        })
+        .save(tmp);
+    });
   });
-}
-
-// Better: Single-pass with fade and padding
-async function generatePCMBetter(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "final_" + Date.now() + ".pcm");
-  
-  return new Promise((resolve, reject) => {
-    ffmpeg(input)
-      .audioFilters([
-        // High-pass to remove DC offset
-        "highpass=f=80",
-        // Low-pass for 16kHz
-        "lowpass=f=8000",
-        // Resample to 16kHz
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        // Ensure mono 16-bit
-        "aformat=sample_fmts=s16:channel_layouts=mono",
-        // Fade in (50ms) to prevent click at start
-        "afade=t=in:ss=0:d=0.05",
-        // Fade out (100ms) to prevent hiss after speech
-        "afade=t=out:st=" + (getDuration(input) - 0.1) + ":d=0.1",
-        // Normalize
-        "dynaudnorm=p=0.95:g=15",
-        // Final volume
-        "volume=0.85"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => {
-        const pcm = fs.readFileSync(tmp);
-        fs.unlinkSync(tmp);
-        resolve(pcm);
-      })
-      .save(tmp);
-  });
-}
-
-// Helper: get audio duration (simplified)
-function getDuration(input: string): number {
-  // Default 5 seconds if can't determine
-  return 5.0;
 }
 
 // ============================================================================
@@ -128,7 +91,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   const totalChunks = alignedLen / CHUNK_SIZE;
   
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 500));
+  await new Promise(r => setTimeout(r, 600));  // Longer prep
   ws.send("START_RESPONSE");
   
   let seq = 0;
@@ -159,8 +122,11 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     nextSendTime += SEND_INTERVAL_MS;
   }
   
+  // Wait before sending FINISH - ensure all data played
+  await new Promise(r => setTimeout(r, 1000));
+  
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks");
+  console.log("[STREAM] Sent " + seq + " chunks + tail");
 }
 
 // ============================================================================
@@ -245,8 +211,8 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       rate: "+15%"
     });
 
-    // PCM with fade out (prevents hiss)
-    const pcm = await generatePCMBetter(mp3);
+    // PCM with fade + silence tail
+    const pcm = await generatePCM(mp3);
     console.log("[TTS] PCM:", pcm.length, "bytes");
 
     // Stream
@@ -276,7 +242,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V13 No Hiss");
+    console.log("ESP connected - V14 No Hiss");
 
     let processing = false;
 
