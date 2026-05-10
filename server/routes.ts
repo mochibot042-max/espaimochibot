@@ -20,16 +20,16 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V15: SLOWER PACE - Prevent ESP32 buffer overflow/underrun
+// V16: DIRECT WRITE MATCH - 16kHz, 256 sample chunks
 // ============================================================================
 const SAMPLE_RATE = 16000;
 
 // Match ESP DMA: 256 samples * 2 bytes = 512 bytes
 const CHUNK_SIZE = 512;
 
-// 256 samples / 16000 = 16ms per chunk
-// Send every 14ms (slightly faster than real-time to keep buffer filled)
-const SEND_INTERVAL_MS = 14;
+// 256 samples / 16000 = 16ms
+// Send every 16ms exactly (real-time)
+const SEND_INTERVAL_MS = 16;
 
 // ============================================================================
 // PCM GENERATOR
@@ -62,7 +62,7 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM - MATCH ESP DMA EXACTLY
+// STREAM - EXACT REAL-TIME
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
@@ -71,11 +71,10 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   const totalChunks = alignedLen / CHUNK_SIZE;
   
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300));
+  await new Promise(r => setTimeout(r, 200));
   ws.send("START_RESPONSE");
   
   let seq = 0;
-  let nextSendTime = Date.now() + SEND_INTERVAL_MS;
   
   for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
@@ -94,16 +93,12 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     
     seq++;
     
-    const now = Date.now();
-    const wait = nextSendTime - now;
-    if (wait > 0) {
-      await new Promise(r => setTimeout(r, wait));
-    }
-    nextSendTime += SEND_INTERVAL_MS;
+    // Exact real-time: 16ms per chunk
+    await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
   }
   
-  // Small delay before FINISH to let last data play
-  await new Promise(r => setTimeout(r, 500));
+  // Small delay before finish
+  await new Promise(r => setTimeout(r, 200));
   
   ws.send("FINISH_RESPONSE");
   console.log("[STREAM] Sent " + seq + " chunks");
@@ -216,7 +211,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V15");
+    console.log("ESP connected - V16 Direct");
 
     let processing = false;
 
