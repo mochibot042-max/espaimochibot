@@ -20,19 +20,14 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V16: DIRECT WRITE MATCH - 16kHz, 256 sample chunks
+// V17: MATCH MICRO BUFFER - 16kHz, 256 sample chunks
 // ============================================================================
 const SAMPLE_RATE = 16000;
-
-// Match ESP DMA: 256 samples * 2 bytes = 512 bytes
-const CHUNK_SIZE = 512;
-
-// 256 samples / 16000 = 16ms
-// Send every 16ms exactly (real-time)
-const SEND_INTERVAL_MS = 16;
+const CHUNK_SIZE = 512;  // 256 samples * 2 bytes
+const SEND_INTERVAL_MS = 16;  // 16ms = real-time
 
 // ============================================================================
-// PCM GENERATOR
+// PCM
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -62,7 +57,7 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM - EXACT REAL-TIME
+// STREAM
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
@@ -92,14 +87,10 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     }
     
     seq++;
-    
-    // Exact real-time: 16ms per chunk
     await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
   }
   
-  // Small delay before finish
   await new Promise(r => setTimeout(r, 200));
-  
   ws.send("FINISH_RESPONSE");
   console.log("[STREAM] Sent " + seq + " chunks");
 }
@@ -211,7 +202,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V16 Direct");
+    console.log("ESP connected - V17 Micro");
 
     let processing = false;
 
