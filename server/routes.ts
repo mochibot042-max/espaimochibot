@@ -25,17 +25,20 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V42: CONNECTION STABILITY ---------------- */
+/* ---------------- CONFIG - V43: SLOW WIFI + RENDER FIX ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 16000;
 const SILENCE_MS = 400;
-const CHUNK_SIZE = 2048;
 
-const INITIAL_CHUNK_DELAY_MS = 45;
-const NORMAL_CHUNK_DELAY_MS = 58;
-const MUSIC_CHUNK_DELAY_MS = 55;
+// V43: MAS MALIIT NA CHUNKS para sa mabagal na WiFi
+const CHUNK_SIZE = 1024;                  // 1024 bytes = 32ms @ 16kHz (mas maliit, mas stable)
 
-const PREBUFFER_CHUNKS = 5;
+// V43: MAS BAGAL NA PACING para hindi overload yung WiFi
+const INITIAL_CHUNK_DELAY_MS = 60;        // Unang 30 chunks - mas conservative
+const NORMAL_CHUNK_DELAY_MS = 75;         // Normal - 32ms audio + 43ms gap = natural
+const MUSIC_CHUNK_DELAY_MS = 70;          // Music - consistent
+
+const PREBUFFER_CHUNKS = 8;               // Mas maraming prebuffer para may head start
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -80,7 +83,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V42: REAL-TIME PCM STREAM ---------------- */
+/* ---------------- V43: REAL-TIME PCM STREAM - SLOW WIFI ---------------- */
 async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
   if (ws.readyState !== ws.OPEN) return;
 
@@ -91,8 +94,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
       "-af", "highpass=f=80,lowpass=f=7500,volume=0.95,dynaudnorm=p=0.95:g=15,afftdn=nf=-25",
-      "-bufsize", "128k",
-      "-maxrate", "256k",
+      "-bufsize", "64k",          // V43: Mas maliit na buffer
+      "-maxrate", "128k",         // V43: Mas mabagal na max rate
       "pipe:1"
     ]);
 
@@ -108,11 +111,12 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       
       buffer = Buffer.concat([buffer, chunk]);
       
+      // V43: Mas maraming prebuffer bago mag-start
       if (!hasStarted && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 200)); // Mas mahabang setup delay
         ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
         hasStarted = true;
-        console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent`);
+        console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent (prebuffer: ${PREBUFFER_CHUNKS} chunks)`);
       }
       
       while (buffer.length >= CHUNK_SIZE && isActive) {
@@ -132,7 +136,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
           ws.send(packet, { binary: true });
           seq++;
           
-          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
+          // V43: MAS BAGAL NA PACING para sa mabagal na WiFi
+          const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
                        isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
@@ -155,7 +160,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
         seq++;
       }
       
-      const silencePackets = isMusic ? 50 : 100;
+      // V43: MAS MARAMING SILENCE PACKETS
+      const silencePackets = isMusic ? 60 : 120;
       for (let i = 0; i < silencePackets; i++) {
         if (ws.readyState !== ws.OPEN) break;
         const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
@@ -228,13 +234,13 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
       "-af", "highpass=f=60,lowpass=f=7500,volume=0.90",
-      "-bufsize", "128k",
-      "-maxrate", "256k",
+      "-bufsize", "64k",
+      "-maxrate", "128k",
       "pipe:1"
     ]);
 
     ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 200));
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
@@ -263,7 +269,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
+          const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
@@ -286,7 +292,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       }
       
       const sendSilence = async () => {
-        for (let i = 0; i < 50; i++) {
+        for (let i = 0; i < 60; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
@@ -338,6 +344,18 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 
 /* ---------------- SERVER ---------------- */
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  
+  // V43: HTTP endpoint para ma-wake up yung server bago mag-WebSocket
+  app.get("/ping", (req, res) => {
+    res.json({ status: "alive", timestamp: Date.now() });
+  });
+  
+  // V43: HTTP endpoint para sa wake-up call mula ESP32
+  app.get("/wake", (req, res) => {
+    console.log("[WAKE] Server wake-up call received");
+    res.json({ status: "awake", ready: true });
+  });
+
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
@@ -346,7 +364,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V42 Stable Connection");
+    console.log("ESP32 connected - V43 Slow WiFi Fix");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -357,7 +375,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let lastPongTime = Date.now();
     let isAlive = true;
     
-    // V42: Connection keep-alive check
+    // V43: Mas frequent na heartbeat (3 seconds) para sa mabagal na WiFi
     const keepAliveInterval = setInterval(() => {
       if (!isAlive) {
         console.log("[WS] Connection dead, terminating");
@@ -370,12 +388,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (ws.readyState === ws.OPEN) {
         ws.ping();
       }
-    }, 5000); // V42: 5 seconds heartbeat
+    }, 3000); // V43: 3 seconds heartbeat
     
     ws.on("pong", () => {
       isAlive = true;
       lastPongTime = Date.now();
-      console.log("[WS] Pong received");
     });
     
     ws.on("message", async (data: any, isBinary: boolean) => {
