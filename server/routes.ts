@@ -25,16 +25,16 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V28: 48kHz, Slower streaming ---------------- */
+/* ---------------- CONFIG - V52: FIX PUTOL NA TUNOG ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 48000;
-const SILENCE_MS = 150;
+const TARGET_SAMPLE_RATE = 48000; // Match V37 ESP32
+const SILENCE_MS = 200; // Tumaas para hindi agad matapos
 const CHUNK_SIZE = 1024;
 
-// V28: Slower streaming to prevent ESP32 buffer overflow
-const CHUNK_DELAY_MS = 20;        // Was 10, increased to prevent overwhelm
-const INITIAL_CHUNK_DELAY_MS = 30; // Slower start for first 20 chunks
-const FAST_CHUNK_DELAY_MS = 15;   // Normal speed after buffer filled
+// V52: MAS MABAGAL NA DELAYS para hindi maubos agad ang queue
+const CHUNK_DELAY_MS = 35;        // Tumaas from 20 - mas mabagal na pacing
+const INITIAL_CHUNK_DELAY_MS = 50; // Tumaas from 30 - slower start
+const FAST_CHUNK_DELAY_MS = 25;   // Tumaas from 15
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -79,7 +79,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- GENERATE PCM ---------------- */
+/* ---------------- GENERATE PCM - V52: BETTER QUALITY ---------------- */
 async function generatePCM(inputPath: string): Promise<Buffer> {
   const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
 
@@ -112,6 +112,7 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
           for (let i = 0; i < samples.length; i++) samples[i] -= mean;
         }
 
+        // V52: MAS MARAMING SILENCE para hindi agad matapos
         const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
         const silence = Buffer.alloc(silenceBytes, 0);
         const finalPCM = Buffer.concat([pcm, silence]);
@@ -122,13 +123,15 @@ async function generatePCM(inputPath: string): Promise<Buffer> {
   });
 }
 
-/* ---------------- STREAM PCM TO ESP32 ---------------- */
+/* ---------------- STREAM PCM TO ESP32 - V52: MAS MABAGAL + STABLE ---------------- */
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
+  
+  // V52: Send PREPARE with actual chunk count
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300));
+  await new Promise(r => setTimeout(r, 500)); // V52: Tumaas from 300 - mas mahabang preparation time
   ws.send("START_RESPONSE");
 
   let seq = 0;
@@ -156,16 +159,31 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
       return;
     }
     seq++;
+    
+    // V52: ADAPTIVE DELAY - mas mabagal sa simula, stable pagkatapos
+    const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
+                 seq < 80 ? FAST_CHUNK_DELAY_MS : 
+                 CHUNK_DELAY_MS;
+    
+    await new Promise(r => setTimeout(r, delay));
+  }
+
+  // V52: MAS MARAMING TRAILING SILENCE para sure na hindi putol
+  const trailingSilenceChunks = 50;
+  for (let i = 0; i < trailingSilenceChunks; i++) {
+    if (ws.readyState !== ws.OPEN) break;
+    const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+    silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
+    silencePacket.fill(0, 2);
+    ws.send(silencePacket, { binary: true });
     await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
   }
 
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks at 48kHz");
+  console.log("[STREAM] Sent " + seq + " chunks + " + trailingSilenceChunks + " silence at 48kHz");
 }
 
-/* ============================================================================
-   V28 FIX: INSTANT MUSIC STREAMING - SLOWER TO PREVENT ESP32 OVERWHELM
-   ============================================================================ */
+/* ---------------- MUSIC STREAM - V52: MATCH AI TIMING ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -184,7 +202,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     console.log("[MUSIC] Found:", video.title);
 
     const apiRes = await axios.get(
-      `https://mostakim.onrender.com/m/sing?url=${video.url}`,
+      `https://mostakim.onrender.com/mostakim/sing?url=${video.url}`,
       { timeout: 10000 }
     );
     
@@ -206,9 +224,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "pipe:1"
     ]);
 
-    // V28: Send PREPARE immediately
+    // V52: Mas mahabang preparation time
     ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 500));
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
@@ -220,7 +238,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V28: Stream with adaptive speed - slower at start, faster later
       while (buffer.length >= CHUNK_SIZE && isActive) {
         if (ws.readyState !== ws.OPEN) {
           isActive = false;
@@ -238,9 +255,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          // V28: Adaptive delay - slower at start to let ESP32 fill buffer
-          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
-                       seq < 50 ? FAST_CHUNK_DELAY_MS : 
+          // V52: MATCH AI TIMING
+          const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
+                       seq < 80 ? FAST_CHUNK_DELAY_MS : 
                        CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
@@ -255,7 +272,6 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     ffmpegProcess.stdout.on("end", () => {
       isActive = false;
       
-      // Send remaining buffer
       if (buffer.length > 0 && ws.readyState === ws.OPEN) {
         const packet = Buffer.allocUnsafe(2 + buffer.length);
         packet.writeUInt16BE(seq & 0xFFFF, 0);
@@ -264,9 +280,9 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V28: Send trailing silence
+      // V52: MAS MARAMING SILENCE
       const sendSilence = async () => {
-        for (let i = 0; i < 30; i++) {
+        for (let i = 0; i < 80; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
@@ -326,7 +342,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V28 Stable Music");
+    console.log("ESP32 connected - V52 Fix Putol");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -334,7 +350,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
-    // V28: Keepalive with pong response tracking
     let lastPongTime = Date.now();
     
     ws.on("message", async (data: any, isBinary: boolean) => {
@@ -388,7 +403,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           }
           console.log("USER:", userText);
 
-          /* LLM - Single AI (Mochi) */
+          /* LLM - Mochi */
           const chat = await llmClient.chat.completions.create({
             messages: [
               {
@@ -507,12 +522,10 @@ Rules:
       console.error("[WS] Error:", err);
     });
 
-    // V28: More frequent ping with pong tracking
+    // V52: Mas frequent ping para stable connection
     const pingInterval = setInterval(() => {
       if (ws.readyState === ws.OPEN) {
         ws.ping();
-        
-        // Check if ESP is still responding
         if (Date.now() - lastPongTime > 45000) {
           console.log("[WS] No pong received, closing connection");
           ws.terminate();
@@ -520,7 +533,7 @@ Rules:
       } else {
         clearInterval(pingInterval);
       }
-    }, 8000); // V28: More frequent (was 10000)
+    }, 8000);
 
     ws.on("pong", () => {
       lastPongTime = Date.now();
