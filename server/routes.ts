@@ -25,16 +25,17 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V52: FIX PUTOL NA TUNOG ---------------- */
+/* ---------------- CONFIG - V50: COMPLETE REWRITE ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 48000; // Match V37 ESP32
-const SILENCE_MS = 200; // Tumaas para hindi agad matapos
+const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 1024;
 
-// V52: MAS MABAGAL NA DELAYS para hindi maubos agad ang queue
-const CHUNK_DELAY_MS = 35;        // Tumaas from 20 - mas mabagal na pacing
-const INITIAL_CHUNK_DELAY_MS = 50; // Tumaas from 30 - slower start
-const FAST_CHUNK_DELAY_MS = 25;   // Tumaas from 15
+// V50: MAS MABAGAL NA DELAYS para hindi bumilis at hindi maubos agad
+const INITIAL_CHUNK_DELAY_MS = 90;   // Tumaas from 80
+const NORMAL_CHUNK_DELAY_MS = 95;    // Tumaas from 85
+const MUSIC_CHUNK_DELAY_MS = 92;     // Tumaas from 82
+
+const PREBUFFER_CHUNKS = 16;         // Tumaas from 12
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -79,111 +80,125 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- GENERATE PCM - V52: BETTER QUALITY ---------------- */
-async function generatePCM(inputPath: string): Promise<Buffer> {
-  const tmpRaw = path.join(AUDIO_DIR, `raw_${Date.now()}.pcm`);
+/* ---------------- V50: REAL-TIME PCM STREAM - COMPLETE REWRITE ---------------- */
+async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
+  if (ws.readyState !== ws.OPEN) return;
 
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .noVideo()
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=20000",
-        `aresample=${TARGET_SAMPLE_RATE}:resampler=soxr:precision=28`,
-        "pan=mono|c0=c0",
-        "volume=0.90",
-        "dynaudnorm=p=0.95:g=15",
-        "afftdn=nf=-30"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(TARGET_SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => {
-        let pcm = fs.readFileSync(tmpRaw);
-        fs.unlinkSync(tmpRaw);
+  return new Promise<void>((resolve, reject) => {
+    const ffmpegProcess = spawn("ffmpeg", [
+      "-i", inputPath,
+      "-f", "s16le",
+      "-ac", "1",
+      "-ar", TARGET_SAMPLE_RATE.toString(),
+      "-af", "highpass=f=80,lowpass=f=7500,volume=0.95,dynaudnorm=p=0.95:g=15,afftdn=nf=-25",
+      "-bufsize", "64k",
+      "-maxrate", "128k",
+      "pipe:1"
+    ]);
 
-        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
-        let sum = 0;
-        for (let i = 0; i < samples.length; i++) sum += samples[i];
-        const mean = Math.round(sum / samples.length);
-        if (Math.abs(mean) > 10) {
-          for (let i = 0; i < samples.length; i++) samples[i] -= mean;
+    // V50: Send PREPARE only once
+    ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
+    
+    let isActive = true;
+    let buffer = Buffer.alloc(0);
+    let seq = 0;
+    let startSent = false;
+
+    ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
+      if (!isActive || ws.readyState !== ws.OPEN) return;
+      
+      buffer = Buffer.concat([buffer, chunk]);
+      
+      // V50: Send START only once, strictly
+      if (!startSent && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
+        startSent = true;
+        await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
+        if (ws.readyState === ws.OPEN) {
+          ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
+          console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent ONCE`);
         }
+      }
+      
+      while (buffer.length >= CHUNK_SIZE && isActive) {
+        if (ws.readyState !== ws.OPEN) {
+          isActive = false;
+          return;
+        }
+        
+        const sendChunk = buffer.slice(0, CHUNK_SIZE);
+        buffer = buffer.slice(CHUNK_SIZE);
+        
+        const packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        sendChunk.copy(packet, 2);
+        
+        try {
+          ws.send(packet, { binary: true });
+          seq++;
+          
+          // V50: MAS MABAGAL NA DELAYS
+          const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : 
+                       isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
+          
+          await new Promise(r => setTimeout(r, delay));
+        } catch (e) {
+          console.error("[STREAM] Send error:", e);
+          isActive = false;
+          return;
+        }
+      }
+    });
 
-        // V52: MAS MARAMING SILENCE para hindi agad matapos
-        const silenceBytes = Math.floor((SILENCE_MS / 1000) * TARGET_SAMPLE_RATE * 2);
-        const silence = Buffer.alloc(silenceBytes, 0);
-        const finalPCM = Buffer.concat([pcm, silence]);
+    ffmpegProcess.stdout.on("end", async () => {
+      isActive = false;
+      
+      if (buffer.length > 0 && ws.readyState === ws.OPEN) {
+        const packet = Buffer.allocUnsafe(2 + buffer.length);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        buffer.copy(packet, 2);
+        ws.send(packet, { binary: true });
+        seq++;
+      }
+      
+      // V50: MAS MARAMING SILENCE para hindi agad maubos
+      const silencePackets = isMusic ? 200 : 250;
+      for (let i = 0; i < silencePackets; i++) {
+        if (ws.readyState !== ws.OPEN) break;
+        const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
+        silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
+        silencePacket.fill(0, 2);
+        ws.send(silencePacket, { binary: true });
+        await new Promise(r => setTimeout(r, isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS));
+      }
+      
+      if (ws.readyState === ws.OPEN) {
+        ws.send(isMusic ? "FINISH_MUSIC" : "FINISH_RESPONSE");
+      }
+      
+      console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} finished, sent ${seq} chunks`);
+      resolve();
+    });
 
-        resolve(finalPCM);
-      })
-      .save(tmpRaw);
+    ffmpegProcess.stderr.on("data", (data) => {
+      const str = data.toString();
+      if (str.includes("time=")) {
+        const match = str.match(/time=(\d+:\d+:\d+\.\d+)/);
+        if (match) console.log("[FFMPEG] Progress:", match[1]);
+      }
+    });
+
+    ffmpegProcess.on("error", (err) => {
+      console.error("[FFMPEG] Error:", err);
+      isActive = false;
+      if (ws.readyState === ws.OPEN) {
+        ws.send("ERROR:STREAM_FAILED");
+      }
+      reject(err);
+    });
   });
 }
 
-/* ---------------- STREAM PCM TO ESP32 - V52: MAS MABAGAL + STABLE ---------------- */
-async function streamPCM(ws: WebSocket, pcm: Buffer) {
-  if (ws.readyState !== ws.OPEN) return;
-  
-  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
-  
-  // V52: Send PREPARE with actual chunk count
-  ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 500)); // V52: Tumaas from 300 - mas mahabang preparation time
-  ws.send("START_RESPONSE");
-
-  let seq = 0;
-  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
-    if (ws.readyState !== ws.OPEN) return;
-    const chunk = pcm.slice(i, i + CHUNK_SIZE);
-
-    let packet: Buffer;
-    if (chunk.length < CHUNK_SIZE) {
-      const padded = Buffer.alloc(CHUNK_SIZE);
-      chunk.copy(padded);
-      packet = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-      packet.writeUInt16BE(seq & 0xFFFF, 0);
-      padded.copy(packet, 2);
-    } else {
-      packet = Buffer.allocUnsafe(2 + chunk.length);
-      packet.writeUInt16BE(seq & 0xFFFF, 0);
-      chunk.copy(packet, 2);
-    }
-
-    try {
-      ws.send(packet, { binary: true });
-    } catch (e) {
-      console.error("[STREAM] Send failed:", e);
-      return;
-    }
-    seq++;
-    
-    // V52: ADAPTIVE DELAY - mas mabagal sa simula, stable pagkatapos
-    const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
-                 seq < 80 ? FAST_CHUNK_DELAY_MS : 
-                 CHUNK_DELAY_MS;
-    
-    await new Promise(r => setTimeout(r, delay));
-  }
-
-  // V52: MAS MARAMING TRAILING SILENCE para sure na hindi putol
-  const trailingSilenceChunks = 50;
-  for (let i = 0; i < trailingSilenceChunks; i++) {
-    if (ws.readyState !== ws.OPEN) break;
-    const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
-    silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
-    silencePacket.fill(0, 2);
-    ws.send(silencePacket, { binary: true });
-    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
-  }
-
-  ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks + " + trailingSilenceChunks + " silence at 48kHz");
-}
-
-/* ---------------- MUSIC STREAM - V52: MATCH AI TIMING ---------------- */
+/* ---------------- MUSIC STREAM - V50 ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -218,15 +233,15 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "-f", "s16le",
       "-ac", "1",
       "-ar", TARGET_SAMPLE_RATE.toString(),
-      "-af", "highpass=f=60,lowpass=f=20000,volume=0.85",
-      "-bufsize", "256k",
-      "-maxrate", "500k",
+      "-af", "highpass=f=60,lowpass=f=7500,volume=0.90",
+      "-bufsize", "64k",
+      "-maxrate", "128k",
       "pipe:1"
     ]);
 
-    // V52: Mas mahabang preparation time
+    // V50: Send PREPARE and START only once
     ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 400)); // V50: Tumaas from 300ms
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
@@ -255,10 +270,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          // V52: MATCH AI TIMING
-          const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
-                       seq < 80 ? FAST_CHUNK_DELAY_MS : 
-                       CHUNK_DELAY_MS;
+          const delay = seq < 50 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
@@ -280,15 +292,15 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V52: MAS MARAMING SILENCE
+      // V50: MAS MARAMING SILENCE
       const sendSilence = async () => {
-        for (let i = 0; i < 80; i++) {
+        for (let i = 0; i < 200; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
           silencePacket.fill(0, 2);
           ws.send(silencePacket, { binary: true });
-          await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+          await new Promise(r => setTimeout(r, MUSIC_CHUNK_DELAY_MS));
         }
         
         if (ws.readyState === ws.OPEN) {
@@ -334,6 +346,16 @@ async function downloadSongStream(query: string, ws: WebSocket) {
 
 /* ---------------- SERVER ---------------- */
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  
+  app.get("/ping", (req, res) => {
+    res.json({ status: "alive", timestamp: Date.now(), clients: wss.clients.size });
+  });
+  
+  app.get("/wake", (req, res) => {
+    console.log("[WAKE] Server wake-up call received");
+    res.json({ status: "awake", ready: true });
+  });
+
   const wss = new WebSocketServer({ 
     server: httpServer, 
     path: "/ws/audio",
@@ -342,7 +364,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V52 Fix Putol");
+    console.log("ESP32 connected - V50 Complete Fix");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -351,6 +373,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
     let lastPongTime = Date.now();
+    let isAlive = true;
+    
+    const keepAliveInterval = setInterval(() => {
+      if (!isAlive) {
+        console.log("[WS] Connection dead, terminating");
+        clearInterval(keepAliveInterval);
+        ws.terminate();
+        return;
+      }
+      
+      isAlive = false;
+      if (ws.readyState === ws.OPEN) {
+        ws.ping();
+      }
+    }, 3000);
+    
+    ws.on("pong", () => {
+      isAlive = true;
+      lastPongTime = Date.now();
+    });
     
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (isBinary) {
@@ -361,8 +403,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const msg = data.toString();
       console.log("[WS] TEXT:", msg);
 
+      if (msg === "PING_KEEPALIVE") {
+        ws.send("PONG_KEEPALIVE");
+        return;
+      }
+
       if (msg === "READY") {
-        console.log("[WS] ESP ready");
+        console.log("[WS] ESP ready - acknowledged");
         return;
       }
 
@@ -462,8 +509,7 @@ Rules:
           const tmpMp3 = path.join(AUDIO_DIR, `tts_${Date.now()}.mp3`);
           await edge.ttsPromise(spokenText, tmpMp3, { voice: "en-US-JennyNeural" });
 
-          const pcm = await generatePCM(tmpMp3);
-          await streamPCM(ws, pcm);
+          await streamPCMRealtime(ws, tmpMp3, false);
 
           fs.unlinkSync(tmpMp3);
 
@@ -514,29 +560,14 @@ Rules:
 
     ws.on("close", () => {
       console.log("ESP32 disconnected");
+      clearInterval(keepAliveInterval);
       audioChunks = [];
       isProcessing = false;
     });
 
     ws.on("error", (err) => {
       console.error("[WS] Error:", err);
-    });
-
-    // V52: Mas frequent ping para stable connection
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === ws.OPEN) {
-        ws.ping();
-        if (Date.now() - lastPongTime > 45000) {
-          console.log("[WS] No pong received, closing connection");
-          ws.terminate();
-        }
-      } else {
-        clearInterval(pingInterval);
-      }
-    }, 8000);
-
-    ws.on("pong", () => {
-      lastPongTime = Date.now();
+      clearInterval(keepAliveInterval);
     });
   });
 
