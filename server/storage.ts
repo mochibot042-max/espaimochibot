@@ -13,41 +13,53 @@ export async function pushSchema() {
   try {
     console.log("[DB] Checking schema...");
     
-    // Try to query users table to check if schema exists
+    // Test if schema exists by querying users
     await db.select().from(users).limit(1);
     console.log("[DB] Schema already exists");
-  } catch (e) {
-    console.log("[DB] Schema not found, pushing...");
+  } catch (e: any) {
+    console.log("[DB] Schema not found, creating tables...");
     
-    // Create tables manually using raw SQL
+    // Create users table
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
-        created_at TIMESTAMP DEFAULT NOW()
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `);
     
+    // Create conversations table
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS conversations (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         role TEXT NOT NULL,
         content TEXT NOT NULL,
-        timestamp TIMESTAMP DEFAULT NOW()
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `);
     
+    // Create user_preferences table
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS user_preferences (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         key TEXT NOT NULL,
-        value TEXT NOT NULL
+        value TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `);
     
-    console.log("[DB] Schema pushed successfully");
+    // Create indexes for performance
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);
+    `);
+    
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
+    `);
+    
+    console.log("[DB] Schema created successfully");
   }
 }
 
@@ -75,8 +87,6 @@ export const storage = {
   async deleteUser(name: string) {
     const user = await this.getUserByName(name);
     if (!user) return false;
-    await db.delete(conversations).where(eq(conversations.userId, user.id));
-    await db.delete(userPreferences).where(eq(userPreferences.userId, user.id));
     await db.delete(users).where(eq(users.id, user.id));
     return true;
   },
@@ -90,12 +100,12 @@ export const storage = {
       content,
     });
 
-    // FIFO: Keep only latest 10
+    // FIFO: Keep only latest 10 messages
     const allMessages = await db
       .select()
       .from(conversations)
       .where(eq(conversations.userId, userId))
-      .orderBy(asc(conversations.timestamp));
+      .orderBy(asc(conversations.createdAt));
 
     if (allMessages.length > 10) {
       const toDelete = allMessages.length - 10;
@@ -112,7 +122,7 @@ export const storage = {
       .select()
       .from(conversations)
       .where(eq(conversations.userId, userId))
-      .orderBy(asc(conversations.timestamp))
+      .orderBy(asc(conversations.createdAt))
       .limit(10);
 
     return messages.map(m => ({
