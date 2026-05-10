@@ -20,17 +20,20 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V8: MATCH ESP - 16kHz, LARGER CHUNKS, SLOWER DELIVERY
+// V9: HOTSPOT SURVIVAL - BURST MODE + SLOW STEADY STREAM
 // ============================================================================
 const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 1024;      // MATCH ESP PLAYBACK_CHUNK_SIZE
-const CHUNK_DELAY_MS = 64;    // SLOWER: ~15 chunks/sec for mobile
 
-// Calculate: 16000Hz * 2 bytes * 0.064s = 2048 bytes per 64ms
-// CHUNK_SIZE 1024 = 32ms of audio, sent every 64ms = 2x safety margin
+// BURST MODE: Send 4x chunks together, then longer gap
+// This handles hotspot jitter better than steady small chunks
+const CHUNK_SIZE = 1024;        // 64ms of audio @ 16kHz
+const BURST_COUNT = 4;          // 4 chunks per burst = 256ms
+const BURST_INTERVAL_MS = 350;  // Send burst every 350ms (90ms safety margin)
+
+// Total: 256ms audio every 350ms = 73% duty cycle = plenty of headroom
 
 // ============================================================================
-// PCM GENERATOR - 16kHz
+// PCM GENERATOR
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -40,7 +43,7 @@ async function generatePCM(input: string): Promise<Buffer> {
         "highpass=f=80",
         "lowpass=f=8000",
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "volume=0.9",           // Slightly reduced to prevent clipping
+        "volume=0.85",          // Conservative to prevent clipping
         "dynaudnorm=p=0.95:g=15"
       ])
       .audioCodec("pcm_s16le")
@@ -58,44 +61,55 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM PCM - SLOWER FOR MOBILE
+// BURST STREAM: Send groups of chunks for hotspot stability
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   
   const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
+  const totalBursts = Math.ceil(totalChunks / BURST_COUNT);
+  
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   
-  // LONGER prep time: let ESP fill buffer
-  await new Promise(r => setTimeout(r, 500));
+  // VERY LONG prep time: let ESP build huge buffer
+  await new Promise(r => setTimeout(r, 1000));
   ws.send("START_RESPONSE");
   
   let seq = 0;
-  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
+  
+  for (let burst = 0; burst < totalBursts; burst++) {
     if (ws.readyState !== ws.OPEN) return;
     
-    const chunk = pcm.subarray(i, i + CHUNK_SIZE);
-    const packet = Buffer.allocUnsafe(2 + chunk.length);
-    packet.writeUInt16BE(seq & 0xFFFF, 0);
-    packet.set(chunk, 2);
-    
-    try {
-      ws.send(packet, { binary: true });
-    } catch (e) {
-      console.error("[STREAM] Send failed:", e);
-      return;
+    // Send BURST_COUNT chunks immediately (back-to-back)
+    for (let c = 0; c < BURST_COUNT; c++) {
+      const idx = burst * BURST_COUNT + c;
+      if (idx >= totalChunks) break;
+      
+      const offset = idx * CHUNK_SIZE;
+      const chunk = pcm.subarray(offset, offset + CHUNK_SIZE);
+      const packet = Buffer.allocUnsafe(2 + chunk.length);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      packet.set(chunk, 2);
+      
+      try {
+        ws.send(packet, { binary: true });
+      } catch (e) {
+        console.error("[STREAM] Send failed:", e);
+        return;
+      }
+      seq++;
     }
     
-    seq++;
-    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+    // Wait before next burst
+    await new Promise(r => setTimeout(r, BURST_INTERVAL_MS));
   }
   
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks, " + pcm.length + " bytes");
+  console.log("[STREAM] Sent " + seq + " chunks in " + totalBursts + " bursts");
 }
 
 // ============================================================================
-// PROCESS UPLOADED WAV
+// PROCESS
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
@@ -117,7 +131,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     fs.writeFileSync(wavPath, audioBuffer);
     console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes");
 
-    // STT (WAV is already 16kHz from ESP)
+    // STT
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(wavPath),
@@ -145,7 +159,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
           { role: "system", content: "You are a helpful voice assistant. Keep responses short and natural. Return JSON: {\"text\":\"your response\"}" },
           { role: "user", content: userText }
         ],
-        max_tokens: 120,
+        max_tokens: 100,        // SHORTER for faster response
         temperature: 0.7
       }),
       new Promise<never>((_, reject) =>
@@ -174,14 +188,14 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
     await tts.ttsPromise(text, mp3, {
       voice: "en-US-AriaNeural",
-      rate: "+10%"
+      rate: "+15%"            // Faster for hotspot
     });
 
-    // Generate 16kHz PCM
+    // PCM
     const pcm = await generatePCM(mp3);
     console.log("[TTS] PCM:", pcm.length, "bytes @", SAMPLE_RATE, "Hz");
 
-    // Stream back
+    // Burst stream
     await streamPCM(ws, pcm);
 
     // Cleanup
@@ -210,7 +224,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V8 Mobile");
+    console.log("ESP connected - V9 Hotspot");
 
     let processing = false;
 
