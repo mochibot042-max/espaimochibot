@@ -27,6 +27,25 @@ const CHUNK_SIZE = 512;
 const SEND_INTERVAL_MS = 16;
 
 // ============================================================================
+// DEBOUNCE & DEDUPLICATION
+// ============================================================================
+const RECENT_REQUESTS = new Map<number, number>(); // userId -> timestamp
+const DEBOUNCE_MS = 3000; // 3 seconds cooldown per user
+
+function isDuplicate(userId: number): boolean {
+  const now = Date.now();
+  const last = RECENT_REQUESTS.get(userId);
+  
+  if (last && (now - last) < DEBOUNCE_MS) {
+    console.log("[DEBOUNCE] Duplicate request blocked for user:", userId);
+    return true;
+  }
+  
+  RECENT_REQUESTS.set(userId, now);
+  return false;
+}
+
+// ============================================================================
 // NAME DETECTION
 // ============================================================================
 function extractName(text: string): { action: "save" | "delete" | "none"; name: string | null } {
@@ -72,7 +91,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 // PCM GENERATION
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
+  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   
   return new Promise((resolve, reject) => {
     ffmpeg(input)
@@ -99,13 +118,17 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM PCM
+// STREAM PCM WITH SEQUENCE TRACKING
 // ============================================================================
-async function streamPCM(ws: WebSocket, pcm: Buffer) {
+async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
   
   const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
   const totalChunks = alignedLen / CHUNK_SIZE;
+  
+  // Send session ID to prevent duplicate playback on client
+  ws.send("SESSION:" + sessionId);
+  await new Promise(r => setTimeout(r, 50));
   
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await new Promise(r => setTimeout(r, 200));
@@ -133,14 +156,23 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   }
   
   await new Promise(r => setTimeout(r, 200));
-  ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks");
+  ws.send("FINISH_RESPONSE:" + sessionId);
+  console.log("[STREAM] Sent " + seq + " chunks, session:", sessionId);
 }
 
 // ============================================================================
-// PROCESS WITH MEMORY
+// PROCESS WITH MEMORY & DEDUPLICATION
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: number) {
+  // DEDUPLICATION CHECK
+  if (isDuplicate(userId)) {
+    ws.send("ERROR:PROCESSING_BUSY");
+    return;
+  }
+
+  // ATOMIC PROCESSING FLAG
+  let processingComplete = false;
+
   try {
     if (audioBuffer.length < 1000) {
       ws.send("ERROR:AUDIO_TOO_SHORT");
@@ -154,10 +186,11 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
       return;
     }
 
-    const id = Date.now();
-    const wavPath = path.join(UPLOAD_DIR, id + ".wav");
+    // UNIQUE FILENAME TO PREVENT CONFLICTS
+    const uniqueId = Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+    const wavPath = path.join(UPLOAD_DIR, uniqueId + ".wav");
     fs.writeFileSync(wavPath, audioBuffer);
-    console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes");
+    console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes, ID:", uniqueId);
 
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
@@ -236,18 +269,21 @@ Return JSON: {"text":"your response"}`;
     await storage.addMessage(userId, "user", userText);
     await storage.addMessage(userId, "assistant", text);
 
-    // TTS
+    // TTS WITH UNIQUE FILENAME
     const tts = new EdgeTTS();
-    const mp3 = path.join(AUDIO_DIR, id + ".mp3");
+    const mp3 = path.join(AUDIO_DIR, uniqueId + ".mp3");
     await tts.ttsPromise(text, mp3, {
       voice: "en-US-AriaNeural",
       rate: "+15%"
     });
 
     const pcm = await generatePCM(mp3);
-    console.log("[TTS] PCM:", pcm.length, "bytes");
+    console.log("[TTS] PCM:", pcm.length, "bytes, ID:", uniqueId);
 
-    await streamPCM(ws, pcm);
+    // STREAM WITH UNIQUE SESSION ID
+    await streamPCM(ws, pcm, uniqueId);
+
+    processingComplete = true;
 
     // Cleanup
     try {
@@ -258,6 +294,13 @@ Return JSON: {"text":"your response"}`;
   } catch (e: any) {
     console.error("[PROCESS] Error:", e.message);
     ws.send("ERROR:" + (e.message || "UNKNOWN"));
+  } finally {
+    // Clear from recent requests after longer delay
+    if (processingComplete) {
+      setTimeout(() => {
+        RECENT_REQUESTS.delete(userId);
+      }, DEBOUNCE_MS);
+    }
   }
 }
 
@@ -268,17 +311,13 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   // AUTO PUSH SCHEMA ON STARTUP
   try {
     await pushSchema();
-    
-    // Verify schema was created
     const isValid = await verifySchema();
     if (!isValid) {
       throw new Error("Schema verification failed");
     }
-    
     console.log("[SERVER] Database ready");
   } catch (e: any) {
     console.error("[SERVER] Database init failed:", e.message);
-    // Continue running - baka may existing tables na
   }
 
   const wss = new WebSocketServer({
@@ -293,17 +332,20 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
     let processing = false;
     let currentUserId: number | null = null;
+    let messageCount = 0;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
+      messageCount++;
+      const currentMsgNum = messageCount;
+      
       if (!isBinary) {
         const msg = data.toString();
-        console.log("[WS] TEXT:", msg);
+        console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
         
         if (msg === "READY") {
           console.log("[WS] ESP ready");
         }
         
-        // User identification
         if (msg.startsWith("USER:")) {
           const userName = msg.replace("USER:", "").trim();
           try {
@@ -320,10 +362,16 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         return;
       }
 
+      console.log("[WS] BINARY #" + currentMsgNum + ":", Buffer.from(data).length, "bytes");
+
+      // STRICT PROCESSING CHECK
       if (processing) {
-        console.log("[UPLOAD] Busy");
+        console.log("[UPLOAD] Busy - rejecting message #" + currentMsgNum);
+        ws.send("ERROR:PROCESSING_BUSY");
         return;
       }
+
+      processing = true;
 
       // Auto-create anonymous user if none
       if (!currentUserId) {
@@ -333,23 +381,27 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         } catch (e: any) {
           console.error("[USER] Anon error:", e.message);
           ws.send("ERROR:DB_FAILED");
+          processing = false;
           return;
         }
       }
 
       const audioBuffer = Buffer.from(data);
-      console.log("[UPLOAD] WAV:", audioBuffer.length, "bytes");
+      console.log("[UPLOAD] WAV #" + currentMsgNum + ":", audioBuffer.length, "bytes");
 
-      processing = true;
-      processAndRespond(ws, audioBuffer, currentUserId).finally(() => {
+      try {
+        await processAndRespond(ws, audioBuffer, currentUserId);
+      } finally {
         processing = false;
-      });
+        console.log("[UPLOAD] Done processing message #" + currentMsgNum);
+      }
     });
 
     ws.on("close", () => {
       console.log("ESP disconnected");
       processing = false;
       currentUserId = null;
+      messageCount = 0;
     });
 
     ws.on("error", (err) => {
