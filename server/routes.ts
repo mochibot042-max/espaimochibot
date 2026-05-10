@@ -25,16 +25,20 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V40: 16kHz Stable Stream ---------------- */
+/* ---------------- CONFIG - V41: NATURAL SPEECH PACING ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 16000;        // BABA SA 16kHz
+const TARGET_SAMPLE_RATE = 16000;        // 16kHz stable
 const SILENCE_MS = 400;
-const CHUNK_SIZE = 2048;                  // MAS MALAKING CHUNK
+const CHUNK_SIZE = 2048;                  // 2048 bytes = 64ms @ 16kHz mono 16bit
 
-const INITIAL_CHUNK_DELAY_MS = 8;         // MAS MABILIS NA START
-const FAST_CHUNK_DELAY_MS = 5;           // MABILIS NA BURST
-const NORMAL_CHUNK_DELAY_MS = 8;         // NORMAL PACING
-const MUSIC_CHUNK_DELAY_MS = 12;          // MUSIC PACING
+// V41: NATURAL PACING - Hindi masyadong mabilis
+// 2048 bytes @ 16kHz 16bit mono = 64ms of audio
+// Delay should be SLIGHTLY LESS than audio duration para may small buffer
+const INITIAL_CHUNK_DELAY_MS = 45;        // Unang 20 chunks - mabilis pero hindi sobra
+const NORMAL_CHUNK_DELAY_MS = 58;         // Normal - mas bagal para natural
+const MUSIC_CHUNK_DELAY_MS = 55;          // Music - consistent lang
+
+const PREBUFFER_CHUNKS = 5;               // Ilang chunks ang i-pre-send bago mag-start
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -79,7 +83,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V40: REAL-TIME PCM STREAM - 16kHz FIXED ---------------- */
+/* ---------------- V41: REAL-TIME PCM STREAM - NATURAL PACING ---------------- */
 async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
   if (ws.readyState !== ws.OPEN) return;
 
@@ -95,26 +99,27 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       "pipe:1"
     ]);
 
-    // V40: Send PREPARE immediately
+    // Send PREPARE immediately
     ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
     
     let isActive = true;
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let hasStarted = false;
+    let prebufferAccumulated = 0;
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       
-      // V40: Send START immediately pag may data na (hindi na naghihintay ng READY mula ESP32)
-      if (!hasStarted) {
-        await new Promise(r => setTimeout(r, 50)); // Minimal delay lang
+      buffer = Buffer.concat([buffer, chunk]);
+      
+      // V41: Pre-buffering sa server side - iipunin muna ng konti bago mag-start
+      if (!hasStarted && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
+        await new Promise(r => setTimeout(r, 100)); // Small setup delay
         ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
         hasStarted = true;
-        console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent`);
+        console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent (prebuffer: ${PREBUFFER_CHUNKS} chunks)`);
       }
-      
-      buffer = Buffer.concat([buffer, chunk]);
       
       while (buffer.length >= CHUNK_SIZE && isActive) {
         if (ws.readyState !== ws.OPEN) {
@@ -133,9 +138,9 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
           ws.send(packet, { binary: true });
           seq++;
           
-          // V40: Mas aggressive na pacing para hindi choppy
-          const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
-                       seq < 80 ? FAST_CHUNK_DELAY_MS : 
+          // V41: CONSISTENT NATURAL PACING
+          // 2048 bytes = 64ms audio. Delay = 58ms = slight buffer build-up
+          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
                        isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
@@ -159,8 +164,8 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
         seq++;
       }
       
-      // V40: MAS MARAMING SILENCE PACKETS para sure na hindi abrupt ang end
-      const silencePackets = isMusic ? 40 : 80;
+      // V41: MAS MARAMING SILENCE PACKETS para smooth end
+      const silencePackets = isMusic ? 50 : 100;
       for (let i = 0; i < silencePackets; i++) {
         if (ws.readyState !== ws.OPEN) break;
         const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
@@ -239,7 +244,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     ]);
 
     ws.send("PREPARE_MUSIC:0");
-    await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 100));
     ws.send("START_MUSIC");
 
     let buffer = Buffer.alloc(0);
@@ -268,9 +273,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
           ws.send(packet, { binary: true });
           seq++;
           
-          const delay = seq < 30 ? INITIAL_CHUNK_DELAY_MS : 
-                       seq < 80 ? FAST_CHUNK_DELAY_MS : 
-                       MUSIC_CHUNK_DELAY_MS;
+          const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : MUSIC_CHUNK_DELAY_MS;
           
           await new Promise(r => setTimeout(r, delay));
         } catch (e) {
@@ -293,7 +296,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       }
       
       const sendSilence = async () => {
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 50; i++) {
           if (ws.readyState !== ws.OPEN) break;
           const silencePacket = Buffer.allocUnsafe(2 + CHUNK_SIZE);
           silencePacket.writeUInt16BE((seq + i) & 0xFFFF, 0);
@@ -353,7 +356,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V40 16kHz Stable");
+    console.log("ESP32 connected - V41 Natural Speech");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
