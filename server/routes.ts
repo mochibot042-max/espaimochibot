@@ -20,31 +20,39 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V5: REAL-TIME STREAMING SETTINGS
+// V6: FILE UPLOAD SETTINGS
 // ============================================================================
 const SAMPLE_RATE = 44100;
 const CHUNK_SIZE = 2048;
 const CHUNK_DELAY_MS = 23;
 
 // ============================================================================
-// WAV HEADER
+// STREAM PCM BACK TO ESP (unchanged - still streaming for playback)
 // ============================================================================
-function wavHeader(len: number): Buffer {
-  const b = Buffer.alloc(44);
-  b.write("RIFF", 0);
-  b.writeUInt32LE(36 + len, 4);
-  b.write("WAVE", 8);
-  b.write("fmt ", 12);
-  b.writeUInt32LE(16, 16);
-  b.writeUInt16LE(1, 20);
-  b.writeUInt16LE(1, 22);
-  b.writeUInt32LE(SAMPLE_RATE, 24);
-  b.writeUInt32LE(SAMPLE_RATE * 2, 28);
-  b.writeUInt16LE(2, 32);
-  b.writeUInt16LE(16, 34);
-  b.write("data", 36);
-  b.writeUInt32LE(len, 40);
-  return b;
+async function streamPCM(ws: WebSocket, pcm: Buffer) {
+  if (ws.readyState !== ws.OPEN) return;
+  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
+  ws.send("PREPARE_RESPONSE:" + totalChunks);
+  await new Promise(r => setTimeout(r, 200));
+  ws.send("START_RESPONSE");
+  let seq = 0;
+  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
+    if (ws.readyState !== ws.OPEN) return;
+    const chunk = pcm.subarray(i, i + CHUNK_SIZE);
+    const packet = Buffer.allocUnsafe(2 + chunk.length);
+    packet.writeUInt16BE(seq & 0xFFFF, 0);
+    packet.set(chunk, 2);
+    try {
+      ws.send(packet, { binary: true });
+    } catch (e) {
+      console.error("[STREAM] Send failed:", e);
+      return;
+    }
+    seq++;
+    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+  }
+  ws.send("FINISH_RESPONSE");
+  console.log("[STREAM] Sent " + seq + " chunks, total " + pcm.length + " bytes");
 }
 
 // ============================================================================
@@ -76,52 +84,33 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM PCM BACK TO ESP
-// ============================================================================
-async function streamPCM(ws: WebSocket, pcm: Buffer) {
-  if (ws.readyState !== ws.OPEN) return;
-  const totalChunks = Math.ceil(pcm.length / CHUNK_SIZE);
-  ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 200));
-  ws.send("START_RESPONSE");
-  let seq = 0;
-  for (let i = 0; i < pcm.length; i += CHUNK_SIZE) {
-    if (ws.readyState !== ws.OPEN) return;
-    const chunk = pcm.subarray(i, i + CHUNK_SIZE);
-    const packet = Buffer.allocUnsafe(2 + chunk.length);
-    packet.writeUInt16BE(seq & 0xFFFF, 0);
-    chunk.copy(packet, 2);
-    try {
-      ws.send(packet, { binary: true });
-    } catch (e) {
-      console.error("[STREAM] Send failed:", e);
-      return;
-    }
-    seq++;
-    await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
-  }
-  ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks, total " + pcm.length + " bytes");
-}
-
-// ============================================================================
-// V5: PROCESS AUDIO AND RESPOND
+// V6: PROCESS UPLOADED WAV FILE
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
   try {
-    if (audioBuffer.length < 800) {
+    // Check minimum size (WAV header + some data)
+    if (audioBuffer.length < 1000) {
       ws.send("ERROR:AUDIO_TOO_SHORT");
+      return;
+    }
+
+    // Validate WAV header
+    const riff = audioBuffer.slice(0, 4).toString();
+    const wave = audioBuffer.slice(8, 12).toString();
+    if (riff !== "RIFF" || wave !== "WAVE") {
+      console.error("[UPLOAD] Invalid WAV header:", riff, wave);
+      ws.send("ERROR:INVALID_AUDIO_FORMAT");
       return;
     }
 
     const id = Date.now();
     const wavPath = path.join(UPLOAD_DIR, id + ".wav");
 
-    fs.writeFileSync(wavPath, Buffer.concat([
-      wavHeader(audioBuffer.length),
-      audioBuffer
-    ]));
+    // Save the uploaded WAV directly (no need to rebuild)
+    fs.writeFileSync(wavPath, audioBuffer);
+    console.log("[UPLOAD] Saved WAV:", audioBuffer.length, "bytes");
 
+    // Resample to 16kHz for STT
     const resampled = path.join(UPLOAD_DIR, id + "_16k.wav");
     await new Promise<void>((res, rej) => {
       ffmpeg(wavPath)
@@ -133,6 +122,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
         .save(resampled);
     });
 
+    // STT
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(resampled),
@@ -151,6 +141,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("USER:", userText);
 
+    // LLM
     const ai = await Promise.race([
       llmClient.chat.completions.create({
         model: "llama-3.3-70b-versatile",
@@ -180,16 +171,19 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       response: text
     });
 
+    // TTS
     const tts = new EdgeTTS();
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
     await tts.ttsPromise(text, mp3, {
       voice: "en-US-AriaNeural"
     });
 
+    // Generate PCM and stream back
     const pcm = await generatePCM(mp3);
     console.log("[TTS] Generated PCM: " + pcm.length + " bytes");
     await streamPCM(ws, pcm);
 
+    // Cleanup
     try {
       fs.unlinkSync(mp3);
       fs.unlinkSync(wavPath);
@@ -205,22 +199,20 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 }
 
 // ============================================================================
-// V5: ROUTES WITH REAL-TIME STREAMING SUPPORT
+// V6: ROUTES WITH FILE UPLOAD SUPPORT
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
     perMessageDeflate: false,
-    maxPayload: 1024 * 1024
+    maxPayload: 1024 * 1024  // 1MB max for file upload
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V5 Real-Time Streaming");
+    console.log("ESP connected - V6 File Upload Mode");
 
-    let chunks: Buffer[] = [];
     let processing = false;
-    let isRecording = false;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       // Handle text messages
@@ -229,62 +221,33 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         console.log("[WS] TEXT:", msg);
 
         if (msg === "READY") {
-          console.log("[WS] ESP ready for streaming");
-          return;
-        }
-
-        // V5: START_STREAM = user started speaking
-        if (msg === "START_STREAM") {
-          console.log("[STREAM] User started speaking");
-          isRecording = true;
-          chunks = [];
-          return;
-        }
-
-        // V5: END_STREAM = user stopped speaking
-        if (msg === "END_STREAM") {
-          if (!isRecording) return;
-          isRecording = false;
-
-          if (processing) return;
-          processing = true;
-
-          console.log("[STREAM] User stopped speaking, processing...");
-
-          // Combine all chunks
-          const audio = Buffer.concat(chunks);
-          chunks = [];
-
-          console.log("[STREAM] Total audio received: " + audio.length + " bytes");
-
-          // Process in background
-          processAndRespond(ws, audio).finally(() => {
-            processing = false;
-          });
-
+          console.log("[WS] ESP ready");
           return;
         }
 
         return;
       }
 
-      // V5: Binary data = streaming audio chunks from ESP
-      if (isRecording) {
-        chunks.push(Buffer.from(data));
-
-        // Optional: Log chunk received
-        if (chunks.length % 10 === 0) {
-          const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-          console.log("[STREAM] Received " + chunks.length + " chunks, " + totalBytes + " bytes");
-        }
+      // V6: Binary data = complete WAV file upload
+      if (processing) {
+        console.log("[UPLOAD] Already processing, ignoring");
+        return;
       }
+
+      const audioBuffer = Buffer.from(data);
+      console.log("[UPLOAD] Received WAV file:", audioBuffer.length, "bytes");
+
+      processing = true;
+
+      // Process in background
+      processAndRespond(ws, audioBuffer).finally(() => {
+        processing = false;
+      });
     });
 
     ws.on("close", () => {
       console.log("ESP disconnected");
-      chunks = [];
       processing = false;
-      isRecording = false;
     });
 
     ws.on("error", (err) => {
