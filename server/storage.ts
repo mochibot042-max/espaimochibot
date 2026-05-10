@@ -10,16 +10,10 @@ export interface Message {
 
 // ========== AUTO PUSH SCHEMA ON STARTUP ==========
 export async function pushSchema() {
+  console.log("[DB] Starting schema push...");
+  
   try {
-    console.log("[DB] Checking schema...");
-    
-    // Test if schema exists by querying users
-    await db.select().from(users).limit(1);
-    console.log("[DB] Schema already exists");
-  } catch (e: any) {
-    console.log("[DB] Schema not found, creating tables...");
-    
-    // Create users table
+    // Create users table first (no dependencies)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -27,8 +21,9 @@ export async function pushSchema() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `);
+    console.log("[DB] users table OK");
     
-    // Create conversations table
+    // Create conversations table (depends on users)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS conversations (
         id SERIAL PRIMARY KEY,
@@ -38,8 +33,9 @@ export async function pushSchema() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `);
+    console.log("[DB] conversations table OK");
     
-    // Create user_preferences table
+    // Create user_preferences table (depends on users)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS user_preferences (
         id SERIAL PRIMARY KEY,
@@ -49,17 +45,30 @@ export async function pushSchema() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `);
+    console.log("[DB] user_preferences table OK");
     
-    // Create indexes for performance
-    await db.execute(sql`
-      CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);
-    `);
+    // Create indexes
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_preferences_user_key ON user_preferences(user_id, key);`);
+    console.log("[DB] indexes OK");
     
-    await db.execute(sql`
-      CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
-    `);
-    
-    console.log("[DB] Schema created successfully");
+    console.log("[DB] Schema push completed successfully");
+  } catch (e: any) {
+    console.error("[DB] Schema push failed:", e.message);
+    throw e;
+  }
+}
+
+// ========== VERIFY SCHEMA EXISTS ==========
+export async function verifySchema(): Promise<boolean> {
+  try {
+    await db.select().from(users).limit(1);
+    await db.select().from(conversations).limit(1);
+    await db.select().from(userPreferences).limit(1);
+    return true;
+  } catch {
+    return false;
   }
 }
 
