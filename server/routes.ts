@@ -20,16 +20,16 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V11: MATCH ESP - 16kHz, CHUNKS ALIGNED TO DMA
+// V12: MATCH PCM5102A - 16kHz, 1024 sample chunks
 // ============================================================================
 const SAMPLE_RATE = 16000;
 
-// Match ESP DMA: 512 samples * 2 bytes = 1024 bytes per buffer
-const CHUNK_SIZE = 1024;
+// Match ESP DMA: 1024 samples * 2 bytes = 2048 bytes
+const CHUNK_SIZE = 2048;
 
-// Send every 32ms (match DMA buffer duration)
-// 512 samples / 16000 Hz = 32ms
-const SEND_INTERVAL_MS = 32;
+// 1024 samples / 16000 = 64ms per chunk
+// Send every 58ms (slightly faster than real-time to keep buffer filled)
+const SEND_INTERVAL_MS = 58;
 
 // ============================================================================
 // PCM GENERATOR - EXPLICIT MONO 16kHz
@@ -42,7 +42,7 @@ async function generatePCM(input: string): Promise<Buffer> {
         "highpass=f=80",
         "lowpass=f=8000",
         "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "aformat=sample_fmts=s16:channel_layouts=mono",  // EXPLICIT mono 16-bit
+        "aformat=sample_fmts=s16:channel_layouts=mono",
         "volume=0.85",
         "dynaudnorm=p=0.95:g=15"
       ])
@@ -61,20 +61,21 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM - ALIGNED TO DMA BUFFERS
+// STREAM - STEADY 58ms INTERVALS
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
   
-  // Ensure PCM length is multiple of CHUNK_SIZE
+  // Align to chunk size
   const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
   const totalChunks = alignedLen / CHUNK_SIZE;
   
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300));
+  await new Promise(r => setTimeout(r, 500));  // Longer prep for jitter buffer
   ws.send("START_RESPONSE");
   
   let seq = 0;
+  let nextSendTime = Date.now() + SEND_INTERVAL_MS;
   
   for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
@@ -92,11 +93,18 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     }
     
     seq++;
-    await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
+    
+    // Precise timing
+    const now = Date.now();
+    const wait = nextSendTime - now;
+    if (wait > 0) {
+      await new Promise(r => setTimeout(r, wait));
+    }
+    nextSendTime += SEND_INTERVAL_MS;
   }
   
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks, " + alignedLen + " bytes");
+  console.log("[STREAM] Sent " + seq + " chunks steadily");
 }
 
 // ============================================================================
@@ -212,7 +220,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V11");
+    console.log("ESP connected - V12 PCM5102A");
 
     let processing = false;
 
