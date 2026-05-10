@@ -6,7 +6,7 @@ import fs from "fs";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
-import { storage } from "./storage";
+import { storage, pushSchema } from "./storage.js";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
@@ -20,19 +20,18 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V17: MATCH MICRO BUFFER - 16kHz, 256 sample chunks
+// AUDIO CONFIG
 // ============================================================================
 const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 512;  // 256 samples * 2 bytes
-const SEND_INTERVAL_MS = 16;  // 16ms = real-time
+const CHUNK_SIZE = 512;
+const SEND_INTERVAL_MS = 16;
 
 // ============================================================================
-// NAME DETECTION HELPERS
+// NAME DETECTION
 // ============================================================================
 function extractName(text: string): { action: "save" | "delete" | "none"; name: string | null } {
   const lower = text.toLowerCase();
   
-  // Delete patterns
   const deletePatterns = [
     /delete\s+(?:my\s+)?name/i,
     /remove\s+(?:my\s+)?name/i,
@@ -40,6 +39,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
     /clear\s+(?:my\s+)?name/i,
     /wala\s+na\s+ang\s+pangalan\s+ko/i,
     /burahin\s+(?:ang\s+)?pangalan\s+ko/i,
+    /alisin\s+(?:ang\s+)?pangalan\s+ko/i,
   ];
   
   for (const pattern of deletePatterns) {
@@ -48,16 +48,17 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
     }
   }
   
-  // Save patterns
   const savePatterns = [
-    /(?:my\s+name\s+is|i\s+am|call\s+me|ang\s+pangalan\s+ko\s+ay|ako\s+si)\s+([a-zA-Z\s]+)/i,
+    /(?:my\s+name\s+is|i\s+am|call\s+me|i'm)\s+([a-zA-Z\s]+)/i,
     /pangalan\s+ko\s+ay\s+([a-zA-Z\s]+)/i,
+    /ako\s+si\s+([a-zA-Z\s]+)/i,
+    /tawagin\s+mo\s+akong\s+([a-zA-Z\s]+)/i,
   ];
   
   for (const pattern of savePatterns) {
     const match = lower.match(pattern);
     if (match && match[1]) {
-      const name = match[1].trim().split(/\s+/)[0]; // Get first word only
+      const name = match[1].trim().split(/\s+/)[0];
       if (name.length > 1) {
         return { action: "save", name: name.charAt(0).toUpperCase() + name.slice(1) };
       }
@@ -68,7 +69,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// PCM
+// PCM GENERATION
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
@@ -98,7 +99,7 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM
+// STREAM PCM
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
@@ -177,7 +178,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
 
     console.log("USER:", userText);
 
-    // Check for name commands
+    // Check name commands
     const nameAction = extractName(userText);
     let nameResponse = "";
 
@@ -189,13 +190,13 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
       nameResponse = "I've deleted your name from my memory.";
     }
 
-    // Get conversation history (max 10)
+    // Get conversation history
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    // Build messages with system prompt
+    // Build messages
     const systemPrompt = `You are a helpful voice assistant. Keep responses short and natural. 
-${savedName ? `The user's name is ${savedName}.` : ""}
+${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
 Return JSON: {"text":"your response"}`;
 
     const messages: any[] = [
@@ -225,17 +226,17 @@ Return JSON: {"text":"your response"}`;
       text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
     }
 
-    // If name action happened, override response
     if (nameResponse) {
       text = nameResponse;
     }
 
     console.log("AI:", text);
 
-    // Save to conversation history (FIFO, max 10)
+    // Save to DB (FIFO, max 10)
     await storage.addMessage(userId, "user", userText);
     await storage.addMessage(userId, "assistant", text);
 
+    // TTS
     const tts = new EdgeTTS();
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
     await tts.ttsPromise(text, mp3, {
@@ -248,6 +249,7 @@ Return JSON: {"text":"your response"}`;
 
     await streamPCM(ws, pcm);
 
+    // Cleanup
     try {
       fs.unlinkSync(mp3);
       fs.unlinkSync(wavPath);
@@ -263,6 +265,10 @@ Return JSON: {"text":"your response"}`;
 // ROUTES
 // ============================================================================
 export async function registerRoutes(httpServer: Server, app: Express) {
+  // AUTO PUSH SCHEMA ON STARTUP
+  await pushSchema();
+  console.log("[SERVER] Database ready");
+
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws/audio",
@@ -271,7 +277,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V17 Micro with Memory");
+    console.log("ESP connected - Voice AI with Memory");
 
     let processing = false;
     let currentUserId: number | null = null;
@@ -285,7 +291,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           console.log("[WS] ESP ready");
         }
         
-        // Handle user identification via text
+        // User identification
         if (msg.startsWith("USER:")) {
           const userName = msg.replace("USER:", "").trim();
           const user = await storage.getOrCreateUser(userName);
@@ -302,9 +308,9 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         return;
       }
 
-      // Auto-create anonymous user if none set
+      // Auto-create anonymous user if none
       if (!currentUserId) {
-        const anon = await storage.getOrCreateUser("anonymous_" + Date.now());
+        const anon = await storage.getOrCreateUser("anon_" + Date.now());
         currentUserId = anon.id;
       }
 
