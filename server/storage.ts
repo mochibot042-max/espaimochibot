@@ -1,16 +1,54 @@
-import { db } from "./db";
-import { conversations, users, userPreferences } from "./db/schema";
-import { eq, and, asc, desc, sql } from "drizzle-orm";
-
-export interface Interaction {
-  transcript: string;
-  response: string;
-  userId?: number;
-}
+import { db } from "./db/index.js";
+import { conversations, users, userPreferences } from "./db/schema.js";
+import { eq, and, asc } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 
 export interface Message {
   role: "user" | "assistant";
   content: string;
+}
+
+// ========== AUTO PUSH SCHEMA ON STARTUP ==========
+export async function pushSchema() {
+  try {
+    console.log("[DB] Checking schema...");
+    
+    // Try to query users table to check if schema exists
+    await db.select().from(users).limit(1);
+    console.log("[DB] Schema already exists");
+  } catch (e) {
+    console.log("[DB] Schema not found, pushing...");
+    
+    // Create tables manually using raw SQL
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        key TEXT NOT NULL,
+        value TEXT NOT NULL
+      );
+    `);
+    
+    console.log("[DB] Schema pushed successfully");
+  }
 }
 
 export const storage = {
@@ -46,14 +84,13 @@ export const storage = {
   // ========== CONVERSATION MEMORY (MAX 10, FIFO) ==========
   
   async addMessage(userId: number, role: "user" | "assistant", content: string) {
-    // Insert new message
     await db.insert(conversations).values({
       userId,
       role,
       content,
     });
 
-    // Keep only latest 10 messages (FIFO - delete oldest if > 10)
+    // FIFO: Keep only latest 10
     const allMessages = await db
       .select()
       .from(conversations)
@@ -91,7 +128,6 @@ export const storage = {
   // ========== NAME MEMORY (PERSISTENT) ==========
   
   async saveName(userId: number, name: string) {
-    // Delete existing name preference for this user
     await db
       .delete(userPreferences)
       .where(
@@ -132,9 +168,9 @@ export const storage = {
       );
   },
 
-  // ========== LEGACY (for compatibility) ==========
+  // ========== LEGACY ==========
   
-  async createInteraction(data: Interaction) {
+  async createInteraction(data: { transcript: string; response: string; userId?: number }) {
     if (data.userId) {
       await this.addMessage(data.userId, "user", data.transcript);
       await this.addMessage(data.userId, "assistant", data.response);
