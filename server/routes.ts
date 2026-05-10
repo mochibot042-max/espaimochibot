@@ -27,6 +27,47 @@ const CHUNK_SIZE = 512;  // 256 samples * 2 bytes
 const SEND_INTERVAL_MS = 16;  // 16ms = real-time
 
 // ============================================================================
+// NAME DETECTION HELPERS
+// ============================================================================
+function extractName(text: string): { action: "save" | "delete" | "none"; name: string | null } {
+  const lower = text.toLowerCase();
+  
+  // Delete patterns
+  const deletePatterns = [
+    /delete\s+(?:my\s+)?name/i,
+    /remove\s+(?:my\s+)?name/i,
+    /forget\s+(?:my\s+)?name/i,
+    /clear\s+(?:my\s+)?name/i,
+    /wala\s+na\s+ang\s+pangalan\s+ko/i,
+    /burahin\s+(?:ang\s+)?pangalan\s+ko/i,
+  ];
+  
+  for (const pattern of deletePatterns) {
+    if (pattern.test(lower)) {
+      return { action: "delete", name: null };
+    }
+  }
+  
+  // Save patterns
+  const savePatterns = [
+    /(?:my\s+name\s+is|i\s+am|call\s+me|ang\s+pangalan\s+ko\s+ay|ako\s+si)\s+([a-zA-Z\s]+)/i,
+    /pangalan\s+ko\s+ay\s+([a-zA-Z\s]+)/i,
+  ];
+  
+  for (const pattern of savePatterns) {
+    const match = lower.match(pattern);
+    if (match && match[1]) {
+      const name = match[1].trim().split(/\s+/)[0]; // Get first word only
+      if (name.length > 1) {
+        return { action: "save", name: name.charAt(0).toUpperCase() + name.slice(1) };
+      }
+    }
+  }
+  
+  return { action: "none", name: null };
+}
+
+// ============================================================================
 // PCM
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
@@ -96,9 +137,9 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
 }
 
 // ============================================================================
-// PROCESS
+// PROCESS WITH MEMORY
 // ============================================================================
-async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
+async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: number) {
   try {
     if (audioBuffer.length < 1000) {
       ws.send("ERROR:AUDIO_TOO_SHORT");
@@ -136,14 +177,38 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("USER:", userText);
 
+    // Check for name commands
+    const nameAction = extractName(userText);
+    let nameResponse = "";
+
+    if (nameAction.action === "save" && nameAction.name) {
+      await storage.saveName(userId, nameAction.name);
+      nameResponse = `Nice to meet you, ${nameAction.name}! I'll remember your name.`;
+    } else if (nameAction.action === "delete") {
+      await storage.deleteSavedName(userId);
+      nameResponse = "I've deleted your name from my memory.";
+    }
+
+    // Get conversation history (max 10)
+    const history = await storage.getConversationHistory(userId);
+    const savedName = await storage.getSavedName(userId);
+
+    // Build messages with system prompt
+    const systemPrompt = `You are a helpful voice assistant. Keep responses short and natural. 
+${savedName ? `The user's name is ${savedName}.` : ""}
+Return JSON: {"text":"your response"}`;
+
+    const messages: any[] = [
+      { role: "system", content: systemPrompt },
+      ...history.map(h => ({ role: h.role, content: h.content })),
+      { role: "user", content: userText }
+    ];
+
     const ai = await Promise.race([
       llmClient.chat.completions.create({
         model: "llama-3.3-70b-versatile",
-        messages: [
-          { role: "system", content: "You are a helpful voice assistant. Keep responses short and natural. Return JSON: {\"text\":\"your response\"}" },
-          { role: "user", content: userText }
-        ],
-        max_tokens: 100,
+        messages: messages,
+        max_tokens: 150,
         temperature: 0.7
       }),
       new Promise<never>((_, reject) =>
@@ -160,12 +225,16 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
     }
 
+    // If name action happened, override response
+    if (nameResponse) {
+      text = nameResponse;
+    }
+
     console.log("AI:", text);
 
-    await storage.createInteraction({
-      transcript: userText,
-      response: text
-    });
+    // Save to conversation history (FIFO, max 10)
+    await storage.addMessage(userId, "user", userText);
+    await storage.addMessage(userId, "assistant", text);
 
     const tts = new EdgeTTS();
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
@@ -202,17 +271,29 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V17 Micro");
+    console.log("ESP connected - V17 Micro with Memory");
 
     let processing = false;
+    let currentUserId: number | null = null;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT:", msg);
+        
         if (msg === "READY") {
           console.log("[WS] ESP ready");
         }
+        
+        // Handle user identification via text
+        if (msg.startsWith("USER:")) {
+          const userName = msg.replace("USER:", "").trim();
+          const user = await storage.getOrCreateUser(userName);
+          currentUserId = user.id;
+          console.log("[USER] Identified as:", userName, "ID:", user.id);
+          ws.send("USER_CONFIRMED:" + user.name);
+        }
+        
         return;
       }
 
@@ -221,11 +302,17 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         return;
       }
 
+      // Auto-create anonymous user if none set
+      if (!currentUserId) {
+        const anon = await storage.getOrCreateUser("anonymous_" + Date.now());
+        currentUserId = anon.id;
+      }
+
       const audioBuffer = Buffer.from(data);
       console.log("[UPLOAD] WAV:", audioBuffer.length, "bytes");
 
       processing = true;
-      processAndRespond(ws, audioBuffer).finally(() => {
+      processAndRespond(ws, audioBuffer, currentUserId).finally(() => {
         processing = false;
       });
     });
@@ -233,6 +320,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     ws.on("close", () => {
       console.log("ESP disconnected");
       processing = false;
+      currentUserId = null;
     });
 
     ws.on("error", (err) => {
