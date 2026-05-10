@@ -29,8 +29,8 @@ const SEND_INTERVAL_MS = 16;
 // ============================================================================
 // DEBOUNCE & DEDUPLICATION
 // ============================================================================
-const RECENT_REQUESTS = new Map<number, number>(); // userId -> timestamp
-const DEBOUNCE_MS = 3000; // 3 seconds cooldown per user
+const RECENT_REQUESTS = new Map<number, number>();
+const DEBOUNCE_MS = 3000;
 
 function isDuplicate(userId: number): boolean {
   const now = Date.now();
@@ -118,59 +118,87 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// STREAM PCM WITH SEQUENCE TRACKING
+// STREAM PCM WITH GUARANTEED END SIGNAL
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
-  if (ws.readyState !== ws.OPEN) return;
+  if (ws.readyState !== ws.OPEN) {
+    console.log("[STREAM] WebSocket not open, aborting");
+    return;
+  }
   
   const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
   const totalChunks = alignedLen / CHUNK_SIZE;
   
-  // Send session ID to prevent duplicate playback on client
-  ws.send("SESSION:" + sessionId);
-  await new Promise(r => setTimeout(r, 50));
+  console.log("[STREAM] Starting session:", sessionId, "chunks:", totalChunks);
   
+  // Send session start
+  ws.send("SESSION:" + sessionId);
+  await new Promise(r => setTimeout(r, 100));
+  
+  // Send prepare
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 200));
+  await new Promise(r => setTimeout(r, 300));
+  
+  // Send start
   ws.send("START_RESPONSE");
+  await new Promise(r => setTimeout(r, 100));
   
   let seq = 0;
+  let lastSendTime = Date.now();
   
-  for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
-    if (ws.readyState !== ws.OPEN) return;
-    
-    const chunk = pcm.subarray(i, i + CHUNK_SIZE);
-    const packet = Buffer.allocUnsafe(2 + chunk.length);
-    packet.writeUInt16BE(seq & 0xFFFF, 0);
-    packet.set(chunk, 2);
-    
-    try {
+  try {
+    for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
+      if (ws.readyState !== ws.OPEN) {
+        console.log("[STREAM] WebSocket closed mid-stream");
+        return;
+      }
+      
+      const chunk = pcm.subarray(i, i + CHUNK_SIZE);
+      const packet = Buffer.allocUnsafe(2 + chunk.length);
+      packet.writeUInt16BE(seq & 0xFFFF, 0);
+      packet.set(chunk, 2);
+      
       ws.send(packet, { binary: true });
-    } catch (e) {
-      console.error("[STREAM] Send failed:", e);
-      return;
+      
+      seq++;
+      lastSendTime = Date.now();
+      
+      // Adaptive delay
+      await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
     }
     
-    seq++;
-    await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
+    // Wait a bit after last chunk
+    await new Promise(r => setTimeout(r, 500));
+    
+    // Send finish with multiple retries
+    for (let retry = 0; retry < 3; retry++) {
+      if (ws.readyState === ws.OPEN) {
+        ws.send("FINISH_RESPONSE:" + sessionId);
+        console.log("[STREAM] Sent FINISH_RESPONSE attempt", retry + 1);
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+    
+    console.log("[STREAM] Completed session:", sessionId, "sent", seq, "chunks");
+    
+  } catch (e: any) {
+    console.error("[STREAM] Error:", e.message);
+    // Try to send finish even on error
+    try {
+      ws.send("FINISH_RESPONSE:" + sessionId);
+    } catch {}
   }
-  
-  await new Promise(r => setTimeout(r, 200));
-  ws.send("FINISH_RESPONSE:" + sessionId);
-  console.log("[STREAM] Sent " + seq + " chunks, session:", sessionId);
 }
 
 // ============================================================================
 // PROCESS WITH MEMORY & DEDUPLICATION
 // ============================================================================
 async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: number) {
-  // DEDUPLICATION CHECK
   if (isDuplicate(userId)) {
     ws.send("ERROR:PROCESSING_BUSY");
     return;
   }
 
-  // ATOMIC PROCESSING FLAG
   let processingComplete = false;
 
   try {
@@ -186,7 +214,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
       return;
     }
 
-    // UNIQUE FILENAME TO PREVENT CONFLICTS
     const uniqueId = Date.now() + "_" + Math.random().toString(36).slice(2, 8);
     const wavPath = path.join(UPLOAD_DIR, uniqueId + ".wav");
     fs.writeFileSync(wavPath, audioBuffer);
@@ -294,8 +321,12 @@ Return JSON: {"text":"your response"}`;
   } catch (e: any) {
     console.error("[PROCESS] Error:", e.message);
     ws.send("ERROR:" + (e.message || "UNKNOWN"));
+    
+    // Send finish on error to unlock client
+    try {
+      ws.send("FINISH_RESPONSE:ERROR");
+    } catch {}
   } finally {
-    // Clear from recent requests after longer delay
     if (processingComplete) {
       setTimeout(() => {
         RECENT_REQUESTS.delete(userId);
@@ -344,6 +375,8 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         
         if (msg === "READY") {
           console.log("[WS] ESP ready");
+          // Send idle confirmation
+          ws.send("STATE:IDLE");
         }
         
         if (msg.startsWith("USER:")) {
