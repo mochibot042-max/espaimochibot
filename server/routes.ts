@@ -20,69 +20,49 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// V14: 500ms SILENCE TAIL + FADE OUT
+// V15: SLOWER PACE - Prevent ESP32 buffer overflow/underrun
 // ============================================================================
 const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 2048;
-const SEND_INTERVAL_MS = 58;
 
-// 500ms silence tail = 8000 samples = 16000 bytes
-const SILENCE_TAIL_MS = 500;
-const SILENCE_TAIL_BYTES = (SAMPLE_RATE * 2 * SILENCE_TAIL_MS) / 1000;  // 16000
+// Match ESP DMA: 256 samples * 2 bytes = 512 bytes
+const CHUNK_SIZE = 512;
+
+// 256 samples / 16000 = 16ms per chunk
+// Send every 14ms (slightly faster than real-time to keep buffer filled)
+const SEND_INTERVAL_MS = 14;
 
 // ============================================================================
-// PCM WITH SILENCE TAIL AND FADE
+// PCM GENERATOR
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "proc_" + Date.now() + ".pcm");
+  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + ".pcm");
   
   return new Promise((resolve, reject) => {
-    // Get duration first
-    ffmpeg.ffprobe(input, (err, metadata) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      
-      const duration = metadata.format.duration || 5.0;
-      const fadeStart = Math.max(0, duration - 0.3);  // Fade out last 300ms
-      
-      ffmpeg(input)
-        .audioFilters([
-          "highpass=f=80",
-          "lowpass=f=8000",
-          "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-          "aformat=sample_fmts=s16:channel_layouts=mono",
-          // Fade in 50ms
-          "afade=t=in:ss=0:d=0.05",
-          // Fade out 300ms (smooth ending)
-          "afade=t=out:st=" + fadeStart + ":d=0.3",
-          "dynaudnorm=p=0.95:g=15",
-          "volume=0.85"
-        ])
-        .audioCodec("pcm_s16le")
-        .audioChannels(1)
-        .audioFrequency(SAMPLE_RATE)
-        .format("s16le")
-        .on("error", reject)
-        .on("end", () => {
-          const rawPCM = fs.readFileSync(tmp);
-          fs.unlinkSync(tmp);
-          
-          // Add 500ms silence tail (prevents cut-off hiss)
-          const silence = Buffer.alloc(SILENCE_TAIL_BYTES, 0);
-          const finalPCM = Buffer.concat([rawPCM, silence]);
-          
-          console.log("[PCM] Raw: " + rawPCM.length + " + tail: " + silence.length + " = " + finalPCM.length);
-          resolve(finalPCM);
-        })
-        .save(tmp);
-    });
+    ffmpeg(input)
+      .audioFilters([
+        "highpass=f=80",
+        "lowpass=f=8000",
+        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+        "aformat=sample_fmts=s16:channel_layouts=mono",
+        "volume=0.85",
+        "dynaudnorm=p=0.95:g=15"
+      ])
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(SAMPLE_RATE)
+      .format("s16le")
+      .on("error", reject)
+      .on("end", () => {
+        const pcm = fs.readFileSync(tmp);
+        fs.unlinkSync(tmp);
+        resolve(pcm);
+      })
+      .save(tmp);
   });
 }
 
 // ============================================================================
-// STREAM
+// STREAM - MATCH ESP DMA EXACTLY
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer) {
   if (ws.readyState !== ws.OPEN) return;
@@ -91,7 +71,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
   const totalChunks = alignedLen / CHUNK_SIZE;
   
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 600));  // Longer prep
+  await new Promise(r => setTimeout(r, 300));
   ws.send("START_RESPONSE");
   
   let seq = 0;
@@ -122,11 +102,11 @@ async function streamPCM(ws: WebSocket, pcm: Buffer) {
     nextSendTime += SEND_INTERVAL_MS;
   }
   
-  // Wait before sending FINISH - ensure all data played
-  await new Promise(r => setTimeout(r, 1000));
+  // Small delay before FINISH to let last data play
+  await new Promise(r => setTimeout(r, 500));
   
   ws.send("FINISH_RESPONSE");
-  console.log("[STREAM] Sent " + seq + " chunks + tail");
+  console.log("[STREAM] Sent " + seq + " chunks");
 }
 
 // ============================================================================
@@ -151,7 +131,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
     fs.writeFileSync(wavPath, audioBuffer);
     console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes");
 
-    // STT
     const stt = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(wavPath),
@@ -171,7 +150,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
 
     console.log("USER:", userText);
 
-    // LLM
     const ai = await Promise.race([
       llmClient.chat.completions.create({
         model: "llama-3.3-70b-versatile",
@@ -203,7 +181,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       response: text
     });
 
-    // TTS
     const tts = new EdgeTTS();
     const mp3 = path.join(AUDIO_DIR, id + ".mp3");
     await tts.ttsPromise(text, mp3, {
@@ -211,14 +188,11 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer) {
       rate: "+15%"
     });
 
-    // PCM with fade + silence tail
     const pcm = await generatePCM(mp3);
     console.log("[TTS] PCM:", pcm.length, "bytes");
 
-    // Stream
     await streamPCM(ws, pcm);
 
-    // Cleanup
     try {
       fs.unlinkSync(mp3);
       fs.unlinkSync(wavPath);
@@ -242,7 +216,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V14 No Hiss");
+    console.log("ESP connected - V15");
 
     let processing = false;
 
