@@ -25,20 +25,17 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V41: NATURAL SPEECH PACING ---------------- */
+/* ---------------- CONFIG - V42: CONNECTION STABILITY ---------------- */
 const DEFAULT_VOLUME = 1.0;
-const TARGET_SAMPLE_RATE = 16000;        // 16kHz stable
+const TARGET_SAMPLE_RATE = 16000;
 const SILENCE_MS = 400;
-const CHUNK_SIZE = 2048;                  // 2048 bytes = 64ms @ 16kHz mono 16bit
+const CHUNK_SIZE = 2048;
 
-// V41: NATURAL PACING - Hindi masyadong mabilis
-// 2048 bytes @ 16kHz 16bit mono = 64ms of audio
-// Delay should be SLIGHTLY LESS than audio duration para may small buffer
-const INITIAL_CHUNK_DELAY_MS = 45;        // Unang 20 chunks - mabilis pero hindi sobra
-const NORMAL_CHUNK_DELAY_MS = 58;         // Normal - mas bagal para natural
-const MUSIC_CHUNK_DELAY_MS = 55;          // Music - consistent lang
+const INITIAL_CHUNK_DELAY_MS = 45;
+const NORMAL_CHUNK_DELAY_MS = 58;
+const MUSIC_CHUNK_DELAY_MS = 55;
 
-const PREBUFFER_CHUNKS = 5;               // Ilang chunks ang i-pre-send bago mag-start
+const PREBUFFER_CHUNKS = 5;
 
 /* ---------------- PERSISTENT VOLUME ---------------- */
 function loadVolume(): number {
@@ -83,7 +80,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V41: REAL-TIME PCM STREAM - NATURAL PACING ---------------- */
+/* ---------------- V42: REAL-TIME PCM STREAM ---------------- */
 async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
   if (ws.readyState !== ws.OPEN) return;
 
@@ -99,26 +96,23 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       "pipe:1"
     ]);
 
-    // Send PREPARE immediately
     ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
     
     let isActive = true;
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let hasStarted = false;
-    let prebufferAccumulated = 0;
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V41: Pre-buffering sa server side - iipunin muna ng konti bago mag-start
       if (!hasStarted && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
-        await new Promise(r => setTimeout(r, 100)); // Small setup delay
+        await new Promise(r => setTimeout(r, 100));
         ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
         hasStarted = true;
-        console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent (prebuffer: ${PREBUFFER_CHUNKS} chunks)`);
+        console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent`);
       }
       
       while (buffer.length >= CHUNK_SIZE && isActive) {
@@ -138,8 +132,6 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
           ws.send(packet, { binary: true });
           seq++;
           
-          // V41: CONSISTENT NATURAL PACING
-          // 2048 bytes = 64ms audio. Delay = 58ms = slight buffer build-up
           const delay = seq < 20 ? INITIAL_CHUNK_DELAY_MS : 
                        isMusic ? MUSIC_CHUNK_DELAY_MS : NORMAL_CHUNK_DELAY_MS;
           
@@ -155,7 +147,6 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
     ffmpegProcess.stdout.on("end", async () => {
       isActive = false;
       
-      // Send remaining buffer
       if (buffer.length > 0 && ws.readyState === ws.OPEN) {
         const packet = Buffer.allocUnsafe(2 + buffer.length);
         packet.writeUInt16BE(seq & 0xFFFF, 0);
@@ -164,7 +155,6 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
         seq++;
       }
       
-      // V41: MAS MARAMING SILENCE PACKETS para smooth end
       const silencePackets = isMusic ? 50 : 100;
       for (let i = 0; i < silencePackets; i++) {
         if (ws.readyState !== ws.OPEN) break;
@@ -202,7 +192,7 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
   });
 }
 
-/* ---------------- MUSIC STREAM - 16kHz ---------------- */
+/* ---------------- MUSIC STREAM ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -356,7 +346,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V41 Natural Speech");
+    console.log("ESP32 connected - V42 Stable Connection");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -365,6 +355,28 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     ws.send("VOLUME:" + currentVolume.toFixed(2));
 
     let lastPongTime = Date.now();
+    let isAlive = true;
+    
+    // V42: Connection keep-alive check
+    const keepAliveInterval = setInterval(() => {
+      if (!isAlive) {
+        console.log("[WS] Connection dead, terminating");
+        clearInterval(keepAliveInterval);
+        ws.terminate();
+        return;
+      }
+      
+      isAlive = false;
+      if (ws.readyState === ws.OPEN) {
+        ws.ping();
+      }
+    }, 5000); // V42: 5 seconds heartbeat
+    
+    ws.on("pong", () => {
+      isAlive = true;
+      lastPongTime = Date.now();
+      console.log("[WS] Pong received");
+    });
     
     ws.on("message", async (data: any, isBinary: boolean) => {
       if (isBinary) {
@@ -527,29 +539,14 @@ Rules:
 
     ws.on("close", () => {
       console.log("ESP32 disconnected");
+      clearInterval(keepAliveInterval);
       audioChunks = [];
       isProcessing = false;
     });
 
     ws.on("error", (err) => {
       console.error("[WS] Error:", err);
-    });
-
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === ws.OPEN) {
-        ws.ping();
-        
-        if (Date.now() - lastPongTime > 45000) {
-          console.log("[WS] No pong received, closing connection");
-          ws.terminate();
-        }
-      } else {
-        clearInterval(pingInterval);
-      }
-    }, 8000);
-
-    ws.on("pong", () => {
-      lastPongTime = Date.now();
+      clearInterval(keepAliveInterval);
     });
   });
 
