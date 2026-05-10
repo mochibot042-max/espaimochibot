@@ -25,7 +25,7 @@ const VOLUME_FILE = path.join(process.cwd(), "volume.json");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ---------------- CONFIG - V46: FIX SPAM START + MUSIC STABLE ---------------- */
+/* ---------------- CONFIG - V47: FIX SPAM START + MUSIC STABLE ---------------- */
 const DEFAULT_VOLUME = 1.0;
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 1024;
@@ -79,7 +79,7 @@ function normalizeAudioInput(raw: Buffer): Buffer {
   return raw;
 }
 
-/* ---------------- V46: REAL-TIME PCM STREAM - STRICT START CONTROL ---------------- */
+/* ---------------- V47: REAL-TIME PCM STREAM - STRICT START CONTROL ---------------- */
 async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = false) {
   if (ws.readyState !== ws.OPEN) return;
 
@@ -95,27 +95,26 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
       "pipe:1"
     ]);
 
-    // V46: Send PREPARE only once
+    // V47: Send PREPARE only once, outside the data handler
     ws.send(isMusic ? "PREPARE_MUSIC:0" : "PREPARE_RESPONSE:0");
     
     let isActive = true;
     let buffer = Buffer.alloc(0);
     let seq = 0;
-    let hasStarted = false;
-    let startSent = false;  // V46: Flag para hindi mag-resend ng START
+    // V47: Use a single atomic flag for start control
+    let startSent = false;
 
     ffmpegProcess.stdout.on("data", async (chunk: Buffer) => {
       if (!isActive || ws.readyState !== ws.OPEN) return;
       
       buffer = Buffer.concat([buffer, chunk]);
       
-      // V46: Send START only once, strictly
-      if (!hasStarted && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS && !startSent) {
+      // V47: Send START only once, strictly, synchronously check then send
+      if (!startSent && buffer.length >= CHUNK_SIZE * PREBUFFER_CHUNKS) {
+        startSent = true; // Set flag IMMEDIATELY before any async operation
         await new Promise(r => setTimeout(r, 200));
         if (ws.readyState === ws.OPEN) {
           ws.send(isMusic ? "START_MUSIC" : "START_RESPONSE");
-          startSent = true;
-          hasStarted = true;
           console.log(`[STREAM] ${isMusic ? 'Music' : 'TTS'} START sent ONCE`);
         }
       }
@@ -160,7 +159,7 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
         seq++;
       }
       
-      // V46: MAS MARAMING SILENCE para sa music
+      // V47: MAS MARAMING SILENCE para sa music
       const silencePackets = isMusic ? 100 : 120;
       for (let i = 0; i < silencePackets; i++) {
         if (ws.readyState !== ws.OPEN) break;
@@ -198,7 +197,7 @@ async function streamPCMRealtime(ws: WebSocket, inputPath: string, isMusic = fal
   });
 }
 
-/* ---------------- MUSIC STREAM - V46: STRICT START + LONG SILENCE ---------------- */
+/* ---------------- MUSIC STREAM - V47: STRICT START + LONG SILENCE ---------------- */
 async function downloadSongStream(query: string, ws: WebSocket) {
   try {
     console.log("[MUSIC] Searching:", query);
@@ -217,7 +216,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
     console.log("[MUSIC] Found:", video.title);
 
     const apiRes = await axios.get(
-      `https://mostakim.onrender.com/m/sing?url=${video.url}`,
+      `https://mostakim.onrender.com/mostakim/sing?url=${video.url}`,
       { timeout: 10000 }
     );
     
@@ -239,7 +238,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
       "pipe:1"
     ]);
 
-    // V46: Send PREPARE and START only once
+    // V47: Send PREPARE and START only once
     ws.send("PREPARE_MUSIC:0");
     await new Promise(r => setTimeout(r, 200));
     ws.send("START_MUSIC");
@@ -292,7 +291,7 @@ async function downloadSongStream(query: string, ws: WebSocket) {
         seq++;
       }
       
-      // V46: MAS MARAMING SILENCE para hindi agad maubos
+      // V47: MAS MARAMING SILENCE para hindi agad maubos
       const sendSilence = async () => {
         for (let i = 0; i < 100; i++) {
           if (ws.readyState !== ws.OPEN) break;
@@ -364,7 +363,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP32 connected - V46 Fix Spam");
+    console.log("ESP32 connected - V47 Fix Spam");
 
     let audioChunks: Buffer[] = [];
     let isProcessing = false;
@@ -495,7 +494,7 @@ Rules:
             spokenText = parsed.text || spokenText;
             musicQuery = parsed.music_query ?? null;
             if (parsed.volume !== null && !isNaN(parsed.volume)) {
-              newValue = Math.max(0.05, Math.min(1.5, parsed.volume));
+              newVolume = Math.max(0.05, Math.min(1.5, parsed.volume));
             }
           } catch (e) {
             console.log("[PARSE] JSON error, using raw text");
