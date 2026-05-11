@@ -15,7 +15,6 @@ const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
 const AUDIO_DIR = path.join(process.cwd(), "audio");
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
-const MUSIC_API_BASE = "https://yt-dlp-stream.onrender.com/api/v2/q";
 
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -89,7 +88,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// PCM GENERATION
+// PCM GENERATION (from local file)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -119,11 +118,35 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
+// PCM GENERATION FROM STREAM (for music — no temp MP3 file)
+// ============================================================================
+async function generatePCMFromStream(inputUrl: string, outputPcmPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputUrl)
+      .audioFilters([
+        "highpass=f=80",
+        "lowpass=f=8000",
+        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+        "aformat=sample_fmts=s16:channel_layouts=mono",
+        "volume=0.65",
+        "dynaudnorm=p=0.95:g=15"
+      ])
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(SAMPLE_RATE)
+      .format("s16le")
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outputPcmPath);
+  });
+}
+
+// ============================================================================
 // FETCH MUSIC URL FROM YT-DLP API
 // ============================================================================
 async function fetchMusicUrl(query: string): Promise<string | null> {
   try {
-    const url = `${MUSIC_API_BASE}?=${encodeURIComponent(query)}`;
+    const url = `https://yt-dlp-stream.onrender.com/api/v2/q?=${encodeURIComponent(query)}`;
     console.log("[MUSIC] Searching:", query);
     const response = await fetch(url);
     if (!response.ok) {
@@ -144,6 +167,31 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
+// DOWNLOAD MP3 TO TEMP FILE (bypass anti-hotlinking)
+// ============================================================================
+async function downloadMp3(mp3Url: string, outputPath: string): Promise<void> {
+  console.log("[DOWNLOAD] Starting download to:", outputPath);
+  
+  const response = await fetch(mp3Url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "*/*",
+      "Accept-Encoding": "identity",
+      "Referer": "https://yt-dlp-stream.onrender.com/",
+    },
+    redirect: "follow",
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+  }
+  
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+  console.log("[DOWNLOAD] Saved", buffer.length, "bytes");
+}
+
+// ============================================================================
 // STREAM AI RESPONSE PCM
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
@@ -159,10 +207,8 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   
   ws.send("SESSION:" + sessionId);
   await new Promise(r => setTimeout(r, 100));
-  
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await new Promise(r => setTimeout(r, 300));
-  
   ws.send("START_RESPONSE");
   await new Promise(r => setTimeout(r, 100));
   
@@ -207,7 +253,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// STREAM MUSIC PCM
+// STREAM MUSIC PCM (download first, then convert)
 // ============================================================================
 async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) {
@@ -215,65 +261,72 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
     return;
   }
   
+  const tmpMp3 = path.join(AUDIO_DIR, "tmp_music_" + sessionId + ".mp3");
   const pcmPath = path.join(AUDIO_DIR, "music_" + sessionId + ".pcm");
   
-  console.log("[MUSIC] Converting MP3 -> PCM...");
-  
-  // Convert remote MP3 to PCM via ffmpeg (no permanent MP3 download)
-  await new Promise<void>((resolve, reject) => {
-    ffmpeg(mp3Url)
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=8000",
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.65",
-        "dynaudnorm=p=0.95:g=15"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
-      .format("s16le")
-      .on("error", (err) => {
-        console.error("[MUSIC] FFmpeg error:", err.message);
-        reject(err);
-      })
-      .on("end", () => {
-        console.log("[MUSIC] Conversion done");
-        resolve();
-      })
-      .save(pcmPath);
-  });
-  
-  if (!fs.existsSync(pcmPath)) {
-    throw new Error("PCM conversion failed");
-  }
-  
-  const pcm = fs.readFileSync(pcmPath);
-  fs.unlinkSync(pcmPath);  // Delete temp PCM immediately
-  
-  console.log("[MUSIC] PCM:", pcm.length, "bytes");
-  
-  if (ws.readyState !== ws.OPEN) {
-    console.log("[MUSIC] WebSocket closed after conversion");
-    return;
-  }
-  
-  const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
-  const totalChunks = alignedLen / CHUNK_SIZE;
-  
-  console.log("[MUSIC] Streaming", totalChunks, "chunks");
-  
-  ws.send("SESSION:" + sessionId);
-  await new Promise(r => setTimeout(r, 100));
-  ws.send("PREPARE_MUSIC:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300));
-  ws.send("START_MUSIC");
-  await new Promise(r => setTimeout(r, 100));
-  
-  let seq = 0;
-  
   try {
+    // STEP 1: Download MP3 with browser-like headers
+    await downloadMp3(mp3Url, tmpMp3);
+    
+    // STEP 2: Convert downloaded MP3 to PCM
+    console.log("[MUSIC] Converting MP3 -> PCM...");
+    await new Promise<void>((resolve, reject) => {
+      ffmpeg(tmpMp3)
+        .audioFilters([
+          "highpass=f=80",
+          "lowpass=f=8000",
+          "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+          "aformat=sample_fmts=s16:channel_layouts=mono",
+          "volume=0.65",
+          "dynaudnorm=p=0.95:g=15"
+        ])
+        .audioCodec("pcm_s16le")
+        .audioChannels(1)
+        .audioFrequency(SAMPLE_RATE)
+        .format("s16le")
+        .on("error", (err) => {
+          console.error("[MUSIC] FFmpeg error:", err.message);
+          reject(err);
+        })
+        .on("end", () => {
+          console.log("[MUSIC] Conversion done");
+          resolve();
+        })
+        .save(pcmPath);
+    });
+    
+    // STEP 3: Delete temp MP3 immediately
+    try { fs.unlinkSync(tmpMp3); } catch {}
+    
+    if (!fs.existsSync(pcmPath)) {
+      throw new Error("PCM conversion failed");
+    }
+    
+    const pcm = fs.readFileSync(pcmPath);
+    try { fs.unlinkSync(pcmPath); } catch {}  // Delete PCM after reading
+    
+    console.log("[MUSIC] PCM:", pcm.length, "bytes");
+    
+    if (ws.readyState !== ws.OPEN) {
+      console.log("[MUSIC] WebSocket closed after conversion");
+      return;
+    }
+    
+    // STEP 4: Stream PCM to ESP32
+    const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
+    const totalChunks = alignedLen / CHUNK_SIZE;
+    
+    console.log("[MUSIC] Streaming", totalChunks, "chunks");
+    
+    ws.send("SESSION:" + sessionId);
+    await new Promise(r => setTimeout(r, 100));
+    ws.send("PREPARE_MUSIC:" + totalChunks);
+    await new Promise(r => setTimeout(r, 300));
+    ws.send("START_MUSIC");
+    await new Promise(r => setTimeout(r, 100));
+    
+    let seq = 0;
+    
     for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
       if (ws.readyState !== ws.OPEN) {
         console.log("[MUSIC] WebSocket closed mid-stream");
@@ -304,8 +357,12 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
     console.log("[MUSIC] Completed session:", sessionId, "sent", seq, "chunks");
     
   } catch (e: any) {
-    console.error("[MUSIC] Stream error:", e.message);
+    console.error("[MUSIC] Error:", e.message);
+    // Cleanup on error
+    try { fs.unlinkSync(tmpMp3); } catch {}
+    try { fs.unlinkSync(pcmPath); } catch {}
     try {
+      ws.send("ERROR:MUSIC_FAILED");
       ws.send("FINISH_MUSIC:ERROR");
     } catch {}
   }
@@ -438,7 +495,7 @@ Return ONLY the JSON.`;
         return;
       }
 
-      // Optional: TTS intro before music (e.g., "Playing Tibok now")
+      // Optional: TTS intro before music
       if (text && !nameResponse) {
         const introId = uniqueId + "_intro";
         const tts = new EdgeTTS();
@@ -451,7 +508,6 @@ Return ONLY the JSON.`;
         const introPcm = await generatePCM(introMp3);
         await streamPCM(ws, introPcm, introId);
         
-        // Small gap between intro and music
         await new Promise(r => setTimeout(r, 1000));
       }
 
@@ -480,7 +536,6 @@ Return ONLY the JSON.`;
       ws.send("FINISH_RESPONSE:ERROR");
     } catch {}
   } finally {
-    // Cleanup all temp files
     for (const f of filesToCleanup) {
       try { fs.unlinkSync(f); } catch {}
     }
