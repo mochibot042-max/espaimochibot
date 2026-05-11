@@ -25,7 +25,7 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const AI_SAMPLE_RATE = 16000;
 const AI_CHUNK_SIZE = 512;
 const MUSIC_SAMPLE_RATE = 48000;
-const MUSIC_CHUNK_SIZE = 1536;  // 512 * 3, same 16ms per chunk at 48kHz
+const MUSIC_CHUNK_SIZE = 1536;
 const SEND_INTERVAL_MS = 16;
 
 // ============================================================================
@@ -243,16 +243,14 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
   const pcmPath = path.join(AUDIO_DIR, "music_" + sessionId + ".pcm");
   
   try {
-    // STEP 1: Download MP3
     await downloadMp3(mp3Url, tmpMp3);
     
-    // STEP 2: Convert to 48kHz PCM
     console.log("[MUSIC] Converting MP3 -> 48kHz PCM...");
     await new Promise<void>((resolve, reject) => {
       ffmpeg(tmpMp3)
         .audioFilters([
           "highpass=f=80",
-          "lowpass=f=16000",        // Higher lowpass for music quality at 48kHz
+          "lowpass=f=16000",
           "aresample=" + MUSIC_SAMPLE_RATE + ":resampler=soxr:precision=28",
           "aformat=sample_fmts=s16:channel_layouts=mono",
           "volume=0.70",
@@ -289,7 +287,6 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
       return;
     }
     
-    // STEP 3: Stream at 48kHz
     const alignedLen = Math.floor(pcm.length / MUSIC_CHUNK_SIZE) * MUSIC_CHUNK_SIZE;
     const totalChunks = alignedLen / MUSIC_CHUNK_SIZE;
     
@@ -459,7 +456,6 @@ Return ONLY the JSON.`;
     await storage.addMessage(userId, "user", userText);
     await storage.addMessage(userId, "assistant", text);
 
-    // ==================== MUSIC FLOW ====================
     if (musicQuery) {
       const mp3Url = await fetchMusicUrl(musicQuery);
       if (!mp3Url) {
@@ -467,7 +463,6 @@ Return ONLY the JSON.`;
         return;
       }
 
-      // TTS intro at 16kHz
       if (text && !nameResponse) {
         const introId = uniqueId + "_intro";
         const tts = new EdgeTTS();
@@ -483,10 +478,8 @@ Return ONLY the JSON.`;
         await new Promise(r => setTimeout(r, 1000));
       }
 
-      // Music at 48kHz
       await streamMusic(ws, mp3Url, uniqueId + "_music");
     }
-    // ==================== NORMAL TTS FLOW ====================
     else {
       const tts = new EdgeTTS();
       const mp3 = path.join(AUDIO_DIR, uniqueId + ".mp3");
