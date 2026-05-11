@@ -22,8 +22,10 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 // ============================================================================
 // AUDIO CONFIG
 // ============================================================================
-const SAMPLE_RATE = 16000;
-const CHUNK_SIZE = 512;
+const AI_SAMPLE_RATE = 16000;
+const AI_CHUNK_SIZE = 512;
+const MUSIC_SAMPLE_RATE = 48000;
+const MUSIC_CHUNK_SIZE = 1536;  // 512 * 3, same 16ms per chunk at 48kHz
 const SEND_INTERVAL_MS = 16;
 
 // ============================================================================
@@ -88,7 +90,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// PCM GENERATION (from local file)
+// PCM GENERATION (AI — 16kHz)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -98,14 +100,14 @@ async function generatePCM(input: string): Promise<Buffer> {
       .audioFilters([
         "highpass=f=80",
         "lowpass=f=8000",
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+        "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
         "volume=0.85",
         "dynaudnorm=p=0.95:g=15"
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
+      .audioFrequency(AI_SAMPLE_RATE)
       .format("s16le")
       .on("error", reject)
       .on("end", () => {
@@ -114,30 +116,6 @@ async function generatePCM(input: string): Promise<Buffer> {
         resolve(pcm);
       })
       .save(tmp);
-  });
-}
-
-// ============================================================================
-// PCM GENERATION FROM STREAM (for music — no temp MP3 file)
-// ============================================================================
-async function generatePCMFromStream(inputUrl: string, outputPcmPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputUrl)
-      .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=8000",
-        "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.65",
-        "dynaudnorm=p=0.95:g=15"
-      ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(SAMPLE_RATE)
-      .format("s16le")
-      .on("error", reject)
-      .on("end", () => resolve())
-      .save(outputPcmPath);
   });
 }
 
@@ -167,7 +145,7 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// DOWNLOAD MP3 TO TEMP FILE (bypass anti-hotlinking)
+// DOWNLOAD MP3 TO TEMP FILE
 // ============================================================================
 async function downloadMp3(mp3Url: string, outputPath: string): Promise<void> {
   console.log("[DOWNLOAD] Starting download to:", outputPath);
@@ -192,7 +170,7 @@ async function downloadMp3(mp3Url: string, outputPath: string): Promise<void> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM
+// STREAM AI RESPONSE PCM (16kHz)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) {
@@ -200,10 +178,10 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     return;
   }
   
-  const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
-  const totalChunks = alignedLen / CHUNK_SIZE;
+  const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE) * AI_CHUNK_SIZE;
+  const totalChunks = alignedLen / AI_CHUNK_SIZE;
   
-  console.log("[STREAM] Starting session:", sessionId, "chunks:", totalChunks);
+  console.log("[STREAM] AI session:", sessionId, "chunks:", totalChunks, "@ 16kHz");
   
   ws.send("SESSION:" + sessionId);
   await new Promise(r => setTimeout(r, 100));
@@ -215,13 +193,13 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   let seq = 0;
   
   try {
-    for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
+    for (let i = 0; i < alignedLen; i += AI_CHUNK_SIZE) {
       if (ws.readyState !== ws.OPEN) {
         console.log("[STREAM] WebSocket closed mid-stream");
         return;
       }
       
-      const chunk = pcm.subarray(i, i + CHUNK_SIZE);
+      const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE);
       const packet = Buffer.allocUnsafe(2 + chunk.length);
       packet.writeUInt16BE(seq & 0xFFFF, 0);
       packet.set(chunk, 2);
@@ -242,7 +220,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
       }
     }
     
-    console.log("[STREAM] Completed session:", sessionId, "sent", seq, "chunks");
+    console.log("[STREAM] AI completed:", sessionId, "sent", seq, "chunks");
     
   } catch (e: any) {
     console.error("[STREAM] Error:", e.message);
@@ -253,7 +231,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// STREAM MUSIC PCM (download first, then convert)
+// STREAM MUSIC PCM (48kHz)
 // ============================================================================
 async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) {
@@ -265,24 +243,24 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
   const pcmPath = path.join(AUDIO_DIR, "music_" + sessionId + ".pcm");
   
   try {
-    // STEP 1: Download MP3 with browser-like headers
+    // STEP 1: Download MP3
     await downloadMp3(mp3Url, tmpMp3);
     
-    // STEP 2: Convert downloaded MP3 to PCM
-    console.log("[MUSIC] Converting MP3 -> PCM...");
+    // STEP 2: Convert to 48kHz PCM
+    console.log("[MUSIC] Converting MP3 -> 48kHz PCM...");
     await new Promise<void>((resolve, reject) => {
       ffmpeg(tmpMp3)
         .audioFilters([
           "highpass=f=80",
-          "lowpass=f=8000",
-          "aresample=" + SAMPLE_RATE + ":resampler=soxr:precision=28",
+          "lowpass=f=16000",        // Higher lowpass for music quality at 48kHz
+          "aresample=" + MUSIC_SAMPLE_RATE + ":resampler=soxr:precision=28",
           "aformat=sample_fmts=s16:channel_layouts=mono",
-          "volume=0.65",
+          "volume=0.70",
           "dynaudnorm=p=0.95:g=15"
         ])
         .audioCodec("pcm_s16le")
         .audioChannels(1)
-        .audioFrequency(SAMPLE_RATE)
+        .audioFrequency(MUSIC_SAMPLE_RATE)
         .format("s16le")
         .on("error", (err) => {
           console.error("[MUSIC] FFmpeg error:", err.message);
@@ -295,7 +273,6 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
         .save(pcmPath);
     });
     
-    // STEP 3: Delete temp MP3 immediately
     try { fs.unlinkSync(tmpMp3); } catch {}
     
     if (!fs.existsSync(pcmPath)) {
@@ -303,20 +280,20 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
     }
     
     const pcm = fs.readFileSync(pcmPath);
-    try { fs.unlinkSync(pcmPath); } catch {}  // Delete PCM after reading
+    try { fs.unlinkSync(pcmPath); } catch {}
     
-    console.log("[MUSIC] PCM:", pcm.length, "bytes");
+    console.log("[MUSIC] PCM:", pcm.length, "bytes @ 48kHz");
     
     if (ws.readyState !== ws.OPEN) {
       console.log("[MUSIC] WebSocket closed after conversion");
       return;
     }
     
-    // STEP 4: Stream PCM to ESP32
-    const alignedLen = Math.floor(pcm.length / CHUNK_SIZE) * CHUNK_SIZE;
-    const totalChunks = alignedLen / CHUNK_SIZE;
+    // STEP 3: Stream at 48kHz
+    const alignedLen = Math.floor(pcm.length / MUSIC_CHUNK_SIZE) * MUSIC_CHUNK_SIZE;
+    const totalChunks = alignedLen / MUSIC_CHUNK_SIZE;
     
-    console.log("[MUSIC] Streaming", totalChunks, "chunks");
+    console.log("[MUSIC] Streaming", totalChunks, "chunks @ 48kHz");
     
     ws.send("SESSION:" + sessionId);
     await new Promise(r => setTimeout(r, 100));
@@ -327,13 +304,13 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
     
     let seq = 0;
     
-    for (let i = 0; i < alignedLen; i += CHUNK_SIZE) {
+    for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE) {
       if (ws.readyState !== ws.OPEN) {
         console.log("[MUSIC] WebSocket closed mid-stream");
         return;
       }
       
-      const chunk = pcm.subarray(i, i + CHUNK_SIZE);
+      const chunk = pcm.subarray(i, i + MUSIC_CHUNK_SIZE);
       const packet = Buffer.allocUnsafe(2 + chunk.length);
       packet.writeUInt16BE(seq & 0xFFFF, 0);
       packet.set(chunk, 2);
@@ -354,11 +331,10 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
       }
     }
     
-    console.log("[MUSIC] Completed session:", sessionId, "sent", seq, "chunks");
+    console.log("[MUSIC] Completed session:", sessionId, "sent", seq, "chunks @ 48kHz");
     
   } catch (e: any) {
     console.error("[MUSIC] Error:", e.message);
-    // Cleanup on error
     try { fs.unlinkSync(tmpMp3); } catch {}
     try { fs.unlinkSync(pcmPath); } catch {}
     try {
@@ -418,7 +394,6 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
 
     console.log("USER:", userText);
 
-    // Check name commands
     const nameAction = extractName(userText);
     let nameResponse = "";
 
@@ -430,11 +405,9 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
       nameResponse = "I've deleted your name from my memory.";
     }
 
-    // Get conversation history
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    // Build system prompt with music capability
     const systemPrompt = `You are a helpful voice assistant. Keep responses short and natural.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
 If the user wants to play music or a song, return JSON with "music" field:
@@ -483,7 +456,6 @@ Return ONLY the JSON.`;
 
     console.log("AI:", text, musicQuery ? `(Music: ${musicQuery})` : "");
 
-    // Save to DB (FIFO, max 10)
     await storage.addMessage(userId, "user", userText);
     await storage.addMessage(userId, "assistant", text);
 
@@ -495,7 +467,7 @@ Return ONLY the JSON.`;
         return;
       }
 
-      // Optional: TTS intro before music
+      // TTS intro at 16kHz
       if (text && !nameResponse) {
         const introId = uniqueId + "_intro";
         const tts = new EdgeTTS();
@@ -511,7 +483,7 @@ Return ONLY the JSON.`;
         await new Promise(r => setTimeout(r, 1000));
       }
 
-      // Stream the actual music
+      // Music at 48kHz
       await streamMusic(ws, mp3Url, uniqueId + "_music");
     }
     // ==================== NORMAL TTS FLOW ====================
@@ -570,7 +542,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - Voice AI with Music");
+    console.log("ESP connected - Voice AI with 48kHz Music");
 
     let processing = false;
     let currentUserId: number | null = null;
