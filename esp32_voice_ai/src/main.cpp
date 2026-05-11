@@ -1,13 +1,21 @@
+// ============================================================================
+// ESP32 AUDIO CHATBOT - V22 (IDLE STATE FIX)
+// ============================================================================
+// Fixed: Proper finish handling, guaranteed idle return, no stuck states
+// ============================================================================
+
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WebSocketsClient.h>
 #include <driver/i2s.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
-#include <algorithm>
 #include <string.h>
 
-const char* WS_HOST = "espaimochibot.onrender.com";
+// ============================================================================
+// CONFIG
+// ============================================================================
+const char* WS_HOST = "assistant-xf3o.onrender.com";
 const int WS_PORT = 443;
 const char* WS_PATH = "/ws/audio";
 
@@ -19,375 +27,504 @@ const char* WS_PATH = "/ws/audio";
 #define I2S_WS  5
 #define I2S_DOUT 6
 
+// ============================================================================
+// GLOBALS
+// ============================================================================
 Adafruit_NeoPixel pixels(1, LED_PIN, NEO_GRB + NEO_KHZ800);
-
 WebSocketsClient webSocket;
 Preferences prefs;
 
 bool is_recording = false;
 bool isPlaying = false;
 bool isWSConnected = false;
+bool isPreparingPlayback = false;
 float currentVolume = 0.32f;
 
-volatile float audioLevel = 0.0f;
+// ============================================================================
+// RECORDING
+// ============================================================================
+#define RECORD_RATE 16000
+#define BUFFER_SIZE 512
+#define MAX_RECORDING_SIZE (16000 * 2 * 3)
 
-// --------------------
-#define RECORD_RATE 44100
-#define BUFFER_SIZE 1024
-#define MAX_CHUNK_SIZE 4096
-uint8_t tempBuffer[MAX_CHUNK_SIZE];
-
-#define RECORD_BUFFER_SIZE (256*1024)
-uint8_t* record_buffer;
+uint8_t* record_buffer = NULL;
 size_t record_pos = 0;
 
-const int START_THRESHOLD = 260;
-const int SILENCE_RMS = 120;
-const int SILENCE_THRESH = 110;
-
+const int START_THRESHOLD = 200;
+const int SILENCE_RMS = 60;
+const int SILENCE_THRESH = 25;
 int silence_counter = 0;
 int speech_frames = 0;
-
-const int SPEECH_CONFIRM = 4;
+const int SPEECH_CONFIRM = 2;
 
 unsigned long record_start_time = 0;
-const unsigned long MAX_RECORD_MS = 8000;
+const unsigned long MAX_RECORD_MS = 3000;
 
-// --------------------
-// Helpers
-// --------------------
+// ============================================================================
+// PLAYBACK STATE - FIXED
+// ============================================================================
+volatile bool playback_active = false;
+volatile bool finish_received = false;
+volatile uint32_t chunks_received = 0;
+volatile uint32_t chunks_expected = 0;
+unsigned long finish_receive_time = 0;  // NEW: Track when finish was received
+const unsigned long FINISH_GRACE_MS = 300;  // NEW: Wait 300ms after finish
 
-void setColor(uint32_t color){
-  pixels.setPixelColor(0,color);
+// ============================================================================
+// TIMING
+// ============================================================================
+unsigned long lastWSPing = 0;
+unsigned long lastActivity = 0;
+
+// ============================================================================
+// LED
+// ============================================================================
+void setColor(uint32_t color) {
+  pixels.setPixelColor(0, color);
   pixels.show();
 }
 
-float calculateRMS(int16_t* buffer,size_t samples){
-
-  float sum=0;
-
-  for(size_t i=0;i<samples;i++){
-    float s=buffer[i];
-    sum+=s*s;
+// ============================================================================
+// AUDIO HELPERS
+// ============================================================================
+float calculateRMS(int16_t* buffer, size_t samples) {
+  if (samples == 0) return 0;
+  float sum = 0;
+  for (size_t i = 0; i < samples; i++) {
+    float s = buffer[i];
+    sum += s * s;
   }
-
-  return sqrt(sum/samples);
+  return sqrt(sum / samples);
 }
 
-// --------------------
-// Audio level detect
-// --------------------
-
-float computeAudioLevel(uint8_t* data,size_t len){
-
-  int16_t* samples=(int16_t*)data;
-  int count=len/2;
-
-  float sum=0;
-
-  for(int i=0;i<count;i++){
-
-    float s=samples[i];
-    sum+=s*s;
-
-  }
-
-  return sqrt(sum/count);
+// ============================================================================
+// WAV HEADER
+// ============================================================================
+void buildWavHeader(uint8_t* header, uint32_t dataLen) {
+  memcpy(header + 0, "RIFF", 4);
+  uint32_t fileSize = 36 + dataLen;
+  header[4] = fileSize & 0xFF;
+  header[5] = (fileSize >> 8) & 0xFF;
+  header[6] = (fileSize >> 16) & 0xFF;
+  header[7] = (fileSize >> 24) & 0xFF;
+  memcpy(header + 8, "WAVE", 4);
+  memcpy(header + 12, "fmt ", 4);
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+  header[20] = 1; header[21] = 0;
+  header[22] = 1; header[23] = 0;
+  uint32_t sr = RECORD_RATE;
+  header[24] = sr & 0xFF;
+  header[25] = (sr >> 8) & 0xFF;
+  header[26] = (sr >> 16) & 0xFF;
+  header[27] = (sr >> 24) & 0xFF;
+  uint32_t br = RECORD_RATE * 2;
+  header[28] = br & 0xFF;
+  header[29] = (br >> 8) & 0xFF;
+  header[30] = (br >> 16) & 0xFF;
+  header[31] = (br >> 24) & 0xFF;
+  header[32] = 2; header[33] = 0;
+  header[34] = 16; header[35] = 0;
+  memcpy(header + 36, "data", 4);
+  header[40] = dataLen & 0xFF;
+  header[41] = (dataLen >> 8) & 0xFF;
+  header[42] = (dataLen >> 16) & 0xFF;
+  header[43] = (dataLen >> 24) & 0xFF;
 }
 
-// --------------------
-// Audio Processing
-// --------------------
-
-void applyVolume(uint8_t* data,size_t len,float vol){
-
-  int16_t* samples=(int16_t*)data;
-
-  static float prevInput1=0;
-  static float prevOutput1=0;
-
-  static float prevInput2=0;
-  static float prevOutput2=0;
-
-  const float alpha1=0.998f;
-  const float alpha2=0.996f;
-
-  for(size_t i=0;i<len/2;i++){
-
-    float x=(float)samples[i];
-
-    float y1=alpha1*(prevOutput1+x-prevInput1);
-    prevInput1=x;
-    prevOutput1=y1;
-
-    float y2=alpha2*(prevOutput2+y1-prevInput2);
-    prevInput2=y1;
-    prevOutput2=y2;
-
-    float out=y2*vol*0.9f;
-
-    if(out>32767) out=32767;
-    if(out<-32768) out=-32768;
-
-    samples[i]=(int16_t)out;
-
+// ============================================================================
+// UPLOAD
+// ============================================================================
+void uploadRecording() {
+  if (record_pos == 0 || !webSocket.isConnected()) {
+    record_pos = 0;
+    return;
   }
-
+  if (record_pos % 2 != 0) record_pos--;
+  
+  uint32_t dataLen = record_pos;
+  uint32_t totalSize = 44 + dataLen;
+  
+  uint8_t* uploadBuffer = (uint8_t*)ps_malloc(totalSize);
+  if (!uploadBuffer) {
+    record_pos = 0;
+    return;
+  }
+  
+  buildWavHeader(uploadBuffer, dataLen);
+  memcpy(uploadBuffer + 44, record_buffer, dataLen);
+  
+  Serial.printf("[UPLOAD] %d bytes\n", totalSize);
+  webSocket.sendBIN(uploadBuffer, totalSize);
+  free(uploadBuffer);
+  record_pos = 0;
+  Serial.println("[UPLOAD] Sent");
 }
 
-// --------------------
-// Send Audio
-// --------------------
-
-void sendToServer(){
-
-  is_recording=false;
-
-  size_t sent=0;
-
-  while(sent<record_pos){
-
-    size_t to_send=min((size_t)2048,record_pos-sent);
-
-    if(webSocket.sendBIN(record_buffer+sent,to_send))
-      sent+=to_send;
-
-    webSocket.loop();
-
+// ============================================================================
+// RECORD
+// ============================================================================
+void recordToBuffer(uint8_t* data, size_t len) {
+  if (record_buffer == NULL) return;
+  size_t avail = MAX_RECORDING_SIZE - record_pos;
+  if (len > avail) len = avail;
+  if (len % 2 != 0) len--;
+  if (len > 0) {
+    memcpy(record_buffer + record_pos, data, len);
+    record_pos += len;
   }
-
-  webSocket.sendTXT("END_STREAM");
-
-  setColor(pixels.Color(0,0,100));
-
-  record_pos=0;
-
 }
 
-// --------------------
-// WebSocket
-// --------------------
+// ============================================================================
+// DIRECT I2S WRITE
+// ============================================================================
+void directI2SWrite(uint8_t* data, size_t len) {
+  if (!playback_active || len == 0) return;
+  size_t written = 0;
+  i2s_write(I2S_NUM_0, data, len, &written, pdMS_TO_TICKS(5));
+}
 
-void webSocketEvent(WStype_t type,uint8_t* payload,size_t length){
+// ============================================================================
+// FLUSH AND STOP - FIXED
+// ============================================================================
+void stopPlayback() {
+  Serial.println("[PLAY] Stopping");
+  
+  // Wait for DMA to finish current buffer
+  delay(50);
+  
+  // Clear everything
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  
+  // Write silence to flush
+  uint8_t silence[512];
+  memset(silence, 0, 512);
+  size_t bw = 0;
+  for (int i = 0; i < 4; i++) {
+    i2s_write(I2S_NUM_0, silence, 512, &bw, pdMS_TO_TICKS(10));
+  }
+  
+  // RESET ALL STATE - CRITICAL FIX
+  playback_active = false;
+  finish_received = false;
+  chunks_received = 0;
+  chunks_expected = 0;
+  finish_receive_time = 0;
+  isPlaying = false;
+  isPreparingPlayback = false;
+  
+  setColor(pixels.Color(0, 0, 100));  // Back to idle blue
+  Serial.println("[PLAY] Stopped -> IDLE");
+  
+  // Send READY to server
+  delay(50);
+  if (webSocket.isConnected()) {
+    webSocket.sendTXT("READY");
+    Serial.println("[WS] Sent READY");
+  }
+}
 
-  switch(type){
-
+// ============================================================================
+// WEBSOCKET EVENT - FIXED FINISH HANDLING
+// ============================================================================
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
     case WStype_DISCONNECTED:
-
-      isWSConnected=false;
-      setColor(pixels.Color(100,0,0));
+      Serial.println("[WS] Disconnected");
+      isWSConnected = false;
+      isPlaying = false;
+      playback_active = false;
+      isPreparingPlayback = false;
+      is_recording = false;
+      record_pos = 0;
+      setColor(pixels.Color(100, 0, 0));
       break;
 
     case WStype_CONNECTED:
-
-      isWSConnected=true;
-      setColor(pixels.Color(0,0,100));
+      isWSConnected = true;
+      isPlaying = false;
+      playback_active = false;
+      isPreparingPlayback = false;
+      is_recording = false;
+      record_pos = 0;
+      setColor(pixels.Color(0, 0, 100));
+      Serial.println("[WS] Connected");
       break;
 
-    case WStype_TEXT:{
+    case WStype_TEXT: {
+      String msg = (char*)payload;
+      Serial.printf("[WS] TXT: %s\n", msg.c_str());
+      lastActivity = millis();
 
-      String msg=(char*)payload;
-
-      if(msg=="START_RESPONSE"||msg=="START_MUSIC"){
-
-        isPlaying=true;
-        setColor(pixels.Color(200,0,200));
-
+      if (msg == "START_RESPONSE" || msg == "START_MUSIC") {
+        isPlaying = true;
+        playback_active = true;
+        isPreparingPlayback = false;
+        finish_received = false;
+        chunks_received = 0;
+        finish_receive_time = 0;
+        setColor(pixels.Color(200, 0, 200));
+        Serial.println("[PLAY] Start");
       }
-
-      else if(msg=="FINISH_RESPONSE"||msg=="FINISH_MUSIC"){
-
-        isPlaying=false;
-        setColor(pixels.Color(0,0,100));
-
+      else if (msg.startsWith("FINISH_RESPONSE:") || msg == "FINISH_RESPONSE" || msg == "FINISH_MUSIC") {
+        Serial.println("[PLAY] Finish received");
+        finish_received = true;
+        finish_receive_time = millis();  // Track finish time
+        
+        // If we already received all expected chunks, stop now
+        if (chunks_received >= chunks_expected && chunks_expected > 0) {
+          Serial.println("[PLAY] All chunks already received, stopping");
+          stopPlayback();
+        }
+        // Otherwise, loop() will handle it after grace period
       }
-
-      else if(msg.startsWith("VOLUME:")){
-
-        currentVolume=msg.substring(7).toFloat();
-        prefs.putFloat("volume",currentVolume);
-
+      else if (msg.startsWith("PREPARE_RESPONSE:")) {
+        int totalChunks = msg.substring(17).toInt();
+        chunks_expected = totalChunks;
+        Serial.printf("[PREPARE] %d chunks\n", totalChunks);
+        isPreparingPlayback = true;
+        isPlaying = false;
+        playback_active = true;
+        finish_received = false;
+        chunks_received = 0;
+        finish_receive_time = 0;
+        
+        // Clear DMA for fresh start
+        i2s_zero_dma_buffer(I2S_NUM_0);
+        
+        delay(200);
+        if (webSocket.isConnected()) {
+          webSocket.sendTXT("READY");
+        }
+        setColor(pixels.Color(100, 100, 0));
       }
-
+      else if (msg.startsWith("VOLUME:")) {
+        currentVolume = msg.substring(7).toFloat();
+        prefs.putFloat("volume", currentVolume);
+      }
+      else if (msg.startsWith("ERROR")) {
+        Serial.printf("[ERR] %s\n", msg.c_str());
+        stopPlayback();
+        isPreparingPlayback = false;
+        is_recording = false;
+        setColor(pixels.Color(100, 0, 0));
+      }
       break;
     }
 
-    case WStype_BIN:{
+    case WStype_BIN: {
+      if (length < 2) return;
+      
+      // Skip sequence number
+      uint8_t* audioData = payload + 2;
+      size_t audioLen = length - 2;
 
-      size_t bytes_written;
-      uint8_t* p=payload;
-
-      if(currentVolume!=1.0f && length<=MAX_CHUNK_SIZE){
-
-        memcpy(tempBuffer,payload,length);
-        applyVolume(tempBuffer,length,currentVolume);
-        p=tempBuffer;
-
+      if (audioLen % 2 != 0) audioLen--;
+      
+      if (audioLen > 0 && playback_active) {
+        directI2SWrite(audioData, audioLen);
+        chunks_received++;
       }
-
-      audioLevel=computeAudioLevel(p,length);
-
-      i2s_write(I2S_NUM_0,p,length,&bytes_written,portMAX_DELAY);
-
+      
+      lastActivity = millis();
       break;
     }
 
+    case WStype_PING:
+    case WStype_PONG:
+      lastWSPing = millis();
+      break;
+
+    case WStype_ERROR:
+      Serial.println("[WS] Error");
+      isWSConnected = false;
+      break;
   }
-
 }
 
-// --------------------
-// Face Animation
-// --------------------
-
-// --------------------
-// Setup
-// --------------------
-
-void setup(){
-
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
   Serial.begin(115200);
-
   pixels.begin();
+  setColor(pixels.Color(50, 50, 0));
 
-  setColor(pixels.Color(50,50,0));
+  prefs.begin("alexatron", false);
+  currentVolume = prefs.getFloat("volume", 0.32f);
 
-  prefs.begin("alexatron",false);
-
-  currentVolume=prefs.getFloat("volume",0.32f);
-
-  record_buffer=(uint8_t*)ps_malloc(RECORD_BUFFER_SIZE);
-
-  WiFiManager wm;
-
-  if(!wm.autoConnect("Alexatron")){
-
-    ESP.restart();
-
+  // Memory
+  record_buffer = (uint8_t*)ps_malloc(MAX_RECORDING_SIZE);
+  if (!record_buffer) {
+    Serial.println("[FATAL] No mem");
+    while (1) {
+      setColor(pixels.Color(255, 0, 0));
+      delay(200);
+      setColor(pixels.Color(0, 0, 0));
+      delay(200);
+    }
   }
 
-  i2s_config_t mic_cfg={
-    .mode=(i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_RX),
-    .sample_rate=RECORD_RATE,
-    .bits_per_sample=I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format=I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format=I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags=ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count=8,
-    .dma_buf_len=256
+  // WiFi
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(60);
+  wm.setDebugOutput(false);
+  setColor(pixels.Color(255, 255, 0));
+  
+  if (!wm.autoConnect("Alexatron")) {
+    delay(3000);
+    ESP.restart();
+  }
+  
+  Serial.printf("[WIFI] %s\n", WiFi.localIP().toString().c_str());
+  setColor(pixels.Color(0, 255, 0));
+  WiFi.setSleep(false);
+
+  // I2S MIC
+  i2s_config_t mic_cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = RECORD_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 128
   };
-
-  i2s_pin_config_t mic_p={
-    .bck_io_num=MIC_BCK,
-    .ws_io_num=MIC_WS,
-    .data_out_num=I2S_PIN_NO_CHANGE,
-    .data_in_num=MIC_SD
+  i2s_pin_config_t mic_p = {
+    .bck_io_num = MIC_BCK,
+    .ws_io_num = MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = MIC_SD
   };
+  i2s_driver_install(I2S_NUM_1, &mic_cfg, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &mic_p);
 
-  i2s_driver_install(I2S_NUM_1,&mic_cfg,0,NULL);
-  i2s_set_pin(I2S_NUM_1,&mic_p);
-
-  i2s_config_t dac_cfg={
-    .mode=(i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_TX),
-    .sample_rate=RECORD_RATE,
-    .bits_per_sample=I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format=I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format=I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags=ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count=32,
-    .dma_buf_len=512
+  // I2S DAC
+  i2s_config_t dac_cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = RECORD_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 16,
+    .dma_buf_len = 256,
+    .use_apll = true,
+    .tx_desc_auto_clear = true
   };
-
-  i2s_pin_config_t dac_p={
-    .bck_io_num=I2S_BCK,
-    .ws_io_num=I2S_WS,
-    .data_out_num=I2S_DOUT,
-    .data_in_num=I2S_PIN_NO_CHANGE
+  
+  i2s_pin_config_t dac_p = {
+    .bck_io_num = I2S_BCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_DOUT,
+    .data_in_num = I2S_PIN_NO_CHANGE
   };
+  
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &dac_cfg, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("[FATAL] DAC err: %d\n", err);
+    while (1) delay(100);
+  }
+  i2s_set_pin(I2S_NUM_0, &dac_p);
+  i2s_set_clk(I2S_NUM_0, RECORD_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-  i2s_driver_install(I2S_NUM_0,&dac_cfg,0,NULL);
-  i2s_set_pin(I2S_NUM_0,&dac_p);
+  // Prime with silence
+  i2s_zero_dma_buffer(I2S_NUM_0);
 
-  webSocket.beginSSL(WS_HOST,WS_PORT,WS_PATH);
-
+  // WebSocket
+  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(10000);
+  webSocket.enableHeartbeat(30000, 10000, 2);
 
+  Serial.println("=================================");
+  Serial.println("[SETUP] V22 IDLE FIX");
+  Serial.println("=================================");
+  setColor(pixels.Color(0, 100, 0));
+
+  lastActivity = millis();
+  lastWSPing = millis();
 }
 
-// --------------------
-// Loop
-// --------------------
-
-void loop(){
-
+// ============================================================================
+// LOOP - FIXED FINISH HANDLING
+// ============================================================================
+void loop() {
   webSocket.loop();
+  yield();
 
-  if(!isWSConnected) return;
-  if(isPlaying) return;
+  unsigned long now = millis();
 
-  int16_t sample_buffer[BUFFER_SIZE/2];
-
-  size_t bytes_read=0;
-
-  i2s_read(I2S_NUM_1,sample_buffer,BUFFER_SIZE,&bytes_read,10);
-
-  if(bytes_read==0) return;
-
-  float rms=calculateRMS(sample_buffer,bytes_read/2);
-
-  if(!is_recording){
-
-    if(rms>START_THRESHOLD) speech_frames++;
-    else speech_frames=0;
-
-    if(speech_frames>=SPEECH_CONFIRM){
-
-      is_recording=true;
-
-      record_pos=0;
-
-      silence_counter=0;
-
-      speech_frames=0;
-
-      record_start_time=millis();
-
-      setColor(pixels.Color(0,255,255));
-
+  // FIXED: Proper finish handling with grace period
+  if (playback_active && finish_received) {
+    // Check if grace period has passed since finish received
+    if (now - finish_receive_time > FINISH_GRACE_MS) {
+      Serial.println("[PLAY] Grace period over, stopping");
+      stopPlayback();
     }
-
   }
 
-  else{
-
-    if(record_pos+bytes_read<=RECORD_BUFFER_SIZE){
-
-      memcpy(record_buffer+record_pos,sample_buffer,bytes_read);
-      record_pos+=bytes_read;
-
+  // Timeout if no activity for 60 seconds
+  if (isWSConnected && (now - lastActivity > 60000)) {
+    if (playback_active) {
+      Serial.println("[TIMEOUT] No activity, forcing stop");
+      stopPlayback();
     }
+  }
 
-    if(rms<SILENCE_RMS){
+  if (!isWSConnected) {
+    if (is_recording) {
+      is_recording = false;
+      record_pos = 0;
+    }
+    return;
+  }
 
+  // Don't record if playing or preparing
+  if (playback_active || isPreparingPlayback) return;
+
+  int16_t sample_buffer[BUFFER_SIZE / 2];
+  size_t bytes_read = 0;
+
+  i2s_read(I2S_NUM_1, sample_buffer, BUFFER_SIZE, &bytes_read, 10);
+  if (bytes_read == 0) return;
+
+  float rms = calculateRMS(sample_buffer, bytes_read / 2);
+
+  if (!is_recording) {
+    if (rms > START_THRESHOLD) speech_frames++;
+    else speech_frames = 0;
+
+    if (speech_frames >= SPEECH_CONFIRM) {
+      is_recording = true;
+      record_pos = 0;
+      silence_counter = 0;
+      speech_frames = 0;
+      record_start_time = millis();
+      setColor(pixels.Color(0, 255, 255));
+      Serial.println("[REC] Start");
+    }
+  }
+  else {
+    recordToBuffer((uint8_t*)sample_buffer, bytes_read);
+
+    if (rms < SILENCE_RMS) {
       silence_counter++;
-
-      if(silence_counter>SILENCE_THRESH){
-
-        sendToServer();
+      if (silence_counter > SILENCE_THRESH) {
+        Serial.println("[REC] Silence -> Upload");
+        uploadRecording();
+        is_recording = false;
         return;
-
       }
-
+    }
+    else {
+      silence_counter = 0;
     }
 
-    else silence_counter=0;
-
-    if(millis()-record_start_time>MAX_RECORD_MS){
-
-      sendToServer();
-
+    if (millis() - record_start_time > MAX_RECORD_MS) {
+      Serial.println("[REC] Max -> Upload");
+      uploadRecording();
+      is_recording = false;
     }
-
   }
-
 }
