@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import { EdgeTTS } from "node-edge-tts";
+import { spawn } from "child_process";
 import { storage, pushSchema, verifySchema } from "./storage.js";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
@@ -23,16 +24,15 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 // AUDIO CONFIG
 // ============================================================================
 const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE_MONO = 512;       // 16kHz mono
+const AI_CHUNK_SIZE_MONO = 512;
 
-const MUSIC_SAMPLE_RATE = 44100;      // FIXED: 41kHz (CD quality)
-const MUSIC_CHUNK_SIZE_MONO = 1024;   // Smaller chunks for smoother streaming
+const MUSIC_SAMPLE_RATE = 44100;
+const MUSIC_CHUNK_SIZE_MONO = 1024;
 
-const SEND_INTERVAL_MS = 20;          // Slightly slower for stability
-const WS_KEEPALIVE_MS = 5000;         // Send ping every 5s during music
+const SEND_INTERVAL_MS = 20;
 
 // ============================================================================
-// DEBOUNCE & DEDUPLICATION
+// DEBOUNCE
 // ============================================================================
 const RECENT_REQUESTS = new Map<number, number>();
 const DEBOUNCE_MS = 3000;
@@ -80,30 +80,22 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// PCM GENERATION (AI — 16kHz MONO)
+// PCM GENERATION (AI)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=80",
-        "lowpass=f=8000",
+        "highpass=f=80", "lowpass=f=8000",
         "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.85",
-        "dynaudnorm=p=0.95:g=15"
+        "volume=0.85", "dynaudnorm=p=0.95:g=15"
       ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(AI_SAMPLE_RATE)
+      .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(AI_SAMPLE_RATE)
       .format("s16le")
       .on("error", reject)
-      .on("end", () => {
-        const pcm = fs.readFileSync(tmp);
-        fs.unlinkSync(tmp);
-        resolve(pcm);
-      })
+      .on("end", () => { const pcm = fs.readFileSync(tmp); fs.unlinkSync(tmp); resolve(pcm); })
       .save(tmp);
   });
 }
@@ -111,30 +103,17 @@ async function generatePCM(input: string): Promise<Buffer> {
 // ============================================================================
 // MOSTAKIM MUSIC API
 // ============================================================================
-interface YTSearchResult {
-  title: string;
-  thumbnail: string;
-  timestamp: string;
-  url: string;
-}
-
-interface YTDownloadResult {
-  status: boolean;
-  title: string;
-  url: string;
-  author: string;
-}
+interface YTSearchResult { title: string; thumbnail: string; timestamp: string; url: string; }
+interface YTDownloadResult { status: boolean; title: string; url: string; author: string; }
 
 async function searchYouTube(query: string): Promise<YTSearchResult | null> {
   try {
     const searchUrl = `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`;
     console.log("[MUSIC] Searching:", query);
-    const response = await fetch(searchUrl, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
-    });
-    if (!response.ok) { console.log("[MUSIC] Search error:", response.status); return null; }
+    const response = await fetch(searchUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+    if (!response.ok) return null;
     const results: YTSearchResult[] = await response.json();
-    if (!Array.isArray(results) || results.length === 0) { console.log("[MUSIC] No results"); return null; }
+    if (!Array.isArray(results) || results.length === 0) return null;
     console.log("[MUSIC] Found:", results[0].title);
     return results[0];
   } catch (e: any) { console.error("[MUSIC] Search error:", e.message); return null; }
@@ -143,9 +122,7 @@ async function searchYouTube(query: string): Promise<YTSearchResult | null> {
 async function getDownloadUrl(youtubeUrl: string): Promise<string | null> {
   try {
     const dlUrl = `https://mostakim.onrender.com/m/ytDl?url=${encodeURIComponent(youtubeUrl)}`;
-    const response = await fetch(dlUrl, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
-    });
+    const response = await fetch(dlUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
     if (!response.ok) return null;
     const data: YTDownloadResult = await response.json();
     if (!data.status || !data.url) return null;
@@ -157,25 +134,6 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
   const searchResult = await searchYouTube(query);
   if (!searchResult) return null;
   return await getDownloadUrl(searchResult.url);
-}
-
-// ============================================================================
-// DOWNLOAD MUSIC FILE
-// ============================================================================
-async function downloadMusicFile(musicUrl: string, outputPath: string): Promise<void> {
-  console.log("[DOWNLOAD] Starting:", outputPath);
-  const response = await fetch(musicUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      "Accept": "*/*", "Accept-Encoding": "identity",
-      "Referer": "https://mostakim.onrender.com/",
-    },
-    redirect: "follow",
-  });
-  if (!response.ok) throw new Error(`Download failed: ${response.status}`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-  fs.writeFileSync(outputPath, buffer);
-  console.log("[DOWNLOAD] Saved", buffer.length, "bytes");
 }
 
 // ============================================================================
@@ -208,10 +166,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     }
     await new Promise(r => setTimeout(r, 500));
     for (let retry = 0; retry < 3; retry++) {
-      if (ws.readyState === ws.OPEN) {
-        ws.send("FINISH_RESPONSE:" + sessionId);
-        await new Promise(r => setTimeout(r, 200));
-      }
+      if (ws.readyState === ws.OPEN) { ws.send("FINISH_RESPONSE:" + sessionId); await new Promise(r => setTimeout(r, 200)); }
     }
     console.log("[STREAM] AI done:", seq, "chunks");
   } catch (e: any) {
@@ -221,96 +176,135 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// STREAM MUSIC PCM (41kHz MONO) — CHUNKED TO PREVENT DISCONNECT
+// REAL-TIME MUSIC STREAMING — NO TEMP FILES!
+// FFmpeg pipes directly from URL -> PCM -> WebSocket
 // ============================================================================
-async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
+async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  const tmpFile = path.join(AUDIO_DIR, "tmp_music_" + sessionId + ".mp4");
-  const pcmPath = path.join(AUDIO_DIR, "music_" + sessionId + ".pcm");
+  console.log("[MUSIC] Starting REAL-TIME stream:", sessionId);
 
-  try {
-    await downloadMusicFile(mp3Url, tmpFile);
+  return new Promise<void>((resolve, reject) => {
+    // Step 1: Start FFmpeg that reads from URL and outputs PCM to stdout
+    const ffmpegArgs = [
+      "-re",                          // Read at native frame rate (throttle)
+      "-i", musicUrl,                 // Input URL
+      "-vn",                          // No video
+      "-af", "highpass=f=60,lowpass=f=18000,aresample=44100:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
+      "-acodec", "pcm_s16le",
+      "-ac", "1",
+      "-ar", "44100",
+      "-f", "s16le",
+      "pipe:1"                        // Output to stdout
+    ];
 
-    console.log("[MUSIC] Converting to 41kHz mono PCM...");
-    await new Promise<void>((resolve, reject) => {
-      ffmpeg(tmpFile)
-        .audioFilters([
-          "highpass=f=60",           // Lower highpass para hindi mawala bass
-          "lowpass=f=18000",         // Higher lowpass para full range
-          "aresample=" + MUSIC_SAMPLE_RATE + ":resampler=soxr:precision=28",
-          "aformat=sample_fmts=s16:channel_layouts=mono",
-          "volume=0.65",             // Lower volume para hindi clip
-          "loudnorm=I=-16:TP=-1.5:LRA=11",  // Better than dynaudnorm para music
-          "equalizer=f=100:t=h:width=200:g=-2",  // Reduce muddiness
-          "equalizer=f=8000:t=h:width=2000:g=2"  // Slight treble boost
-        ])
-        .audioCodec("pcm_s16le")
-        .audioChannels(1)
-        .audioFrequency(MUSIC_SAMPLE_RATE)
-        .format("s16le")
-        .on("error", (err) => { console.error("[MUSIC] FFmpeg:", err.message); reject(err); })
-        .on("end", () => { console.log("[MUSIC] Conversion done"); resolve(); })
-        .save(pcmPath);
+    const ffmpegProc = spawn("ffmpeg", ffmpegArgs, {
+      stdio: ["ignore", "pipe", "pipe"]
     });
 
-    try { fs.unlinkSync(tmpFile); } catch {}
-    if (!fs.existsSync(pcmPath)) throw new Error("PCM conversion failed");
-
-    const pcm = fs.readFileSync(pcmPath);
-    try { fs.unlinkSync(pcmPath); } catch {}
-
-    console.log("[MUSIC] PCM:", pcm.length, "bytes @ 41kHz");
-    if (ws.readyState !== ws.OPEN) return;
-
-    const alignedLen = Math.floor(pcm.length / MUSIC_CHUNK_SIZE_MONO) * MUSIC_CHUNK_SIZE_MONO;
-    const totalChunks = alignedLen / MUSIC_CHUNK_SIZE_MONO;
-    console.log("[MUSIC] Streaming", totalChunks, "chunks");
-
-    ws.send("SESSION:" + sessionId);
-    await new Promise(r => setTimeout(r, 100));
-    ws.send("PREPARE_MUSIC:" + totalChunks);
-    await new Promise(r => setTimeout(r, 300));
-    ws.send("START_MUSIC");
-    await new Promise(r => setTimeout(r, 100));
-
+    let buffer = Buffer.alloc(0);
     let seq = 0;
-    let lastKeepalive = Date.now();
+    let started = false;
+    let finished = false;
+    let chunkCount = 0;
 
-    for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE_MONO) {
-      if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS closed mid-stream"); return; }
+    // Handle FFmpeg stderr (for debugging)
+    ffmpegProc.stderr.on("data", (data) => {
+      const line = data.toString().trim();
+      if (line.includes("Error") || line.includes("error")) {
+        console.log("[FFMPEG]", line.substring(0, 100));
+      }
+    });
 
-      const chunk = pcm.subarray(i, i + MUSIC_CHUNK_SIZE_MONO);
-      const packet = Buffer.allocUnsafe(2 + chunk.length);
-      packet.writeUInt16BE(seq & 0xFFFF, 0);
-      packet.set(chunk, 2);
-      ws.send(packet, { binary: true });
-      seq++;
+    // Handle FFmpeg errors
+    ffmpegProc.on("error", (err) => {
+      console.error("[MUSIC] FFmpeg spawn error:", err.message);
+      if (!finished) {
+        finished = true;
+        try { ws.send("ERROR:MUSIC_FAILED"); ws.send("FINISH_MUSIC:ERROR"); } catch {}
+        reject(err);
+      }
+    });
 
-      // Send keepalive during long music to prevent timeout
-      if (Date.now() - lastKeepalive > WS_KEEPALIVE_MS) {
-        try { ws.send("PING:" + seq); } catch {}
-        lastKeepalive = Date.now();
+    ffmpegProc.on("close", (code) => {
+      console.log("[MUSIC] FFmpeg exited:", code);
+      if (!finished) {
+        finished = true;
+        // Send remaining buffer
+        if (buffer.length >= MUSIC_CHUNK_SIZE_MONO && ws.readyState === ws.OPEN) {
+          const alignedLen = Math.floor(buffer.length / MUSIC_CHUNK_SIZE_MONO) * MUSIC_CHUNK_SIZE_MONO;
+          for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE_MONO) {
+            const chunk = buffer.subarray(i, i + MUSIC_CHUNK_SIZE_MONO);
+            const packet = Buffer.allocUnsafe(2 + chunk.length);
+            packet.writeUInt16BE(seq & 0xFFFF, 0);
+            packet.set(chunk, 2);
+            try { ws.send(packet, { binary: true }); seq++; } catch {}
+          }
+        }
+        // Send finish
+        for (let retry = 0; retry < 3; retry++) {
+          if (ws.readyState === ws.OPEN) {
+            try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
+          }
+        }
+        console.log("[MUSIC] Stream done:", chunkCount, "chunks");
+        resolve();
+      }
+    });
+
+    // Read PCM data from FFmpeg stdout
+    ffmpegProc.stdout.on("data", async (data: Buffer) => {
+      buffer = Buffer.concat([buffer, data]);
+
+      // Start streaming once we have enough buffer
+      if (!started && buffer.length >= MUSIC_CHUNK_SIZE_MONO * 10) {
+        started = true;
+        console.log("[MUSIC] Buffer ready, starting stream...");
+
+        ws.send("SESSION:" + sessionId);
+        await new Promise(r => setTimeout(r, 100));
+        ws.send("PREPARE_MUSIC:0");  // 0 = unknown total, streaming mode
+        await new Promise(r => setTimeout(r, 300));
+        ws.send("START_MUSIC");
+        await new Promise(r => setTimeout(r, 100));
       }
 
-      await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
-    }
+      // Stream chunks as they come
+      while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && !finished) {
+        if (ws.readyState !== ws.OPEN) {
+          console.log("[MUSIC] WS closed, killing FFmpeg");
+          finished = true;
+          ffmpegProc.kill("SIGKILL");
+          return;
+        }
 
-    await new Promise(r => setTimeout(r, 500));
-    for (let retry = 0; retry < 3; retry++) {
-      if (ws.readyState === ws.OPEN) {
-        ws.send("FINISH_MUSIC:" + sessionId);
-        await new Promise(r => setTimeout(r, 200));
+        const chunk = buffer.subarray(0, MUSIC_CHUNK_SIZE_MONO);
+        buffer = buffer.subarray(MUSIC_CHUNK_SIZE_MONO);
+
+        const packet = Buffer.allocUnsafe(2 + chunk.length);
+        packet.writeUInt16BE(seq & 0xFFFF, 0);
+        packet.set(chunk, 2);
+
+        ws.send(packet, { binary: true });
+        seq++;
+        chunkCount++;
+
+        // Small delay to not overwhelm mobile data
+        await new Promise(r => setTimeout(r, 15));
       }
-    }
-    console.log("[MUSIC] Done:", seq, "chunks");
+    });
 
-  } catch (e: any) {
-    console.error("[MUSIC] Error:", e.message);
-    try { fs.unlinkSync(tmpFile); } catch {}
-    try { fs.unlinkSync(pcmPath); } catch {}
-    try { ws.send("ERROR:MUSIC_FAILED"); ws.send("FINISH_MUSIC:ERROR"); } catch {}
-  }
+    // Timeout safety
+    setTimeout(() => {
+      if (!finished) {
+        console.log("[MUSIC] Timeout, stopping stream");
+        finished = true;
+        ffmpegProc.kill("SIGKILL");
+        try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
+        resolve();
+      }
+    }, 600000); // 10 minute max
+  });
 }
 
 // ============================================================================
@@ -335,10 +329,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
     console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes");
 
     const stt = await Promise.race([
-      sttClient.audio.transcriptions.create({
-        file: fs.createReadStream(wavPath),
-        model: "whisper-large-v3-turbo", language: "en"
-      }),
+      sttClient.audio.transcriptions.create({ file: fs.createReadStream(wavPath), model: "whisper-large-v3-turbo", language: "en" }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
 
@@ -376,9 +367,7 @@ Return ONLY the JSON.`;
     ];
 
     const ai = await Promise.race([
-      llmClient.chat.completions.create({
-        model: "llama-3.3-70b-versatile", messages, max_tokens: 150, temperature: 0.7
-      }),
+      llmClient.chat.completions.create({ model: "llama-3.3-70b-versatile", messages, max_tokens: 150, temperature: 0.7 }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
     ]);
 
@@ -395,8 +384,8 @@ Return ONLY the JSON.`;
     await storage.addMessage(userId, "assistant", text);
 
     if (musicQuery) {
-      const mp3Url = await fetchMusicUrl(musicQuery);
-      if (!mp3Url) { ws.send("ERROR:MUSIC_NOT_FOUND"); return; }
+      const musicUrl = await fetchMusicUrl(musicQuery);
+      if (!musicUrl) { ws.send("ERROR:MUSIC_NOT_FOUND"); return; }
 
       if (text && !nameResponse) {
         const introId = uniqueId + "_intro";
@@ -408,7 +397,9 @@ Return ONLY the JSON.`;
         await streamPCM(ws, introPcm, introId);
         await new Promise(r => setTimeout(r, 1000));
       }
-      await streamMusic(ws, mp3Url, uniqueId + "_music");
+
+      // REAL-TIME STREAMING — no download!
+      await streamMusicRealtime(ws, musicUrl, uniqueId + "_music");
     } else {
       const tts = new EdgeTTS();
       const mp3 = path.join(AUDIO_DIR, uniqueId + ".mp3");
@@ -445,7 +436,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V27 41kHz Stereo Music [Mostakim API]");
+    console.log("ESP connected - V28 REAL-TIME STREAMING [Mostakim API]");
     let processing = false;
     let currentUserId: number | null = null;
     let messageCount = 0;
