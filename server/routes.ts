@@ -23,9 +23,6 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 // AUDIO CONFIG — STEREO OUTPUT FOR BOTH AI AND MUSIC
 // ============================================================================
 const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE = 1024;           // STEREO: 512 samples * 2 bytes * 2 ch = 2048? No, server sends mono, ESP converts
-// Actually server sends MONO PCM, ESP32 will convert to stereo
-// So server chunk size stays as mono bytes, ESP32 doubles it
 const AI_CHUNK_SIZE_MONO = 512;       // mono bytes = 256 samples * 2 bytes
 
 const MUSIC_SAMPLE_RATE = 48000;
@@ -125,43 +122,113 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// FETCH MUSIC URL FROM YT-DLP API — FIXED URL BUG
+// NEW MUSIC API — MOSTAKIM YT SEARCH + DOWNLOAD
 // ============================================================================
-async function fetchMusicUrl(query: string): Promise<string | null> {
+
+interface YTSearchResult {
+  title: string;
+  thumbnail: string;
+  timestamp: string;
+  url: string;
+}
+
+interface YTDownloadResult {
+  status: boolean;
+  title: string;
+  url: string;
+  author: string;
+}
+
+async function searchYouTube(query: string): Promise<YTSearchResult | null> {
   try {
-    // FIXED: Changed from `?=` to `query=` — this was a bug!
-    const url = `https://yt-dlp-stream.onrender.com/api/v2/q?query=${encodeURIComponent(query)}`;
+    const searchUrl = `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`;
     console.log("[MUSIC] Searching:", query);
-    const response = await fetch(url);
+
+    const response = await fetch(searchUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+      }
+    });
+
     if (!response.ok) {
-      console.log("[MUSIC] API error status:", response.status);
+      console.log("[MUSIC] Search API error:", response.status);
       return null;
     }
-    const data = await response.json();
-    const mp3Url = data?.media?.mp3;
-    if (!mp3Url || typeof mp3Url !== "string") {
-      console.log("[MUSIC] No MP3 URL in response");
+
+    const results: YTSearchResult[] = await response.json();
+
+    if (!Array.isArray(results) || results.length === 0) {
+      console.log("[MUSIC] No results found");
       return null;
     }
-    return mp3Url.trim();
+
+    // Pick first result (most relevant)
+    const best = results[0];
+    console.log("[MUSIC] Found:", best.title, "-", best.timestamp);
+    return best;
+
   } catch (e: any) {
-    console.error("[MUSIC] Fetch error:", e.message);
+    console.error("[MUSIC] Search error:", e.message);
     return null;
   }
 }
 
+async function getDownloadUrl(youtubeUrl: string): Promise<string | null> {
+  try {
+    const dlUrl = `https://mostakim.onrender.com/m/ytDl?url=${encodeURIComponent(youtubeUrl)}`;
+    console.log("[MUSIC] Getting download URL for:", youtubeUrl);
+
+    const response = await fetch(dlUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      console.log("[MUSIC] Download API error:", response.status);
+      return null;
+    }
+
+    const data: YTDownloadResult = await response.json();
+
+    if (!data.status || !data.url) {
+      console.log("[MUSIC] No download URL in response");
+      return null;
+    }
+
+    console.log("[MUSIC] Download ready:", data.title);
+    return data.url;
+
+  } catch (e: any) {
+    console.error("[MUSIC] Download error:", e.message);
+    return null;
+  }
+}
+
+async function fetchMusicUrl(query: string): Promise<string | null> {
+  // Step 1: Search
+  const searchResult = await searchYouTube(query);
+  if (!searchResult) return null;
+
+  // Step 2: Get download URL
+  const downloadUrl = await getDownloadUrl(searchResult.url);
+  return downloadUrl;
+}
+
 // ============================================================================
-// DOWNLOAD MP3 TO TEMP FILE
+// DOWNLOAD MP3/MP4 TO TEMP FILE
 // ============================================================================
-async function downloadMp3(mp3Url: string, outputPath: string): Promise<void> {
+async function downloadMusicFile(musicUrl: string, outputPath: string): Promise<void> {
   console.log("[DOWNLOAD] Starting download to:", outputPath);
 
-  const response = await fetch(mp3Url, {
+  const response = await fetch(musicUrl, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Accept": "*/*",
       "Accept-Encoding": "identity",
-      "Referer": "https://yt-dlp-stream.onrender.com/",
+      "Referer": "https://mostakim.onrender.com/",
     },
     redirect: "follow",
   });
@@ -245,15 +312,15 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
     return;
   }
 
-  const tmpMp3 = path.join(AUDIO_DIR, "tmp_music_" + sessionId + ".mp3");
+  const tmpFile = path.join(AUDIO_DIR, "tmp_music_" + sessionId + ".mp4");
   const pcmPath = path.join(AUDIO_DIR, "music_" + sessionId + ".pcm");
 
   try {
-    await downloadMp3(mp3Url, tmpMp3);
+    await downloadMusicFile(mp3Url, tmpFile);
 
-    console.log("[MUSIC] Converting MP3 -> 48kHz MONO PCM...");
+    console.log("[MUSIC] Converting to 48kHz MONO PCM...");
     await new Promise<void>((resolve, reject) => {
-      ffmpeg(tmpMp3)
+      ffmpeg(tmpFile)
         .audioFilters([
           "highpass=f=80",
           "lowpass=f=16000",
@@ -277,7 +344,7 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
         .save(pcmPath);
     });
 
-    try { fs.unlinkSync(tmpMp3); } catch {}
+    try { fs.unlinkSync(tmpFile); } catch {}
 
     if (!fs.existsSync(pcmPath)) {
       throw new Error("PCM conversion failed");
@@ -338,7 +405,7 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
 
   } catch (e: any) {
     console.error("[MUSIC] Error:", e.message);
-    try { fs.unlinkSync(tmpMp3); } catch {}
+    try { fs.unlinkSync(tmpFile); } catch {}
     try { fs.unlinkSync(pcmPath); } catch {}
     try {
       ws.send("ERROR:MUSIC_FAILED");
@@ -541,7 +608,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - Voice AI with 48kHz Music + STEREO");
+    console.log("ESP connected - Voice AI with 48kHz Music + STEREO [Mostakim API]");
 
     let processing = false;
     let currentUserId: number | null = null;
