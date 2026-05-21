@@ -20,12 +20,17 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG
+// AUDIO CONFIG — STEREO OUTPUT FOR BOTH AI AND MUSIC
 // ============================================================================
 const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE = 512;
+const AI_CHUNK_SIZE = 1024;           // STEREO: 512 samples * 2 bytes * 2 ch = 2048? No, server sends mono, ESP converts
+// Actually server sends MONO PCM, ESP32 will convert to stereo
+// So server chunk size stays as mono bytes, ESP32 doubles it
+const AI_CHUNK_SIZE_MONO = 512;       // mono bytes = 256 samples * 2 bytes
+
 const MUSIC_SAMPLE_RATE = 48000;
-const MUSIC_CHUNK_SIZE = 1536;
+const MUSIC_CHUNK_SIZE_MONO = 1536;   // mono bytes = 768 samples * 2 bytes
+
 const SEND_INTERVAL_MS = 16;
 
 // ============================================================================
@@ -37,12 +42,12 @@ const DEBOUNCE_MS = 3000;
 function isDuplicate(userId: number): boolean {
   const now = Date.now();
   const last = RECENT_REQUESTS.get(userId);
-  
+
   if (last && (now - last) < DEBOUNCE_MS) {
     console.log("[DEBOUNCE] Duplicate request blocked for user:", userId);
     return true;
   }
-  
+
   RECENT_REQUESTS.set(userId, now);
   return false;
 }
@@ -52,7 +57,7 @@ function isDuplicate(userId: number): boolean {
 // ============================================================================
 function extractName(text: string): { action: "save" | "delete" | "none"; name: string | null } {
   const lower = text.toLowerCase();
-  
+
   const deletePatterns = [
     /delete\s+(?:my\s+)?name/i,
     /remove\s+(?:my\s+)?name/i,
@@ -62,20 +67,20 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
     /burahin\s+(?:ang\s+)?pangalan\s+ko/i,
     /alisin\s+(?:ang\s+)?pangalan\s+ko/i,
   ];
-  
+
   for (const pattern of deletePatterns) {
     if (pattern.test(lower)) {
       return { action: "delete", name: null };
     }
   }
-  
+
   const savePatterns = [
     /(?:my\s+name\s+is|i\s+am|call\s+me|i'm)\s+([a-zA-Z\s]+)/i,
     /pangalan\s+ko\s+ay\s+([a-zA-Z\s]+)/i,
     /ako\s+si\s+([a-zA-Z\s]+)/i,
     /tawagin\s+mo\s+akong\s+([a-zA-Z\s]+)/i,
   ];
-  
+
   for (const pattern of savePatterns) {
     const match = lower.match(pattern);
     if (match && match[1]) {
@@ -85,16 +90,16 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
       }
     }
   }
-  
+
   return { action: "none", name: null };
 }
 
 // ============================================================================
-// PCM GENERATION (AI — 16kHz)
+// PCM GENERATION (AI — 16kHz MONO) — ESP32 will convert to stereo
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
-  
+
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
@@ -120,11 +125,12 @@ async function generatePCM(input: string): Promise<Buffer> {
 }
 
 // ============================================================================
-// FETCH MUSIC URL FROM YT-DLP API
+// FETCH MUSIC URL FROM YT-DLP API — FIXED URL BUG
 // ============================================================================
 async function fetchMusicUrl(query: string): Promise<string | null> {
   try {
-    const url = `https://yt-dlp-stream.onrender.com/api/v2/q?=${encodeURIComponent(query)}`;
+    // FIXED: Changed from `?=` to `query=` — this was a bug!
+    const url = `https://yt-dlp-stream.onrender.com/api/v2/q?query=${encodeURIComponent(query)}`;
     console.log("[MUSIC] Searching:", query);
     const response = await fetch(url);
     if (!response.ok) {
@@ -149,7 +155,7 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 // ============================================================================
 async function downloadMp3(mp3Url: string, outputPath: string): Promise<void> {
   console.log("[DOWNLOAD] Starting download to:", outputPath);
-  
+
   const response = await fetch(mp3Url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -159,59 +165,59 @@ async function downloadMp3(mp3Url: string, outputPath: string): Promise<void> {
     },
     redirect: "follow",
   });
-  
+
   if (!response.ok) {
     throw new Error(`Download failed: ${response.status} ${response.statusText}`);
   }
-  
+
   const buffer = Buffer.from(await response.arrayBuffer());
   fs.writeFileSync(outputPath, buffer);
   console.log("[DOWNLOAD] Saved", buffer.length, "bytes");
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz)
+// STREAM AI RESPONSE PCM (16kHz MONO) — ESP32 converts to STEREO
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) {
     console.log("[STREAM] WebSocket not open, aborting");
     return;
   }
-  
-  const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE) * AI_CHUNK_SIZE;
-  const totalChunks = alignedLen / AI_CHUNK_SIZE;
-  
-  console.log("[STREAM] AI session:", sessionId, "chunks:", totalChunks, "@ 16kHz");
-  
+
+  const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
+  const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
+
+  console.log("[STREAM] AI session:", sessionId, "chunks:", totalChunks, "@ 16kHz mono -> ESP stereo");
+
   ws.send("SESSION:" + sessionId);
   await new Promise(r => setTimeout(r, 100));
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await new Promise(r => setTimeout(r, 300));
   ws.send("START_RESPONSE");
   await new Promise(r => setTimeout(r, 100));
-  
+
   let seq = 0;
-  
+
   try {
-    for (let i = 0; i < alignedLen; i += AI_CHUNK_SIZE) {
+    for (let i = 0; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
       if (ws.readyState !== ws.OPEN) {
         console.log("[STREAM] WebSocket closed mid-stream");
         return;
       }
-      
-      const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE);
+
+      const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE_MONO);
       const packet = Buffer.allocUnsafe(2 + chunk.length);
       packet.writeUInt16BE(seq & 0xFFFF, 0);
       packet.set(chunk, 2);
-      
+
       ws.send(packet, { binary: true });
       seq++;
-      
+
       await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
     }
-    
+
     await new Promise(r => setTimeout(r, 500));
-    
+
     for (let retry = 0; retry < 3; retry++) {
       if (ws.readyState === ws.OPEN) {
         ws.send("FINISH_RESPONSE:" + sessionId);
@@ -219,9 +225,9 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
         await new Promise(r => setTimeout(r, 200));
       }
     }
-    
+
     console.log("[STREAM] AI completed:", sessionId, "sent", seq, "chunks");
-    
+
   } catch (e: any) {
     console.error("[STREAM] Error:", e.message);
     try {
@@ -231,21 +237,21 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// STREAM MUSIC PCM (48kHz)
+// STREAM MUSIC PCM (48kHz MONO) — ESP32 converts to STEREO
 // ============================================================================
 async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) {
     console.log("[MUSIC] WebSocket not open");
     return;
   }
-  
+
   const tmpMp3 = path.join(AUDIO_DIR, "tmp_music_" + sessionId + ".mp3");
   const pcmPath = path.join(AUDIO_DIR, "music_" + sessionId + ".pcm");
-  
+
   try {
     await downloadMp3(mp3Url, tmpMp3);
-    
-    console.log("[MUSIC] Converting MP3 -> 48kHz PCM...");
+
+    console.log("[MUSIC] Converting MP3 -> 48kHz MONO PCM...");
     await new Promise<void>((resolve, reject) => {
       ffmpeg(tmpMp3)
         .audioFilters([
@@ -270,56 +276,56 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
         })
         .save(pcmPath);
     });
-    
+
     try { fs.unlinkSync(tmpMp3); } catch {}
-    
+
     if (!fs.existsSync(pcmPath)) {
       throw new Error("PCM conversion failed");
     }
-    
+
     const pcm = fs.readFileSync(pcmPath);
     try { fs.unlinkSync(pcmPath); } catch {}
-    
-    console.log("[MUSIC] PCM:", pcm.length, "bytes @ 48kHz");
-    
+
+    console.log("[MUSIC] PCM:", pcm.length, "bytes @ 48kHz mono -> ESP stereo");
+
     if (ws.readyState !== ws.OPEN) {
       console.log("[MUSIC] WebSocket closed after conversion");
       return;
     }
-    
-    const alignedLen = Math.floor(pcm.length / MUSIC_CHUNK_SIZE) * MUSIC_CHUNK_SIZE;
-    const totalChunks = alignedLen / MUSIC_CHUNK_SIZE;
-    
-    console.log("[MUSIC] Streaming", totalChunks, "chunks @ 48kHz");
-    
+
+    const alignedLen = Math.floor(pcm.length / MUSIC_CHUNK_SIZE_MONO) * MUSIC_CHUNK_SIZE_MONO;
+    const totalChunks = alignedLen / MUSIC_CHUNK_SIZE_MONO;
+
+    console.log("[MUSIC] Streaming", totalChunks, "chunks @ 48kHz mono");
+
     ws.send("SESSION:" + sessionId);
     await new Promise(r => setTimeout(r, 100));
     ws.send("PREPARE_MUSIC:" + totalChunks);
     await new Promise(r => setTimeout(r, 300));
     ws.send("START_MUSIC");
     await new Promise(r => setTimeout(r, 100));
-    
+
     let seq = 0;
-    
-    for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE) {
+
+    for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE_MONO) {
       if (ws.readyState !== ws.OPEN) {
         console.log("[MUSIC] WebSocket closed mid-stream");
         return;
       }
-      
-      const chunk = pcm.subarray(i, i + MUSIC_CHUNK_SIZE);
+
+      const chunk = pcm.subarray(i, i + MUSIC_CHUNK_SIZE_MONO);
       const packet = Buffer.allocUnsafe(2 + chunk.length);
       packet.writeUInt16BE(seq & 0xFFFF, 0);
       packet.set(chunk, 2);
-      
+
       ws.send(packet, { binary: true });
       seq++;
-      
+
       await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
     }
-    
+
     await new Promise(r => setTimeout(r, 500));
-    
+
     for (let retry = 0; retry < 3; retry++) {
       if (ws.readyState === ws.OPEN) {
         ws.send("FINISH_MUSIC:" + sessionId);
@@ -327,9 +333,9 @@ async function streamMusic(ws: WebSocket, mp3Url: string, sessionId: string) {
         await new Promise(r => setTimeout(r, 200));
       }
     }
-    
+
     console.log("[MUSIC] Completed session:", sessionId, "sent", seq, "chunks @ 48kHz");
-    
+
   } catch (e: any) {
     console.error("[MUSIC] Error:", e.message);
     try { fs.unlinkSync(tmpMp3); } catch {}
@@ -474,7 +480,7 @@ Return ONLY the JSON.`;
         filesToCleanup.push(introMp3);
         const introPcm = await generatePCM(introMp3);
         await streamPCM(ws, introPcm, introId);
-        
+
         await new Promise(r => setTimeout(r, 1000));
       }
 
@@ -535,7 +541,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - Voice AI with 48kHz Music");
+    console.log("ESP connected - Voice AI with 48kHz Music + STEREO");
 
     let processing = false;
     let currentUserId: number | null = null;
@@ -544,16 +550,16 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     ws.on("message", async (data: any, isBinary: boolean) => {
       messageCount++;
       const currentMsgNum = messageCount;
-      
+
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
-        
+
         if (msg === "READY") {
           console.log("[WS] ESP ready");
           ws.send("STATE:IDLE");
         }
-        
+
         if (msg.startsWith("USER:")) {
           const userName = msg.replace("USER:", "").trim();
           try {
@@ -566,7 +572,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
             ws.send("ERROR:USER_FAILED");
           }
         }
-        
+
         return;
       }
 
