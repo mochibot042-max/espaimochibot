@@ -21,20 +21,17 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — ULTRA: Synced with ESP V30-ULTRA for weak hotspot
+// AUDIO CONFIG — FIXED: Faster intervals to prevent ESP32 buffer underrun
 // ============================================================================
-// AI: 16kHz mono, 1024 bytes = 32ms audio → ESP tick every 64ms (plays 2x)
-// Music: 44.1kHz mono, 2048 bytes = 23.2ms audio → ESP tick every 46ms
-// Server sends slightly faster than ESP consumes to keep buffer full
 const AI_SAMPLE_RATE = 16000;
 const AI_CHUNK_SIZE_MONO = 1024;     // 32ms @ 16kHz mono
-const SEND_INTERVAL_MS_AI = 60;       // Slower than real-time for weak hotspot
-const PREBUFFER_CHUNKS_AI = 24;       // ~1.5 seconds prebuffer
+const SEND_INTERVAL_MS_AI = 28;       // <<< FIXED: 28ms (faster than 32ms real-time)
+const PREBUFFER_CHUNKS_AI = 24;       // ~768ms prebuffer
 
 const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;  // 23.2ms @ 44.1kHz mono
-const SEND_INTERVAL_MS_MUSIC = 44;    // Slightly slower than 23ms x 2
-const PREBUFFER_CHUNKS_MUSIC = 32;    // ~1.5 seconds prebuffer
+const SEND_INTERVAL_MS_MUSIC = 20;    // <<< FIXED: 20ms (faster than 23.2ms real-time)
+const PREBUFFER_CHUNKS_MUSIC = 32;    // ~742ms prebuffer
 
 // ============================================================================
 // DEBOUNCE
@@ -113,7 +110,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
 }
 
 // ============================================================================
-// PCM GENERATION (AI) — Optimized for streaming
+// PCM GENERATION (AI)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -170,7 +167,7 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO) — ULTRA for weak hotspot
+// STREAM AI RESPONSE PCM (16kHz MONO) — FIXED INTERVALS
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
@@ -184,7 +181,6 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await delay(300);
 
-  // === ULTRA PRE-BUFFER: Send first N chunks silently ===
   let seq = 0;
   const prebufferLimit = Math.min(PREBUFFER_CHUNKS_AI, totalChunks);
 
@@ -199,12 +195,10 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     await delay(SEND_INTERVAL_MS_AI);
   }
 
-  // Now tell ESP to start — jitter buffer already has 1.5s of data
   ws.send("START_RESPONSE");
   await delay(100);
   console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", prebufferLimit * 32, "ms), started playback");
 
-  // Continue rest of chunks — slower than real-time to let buffer grow
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
       if (ws.readyState !== ws.OPEN) return;
@@ -232,12 +226,12 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — ULTRA for weak hotspot
+// REAL-TIME MUSIC STREAMING — FIXED INTERVALS
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting ULTRA stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
+  console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
 
   return new Promise<void>((resolve, reject) => {
     const ffmpegArgs = [
@@ -283,7 +277,6 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       console.log("[MUSIC] FFmpeg exited:", code);
       if (!finished) {
         finished = true;
-        // Send remaining buffer
         if (buffer.length >= MUSIC_CHUNK_SIZE_MONO && ws.readyState === ws.OPEN) {
           const alignedLen = Math.floor(buffer.length / MUSIC_CHUNK_SIZE_MONO) * MUSIC_CHUNK_SIZE_MONO;
           for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE_MONO) {
@@ -307,7 +300,6 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
     ffmpegProc.stdout.on("data", async (data: Buffer) => {
       buffer = Buffer.concat([buffer, data]);
 
-      // Collect ULTRA prebuffer first
       if (!started) {
         while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && prebufferChunks.length < PREBUFFER_CHUNKS_MUSIC) {
           const chunk = buffer.subarray(0, MUSIC_CHUNK_SIZE_MONO);
@@ -317,14 +309,13 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] ULTRA prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
           ws.send("PREPARE_MUSIC:0");
           await delay(300);
 
-          // Send prebuffer chunks first
           for (const chunk of prebufferChunks) {
             if (ws.readyState !== ws.OPEN) {
               finished = true;
@@ -342,12 +333,11 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
           ws.send("START_MUSIC");
           await delay(100);
-          console.log("[MUSIC] Playback started after ULTRA prebuffer");
+          console.log("[MUSIC] Playback started after prebuffer");
         }
         return;
       }
 
-      // Normal streaming after prebuffer — slower than real-time
       while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && !finished) {
         if (ws.readyState !== ws.OPEN) {
           console.log("[MUSIC] WS closed, killing FFmpeg");
@@ -371,7 +361,6 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       }
     });
 
-    // Timeout safety
     setTimeout(() => {
       if (!finished) {
         console.log("[MUSIC] Timeout, stopping stream");
@@ -475,7 +464,6 @@ Return ONLY the JSON.`;
         const introId = uniqueId + "_intro";
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
 
-        // Use Filipino TTS for intro
         await generateEdgeTTS(text, introMp3);
         filesToCleanup.push(introMp3);
 
@@ -488,7 +476,6 @@ Return ONLY the JSON.`;
     } else {
       const mp3 = path.join(AUDIO_DIR, uniqueId + ".mp3");
 
-      // Use Filipino TTS
       await generateEdgeTTS(text, mp3);
       filesToCleanup.push(mp3);
 
@@ -523,7 +510,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V30-ULTRA WEAK HOTSPOT [fil-PH-AngeloNeural TTS]");
+    console.log("ESP connected - FIXED CHOPPY AUDIO [fil-PH-AngeloNeural TTS]");
     let processing = false;
     let currentUserId: number | null = null;
     let messageCount = 0;
