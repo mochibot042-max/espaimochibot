@@ -5,7 +5,7 @@ import Groq from "groq-sdk";
 import fs from "fs";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
-import { EdgeTTS } from "node-edge-tts";
+import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { spawn } from "child_process";
 import { storage, pushSchema, verifySchema } from "./storage.js";
 
@@ -21,15 +21,19 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG
+// AUDIO CONFIG — HOTSPOT OPTIMIZED
 // ============================================================================
 const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE_MONO = 512;
+const AI_CHUNK_SIZE_MONO = 512;      // 32ms @ 16kHz mono
 
 const MUSIC_SAMPLE_RATE = 44100;
-const MUSIC_CHUNK_SIZE_MONO = 1024;
+const MUSIC_CHUNK_SIZE_MONO = 1024;  // 23ms @ 44.1kHz mono
 
-const SEND_INTERVAL_MS = 20;
+// ADAPTIVE: Start conservative, speed up if network is good
+const SEND_INTERVAL_MS_AI = 35;      // Was 20 — ~29fps, gentler on hotspot
+const SEND_INTERVAL_MS_MUSIC = 25;   // Was 20 — ~40fps for music
+const PREBUFFER_CHUNKS_AI = 8;       // ~256ms prebuffer before telling ESP to start
+const PREBUFFER_CHUNKS_MUSIC = 12;   // ~276ms prebuffer for music
 
 // ============================================================================
 // DEBOUNCE
@@ -80,7 +84,35 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// PCM GENERATION (AI)
+// EDGE TTS — FILIPINO (fil-PH-AngeloNeural)
+// ============================================================================
+async function generateEdgeTTS(text: string, outputPath: string): Promise<void> {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const tts = new MsEdgeTTS();
+      await tts.setMetadata(
+        "fil-PH-AngeloNeural",
+        OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
+      );
+      const { audioStream } = tts.toStream(text);
+      const chunks: Buffer[] = [];
+      audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      audioStream.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
+        fs.writeFileSync(outputPath, buf);
+        console.log("[TTS] fil-PH-AngeloNeural success, size:", buf.length);
+        resolve();
+      });
+      audioStream.on("error", reject);
+    } catch (err: any) {
+      reject(err);
+    }
+  });
+}
+
+// ============================================================================
+// PCM GENERATION (AI) — Optimized for streaming
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -137,24 +169,44 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO)
+// STREAM AI RESPONSE PCM (16kHz MONO) — WITH PRE-BUFFER
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
+
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
   const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
-  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks);
+  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "prebuffer:", PREBUFFER_CHUNKS_AI);
 
   ws.send("SESSION:" + sessionId);
-  await new Promise(r => setTimeout(r, 100));
+  await delay(100);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await new Promise(r => setTimeout(r, 300));
-  ws.send("START_RESPONSE");
-  await new Promise(r => setTimeout(r, 100));
+  await delay(300);
 
+  // === PRE-BUFFER: Send first N chunks WITHOUT telling ESP to start yet ===
+  // This gives the ESP time to fill its jitter buffer before playback
   let seq = 0;
+  const prebufferLimit = Math.min(PREBUFFER_CHUNKS_AI, totalChunks);
+
+  for (let i = 0; i < prebufferLimit * AI_CHUNK_SIZE_MONO; i += AI_CHUNK_SIZE_MONO) {
+    if (ws.readyState !== ws.OPEN) return;
+    const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE_MONO);
+    const packet = Buffer.allocUnsafe(2 + chunk.length);
+    packet.writeUInt16BE(seq & 0xFFFF, 0);
+    packet.set(chunk, 2);
+    ws.send(packet, { binary: true });
+    seq++;
+    await delay(SEND_INTERVAL_MS_AI);
+  }
+
+  // Now tell ESP to start — it already has prebuffered chunks
+  ws.send("START_RESPONSE");
+  await delay(100);
+  console.log("[STREAM] AI prebuffer done, started playback");
+
+  // Continue rest of chunks
   try {
-    for (let i = 0; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
+    for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
       if (ws.readyState !== ws.OPEN) return;
       const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE_MONO);
       const packet = Buffer.allocUnsafe(2 + chunk.length);
@@ -162,11 +214,15 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
       packet.set(chunk, 2);
       ws.send(packet, { binary: true });
       seq++;
-      await new Promise(r => setTimeout(r, SEND_INTERVAL_MS));
+      await delay(SEND_INTERVAL_MS_AI);
     }
-    await new Promise(r => setTimeout(r, 500));
+
+    await delay(500);
     for (let retry = 0; retry < 3; retry++) {
-      if (ws.readyState === ws.OPEN) { ws.send("FINISH_RESPONSE:" + sessionId); await new Promise(r => setTimeout(r, 200)); }
+      if (ws.readyState === ws.OPEN) { 
+        ws.send("FINISH_RESPONSE:" + sessionId); 
+        await delay(200); 
+      }
     }
     console.log("[STREAM] AI done:", seq, "chunks");
   } catch (e: any) {
@@ -176,8 +232,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — NO TEMP FILES!
-// FFmpeg pipes directly from URL -> PCM -> WebSocket
+// REAL-TIME MUSIC STREAMING — WITH PRE-BUFFER
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
@@ -185,17 +240,16 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
   console.log("[MUSIC] Starting REAL-TIME stream:", sessionId);
 
   return new Promise<void>((resolve, reject) => {
-    // Step 1: Start FFmpeg that reads from URL and outputs PCM to stdout
     const ffmpegArgs = [
-      "-re",                          // Read at native frame rate (throttle)
-      "-i", musicUrl,                 // Input URL
-      "-vn",                          // No video
+      "-re",
+      "-i", musicUrl,
+      "-vn",
       "-af", "highpass=f=60,lowpass=f=18000,aresample=44100:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
       "-acodec", "pcm_s16le",
       "-ac", "1",
       "-ar", "44100",
       "-f", "s16le",
-      "pipe:1"                        // Output to stdout
+      "pipe:1"
     ];
 
     const ffmpegProc = spawn("ffmpeg", ffmpegArgs, {
@@ -207,8 +261,8 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
     let started = false;
     let finished = false;
     let chunkCount = 0;
+    let prebufferChunks: Buffer[] = [];
 
-    // Handle FFmpeg stderr (for debugging)
     ffmpegProc.stderr.on("data", (data) => {
       const line = data.toString().trim();
       if (line.includes("Error") || line.includes("error")) {
@@ -216,7 +270,6 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       }
     });
 
-    // Handle FFmpeg errors
     ffmpegProc.on("error", (err) => {
       console.error("[MUSIC] FFmpeg spawn error:", err.message);
       if (!finished) {
@@ -241,7 +294,6 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
             try { ws.send(packet, { binary: true }); seq++; } catch {}
           }
         }
-        // Send finish
         for (let retry = 0; retry < 3; retry++) {
           if (ws.readyState === ws.OPEN) {
             try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
@@ -252,24 +304,50 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       }
     });
 
-    // Read PCM data from FFmpeg stdout
     ffmpegProc.stdout.on("data", async (data: Buffer) => {
       buffer = Buffer.concat([buffer, data]);
 
-      // Start streaming once we have enough buffer
-      if (!started && buffer.length >= MUSIC_CHUNK_SIZE_MONO * 10) {
-        started = true;
-        console.log("[MUSIC] Buffer ready, starting stream...");
+      // Collect prebuffer first
+      if (!started) {
+        while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && prebufferChunks.length < PREBUFFER_CHUNKS_MUSIC) {
+          const chunk = buffer.subarray(0, MUSIC_CHUNK_SIZE_MONO);
+          buffer = buffer.subarray(MUSIC_CHUNK_SIZE_MONO);
+          prebufferChunks.push(Buffer.from(chunk));
+        }
 
-        ws.send("SESSION:" + sessionId);
-        await new Promise(r => setTimeout(r, 100));
-        ws.send("PREPARE_MUSIC:0");  // 0 = unknown total, streaming mode
-        await new Promise(r => setTimeout(r, 300));
-        ws.send("START_MUSIC");
-        await new Promise(r => setTimeout(r, 100));
+        if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
+          started = true;
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks), starting stream...");
+
+          ws.send("SESSION:" + sessionId);
+          await delay(100);
+          ws.send("PREPARE_MUSIC:0");
+          await delay(300);
+
+          // Send prebuffer chunks first
+          for (const chunk of prebufferChunks) {
+            if (ws.readyState !== ws.OPEN) {
+              finished = true;
+              ffmpegProc.kill("SIGKILL");
+              return;
+            }
+            const packet = Buffer.allocUnsafe(2 + chunk.length);
+            packet.writeUInt16BE(seq & 0xFFFF, 0);
+            packet.set(chunk, 2);
+            ws.send(packet, { binary: true });
+            seq++;
+            chunkCount++;
+            await delay(SEND_INTERVAL_MS_MUSIC);
+          }
+
+          ws.send("START_MUSIC");
+          await delay(100);
+          console.log("[MUSIC] Playback started after prebuffer");
+        }
+        return;
       }
 
-      // Stream chunks as they come
+      // Normal streaming after prebuffer
       while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && !finished) {
         if (ws.readyState !== ws.OPEN) {
           console.log("[MUSIC] WS closed, killing FFmpeg");
@@ -289,8 +367,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
         seq++;
         chunkCount++;
 
-        // Small delay to not overwhelm mobile data
-        await new Promise(r => setTimeout(r, 15));
+        await delay(SEND_INTERVAL_MS_MUSIC);
       }
     });
 
@@ -303,8 +380,15 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
         try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
         resolve();
       }
-    }, 600000); // 10 minute max
+    }, 600000);
   });
+}
+
+// ============================================================================
+// DELAY HELPER
+// ============================================================================
+function delay(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ============================================================================
@@ -389,22 +473,25 @@ Return ONLY the JSON.`;
 
       if (text && !nameResponse) {
         const introId = uniqueId + "_intro";
-        const tts = new EdgeTTS();
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
-        await tts.ttsPromise(text, introMp3, { voice: "en-US-AriaNeural", rate: "+15%" });
+
+        // Use Filipino TTS for intro
+        await generateEdgeTTS(text, introMp3);
         filesToCleanup.push(introMp3);
+
         const introPcm = await generatePCM(introMp3);
         await streamPCM(ws, introPcm, introId);
-        await new Promise(r => setTimeout(r, 1000));
+        await delay(1000);
       }
 
-      // REAL-TIME STREAMING — no download!
       await streamMusicRealtime(ws, musicUrl, uniqueId + "_music");
     } else {
-      const tts = new EdgeTTS();
       const mp3 = path.join(AUDIO_DIR, uniqueId + ".mp3");
-      await tts.ttsPromise(text, mp3, { voice: "en-US-AriaNeural", rate: "+15%" });
+
+      // Use Filipino TTS
+      await generateEdgeTTS(text, mp3);
       filesToCleanup.push(mp3);
+
       const pcm = await generatePCM(mp3);
       await streamPCM(ws, pcm, uniqueId);
     }
@@ -436,7 +523,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V28 REAL-TIME STREAMING [Mostakim API]");
+    console.log("ESP connected - V29 HOTSPOT STABLE [fil-PH-AngeloNeural TTS]");
     let processing = false;
     let currentUserId: number | null = null;
     let messageCount = 0;
