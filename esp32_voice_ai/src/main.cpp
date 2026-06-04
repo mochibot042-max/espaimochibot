@@ -1,7 +1,8 @@
 // ============================================================================
-// ESP32 AUDIO CHATBOT - V22 (IDLE STATE FIX)
+// ESP32 AUDIO CHATBOT - V25 (FIXED CHOPPY AUDIO)
 // ============================================================================
-// Fixed: Proper finish handling, guaranteed idle return, no stuck states
+// FIXED: i2s_write now loops with longer timeout to prevent partial writes
+// Server sends faster than real-time to keep buffer full
 // ============================================================================
 
 #include <WiFi.h>
@@ -38,6 +39,7 @@ bool is_recording = false;
 bool isPlaying = false;
 bool isWSConnected = false;
 bool isPreparingPlayback = false;
+bool isMusicMode = false;
 float currentVolume = 0.32f;
 
 // ============================================================================
@@ -61,14 +63,14 @@ unsigned long record_start_time = 0;
 const unsigned long MAX_RECORD_MS = 3000;
 
 // ============================================================================
-// PLAYBACK STATE - FIXED
+// PLAYBACK STATE
 // ============================================================================
 volatile bool playback_active = false;
 volatile bool finish_received = false;
 volatile uint32_t chunks_received = 0;
 volatile uint32_t chunks_expected = 0;
-unsigned long finish_receive_time = 0;  // NEW: Track when finish was received
-const unsigned long FINISH_GRACE_MS = 300;  // NEW: Wait 300ms after finish
+unsigned long finish_receive_time = 0;
+const unsigned long FINISH_GRACE_MS = 300;
 
 // ============================================================================
 // TIMING
@@ -82,6 +84,18 @@ unsigned long lastActivity = 0;
 void setColor(uint32_t color) {
   pixels.setPixelColor(0, color);
   pixels.show();
+}
+
+// ============================================================================
+// I2S SAMPLE RATE SWITCHER
+// ============================================================================
+void setI2SRate(uint32_t rate) {
+  esp_err_t err = i2s_set_clk(I2S_NUM_0, rate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S] Failed to set rate %lu, err=%d\n", rate, err);
+  } else {
+    Serial.printf("[I2S] Sample rate set to %lu Hz\n", rate);
+  }
 }
 
 // ============================================================================
@@ -175,27 +189,48 @@ void recordToBuffer(uint8_t* data, size_t len) {
 }
 
 // ============================================================================
-// DIRECT I2S WRITE
+// FIXED: DIRECT I2S WRITE — Loop with retry to prevent partial writes
 // ============================================================================
 void directI2SWrite(uint8_t* data, size_t len) {
   if (!playback_active || len == 0) return;
-  size_t written = 0;
-  i2s_write(I2S_NUM_0, data, len, &written, pdMS_TO_TICKS(5));
+  
+  size_t totalWritten = 0;
+  int retries = 0;
+  const int MAX_RETRIES = 10;
+  
+  while (totalWritten < len && retries < MAX_RETRIES) {
+    size_t written = 0;
+    esp_err_t err = i2s_write(I2S_NUM_0, data + totalWritten, len - totalWritten, &written, pdMS_TO_TICKS(50));
+    
+    if (err != ESP_OK) {
+      Serial.printf("[I2S] Write error: %d\n", err);
+      break;
+    }
+    
+    if (written == 0) {
+      retries++;
+      delay(1);  // Brief yield if DMA buffer is full
+      continue;
+    }
+    
+    totalWritten += written;
+    retries = 0;  // Reset retries on successful write
+  }
+  
+  if (totalWritten < len) {
+    Serial.printf("[I2S] Partial write: %d/%d bytes\n", totalWritten, len);
+  }
 }
 
 // ============================================================================
-// FLUSH AND STOP - FIXED
+// FLUSH AND STOP
 // ============================================================================
 void stopPlayback() {
   Serial.println("[PLAY] Stopping");
   
-  // Wait for DMA to finish current buffer
   delay(50);
-  
-  // Clear everything
   i2s_zero_dma_buffer(I2S_NUM_0);
   
-  // Write silence to flush
   uint8_t silence[512];
   memset(silence, 0, 512);
   size_t bw = 0;
@@ -203,7 +238,8 @@ void stopPlayback() {
     i2s_write(I2S_NUM_0, silence, 512, &bw, pdMS_TO_TICKS(10));
   }
   
-  // RESET ALL STATE - CRITICAL FIX
+  setI2SRate(RECORD_RATE);
+  
   playback_active = false;
   finish_received = false;
   chunks_received = 0;
@@ -211,11 +247,11 @@ void stopPlayback() {
   finish_receive_time = 0;
   isPlaying = false;
   isPreparingPlayback = false;
+  isMusicMode = false;
   
-  setColor(pixels.Color(0, 0, 100));  // Back to idle blue
-  Serial.println("[PLAY] Stopped -> IDLE");
+  setColor(pixels.Color(0, 0, 100));
+  Serial.println("[PLAY] Stopped -> IDLE (16kHz)");
   
-  // Send READY to server
   delay(50);
   if (webSocket.isConnected()) {
     webSocket.sendTXT("READY");
@@ -224,7 +260,7 @@ void stopPlayback() {
 }
 
 // ============================================================================
-// WEBSOCKET EVENT - FIXED FINISH HANDLING
+// WEBSOCKET EVENT — V25 FIXED
 // ============================================================================
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
@@ -234,8 +270,10 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       isPlaying = false;
       playback_active = false;
       isPreparingPlayback = false;
+      isMusicMode = false;
       is_recording = false;
       record_pos = 0;
+      setI2SRate(RECORD_RATE);
       setColor(pixels.Color(100, 0, 0));
       break;
 
@@ -244,8 +282,10 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       isPlaying = false;
       playback_active = false;
       isPreparingPlayback = false;
+      isMusicMode = false;
       is_recording = false;
       record_pos = 0;
+      setI2SRate(RECORD_RATE);
       setColor(pixels.Color(0, 0, 100));
       Serial.println("[WS] Connected");
       break;
@@ -255,41 +295,75 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       Serial.printf("[WS] TXT: %s\n", msg.c_str());
       lastActivity = millis();
 
-      if (msg == "START_RESPONSE" || msg == "START_MUSIC") {
+      if (msg == "START_RESPONSE") {
         isPlaying = true;
         playback_active = true;
         isPreparingPlayback = false;
         finish_received = false;
         chunks_received = 0;
         finish_receive_time = 0;
+        isMusicMode = false;
         setColor(pixels.Color(200, 0, 200));
-        Serial.println("[PLAY] Start");
+        Serial.println("[PLAY] AI Start (16kHz)");
       }
-      else if (msg.startsWith("FINISH_RESPONSE:") || msg == "FINISH_RESPONSE" || msg == "FINISH_MUSIC") {
+      else if (msg == "START_MUSIC") {
+        isPlaying = true;
+        playback_active = true;
+        isPreparingPlayback = false;
+        finish_received = false;
+        chunks_received = 0;
+        finish_receive_time = 0;
+        isMusicMode = true;
+        setColor(pixels.Color(255, 165, 0));
+        Serial.println("[PLAY] Music Start (48kHz)");
+      }
+      else if (msg.startsWith("FINISH_RESPONSE:") || msg == "FINISH_RESPONSE" || 
+               msg.startsWith("FINISH_MUSIC:") || msg == "FINISH_MUSIC") {
         Serial.println("[PLAY] Finish received");
         finish_received = true;
-        finish_receive_time = millis();  // Track finish time
-        
-        // If we already received all expected chunks, stop now
+        finish_receive_time = millis();
         if (chunks_received >= chunks_expected && chunks_expected > 0) {
           Serial.println("[PLAY] All chunks already received, stopping");
           stopPlayback();
         }
-        // Otherwise, loop() will handle it after grace period
       }
-      else if (msg.startsWith("PREPARE_RESPONSE:")) {
-        int totalChunks = msg.substring(17).toInt();
+      else if (msg.startsWith("PREPARE_MUSIC:")) {
+        int totalChunks = msg.substring(14).toInt();
         chunks_expected = totalChunks;
-        Serial.printf("[PREPARE] %d chunks\n", totalChunks);
+        Serial.printf("[PREPARE] Music %d chunks @ 48kHz\n", totalChunks);
+        
+        setI2SRate(48000);
+        i2s_zero_dma_buffer(I2S_NUM_0);
+        
         isPreparingPlayback = true;
         isPlaying = false;
         playback_active = true;
         finish_received = false;
         chunks_received = 0;
         finish_receive_time = 0;
+        isMusicMode = true;
         
-        // Clear DMA for fresh start
+        delay(200);
+        if (webSocket.isConnected()) {
+          webSocket.sendTXT("READY");
+        }
+        setColor(pixels.Color(255, 100, 0));
+      }
+      else if (msg.startsWith("PREPARE_RESPONSE:")) {
+        int totalChunks = msg.substring(17).toInt();
+        chunks_expected = totalChunks;
+        Serial.printf("[PREPARE] AI %d chunks @ 16kHz\n", totalChunks);
+        
+        setI2SRate(RECORD_RATE);
         i2s_zero_dma_buffer(I2S_NUM_0);
+        
+        isPreparingPlayback = true;
+        isPlaying = false;
+        playback_active = true;
+        finish_received = false;
+        chunks_received = 0;
+        finish_receive_time = 0;
+        isMusicMode = false;
         
         delay(200);
         if (webSocket.isConnected()) {
@@ -314,7 +388,6 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_BIN: {
       if (length < 2) return;
       
-      // Skip sequence number
       uint8_t* audioData = payload + 2;
       size_t audioLen = length - 2;
 
@@ -352,7 +425,6 @@ void setup() {
   prefs.begin("alexatron", false);
   currentVolume = prefs.getFloat("volume", 0.32f);
 
-  // Memory
   record_buffer = (uint8_t*)ps_malloc(MAX_RECORDING_SIZE);
   if (!record_buffer) {
     Serial.println("[FATAL] No mem");
@@ -364,7 +436,6 @@ void setup() {
     }
   }
 
-  // WiFi
   WiFiManager wm;
   wm.setConfigPortalTimeout(60);
   wm.setDebugOutput(false);
@@ -379,7 +450,7 @@ void setup() {
   setColor(pixels.Color(0, 255, 0));
   WiFi.setSleep(false);
 
-  // I2S MIC
+  // I2S MIC (always 16kHz)
   i2s_config_t mic_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = RECORD_RATE,
@@ -399,7 +470,7 @@ void setup() {
   i2s_driver_install(I2S_NUM_1, &mic_cfg, 0, NULL);
   i2s_set_pin(I2S_NUM_1, &mic_p);
 
-  // I2S DAC
+  // I2S DAC (starts at 16kHz, switches to 48kHz for music)
   i2s_config_t dac_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = RECORD_RATE,
@@ -428,17 +499,15 @@ void setup() {
   i2s_set_pin(I2S_NUM_0, &dac_p);
   i2s_set_clk(I2S_NUM_0, RECORD_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-  // Prime with silence
   i2s_zero_dma_buffer(I2S_NUM_0);
 
-  // WebSocket
   webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(10000);
   webSocket.enableHeartbeat(30000, 10000, 2);
 
   Serial.println("=================================");
-  Serial.println("[SETUP] V22 IDLE FIX");
+  Serial.println("[SETUP] V25 FIXED CHOPPY AUDIO");
   Serial.println("=================================");
   setColor(pixels.Color(0, 100, 0));
 
@@ -447,7 +516,7 @@ void setup() {
 }
 
 // ============================================================================
-// LOOP - FIXED FINISH HANDLING
+// LOOP
 // ============================================================================
 void loop() {
   webSocket.loop();
@@ -455,16 +524,13 @@ void loop() {
 
   unsigned long now = millis();
 
-  // FIXED: Proper finish handling with grace period
   if (playback_active && finish_received) {
-    // Check if grace period has passed since finish received
     if (now - finish_receive_time > FINISH_GRACE_MS) {
       Serial.println("[PLAY] Grace period over, stopping");
       stopPlayback();
     }
   }
 
-  // Timeout if no activity for 60 seconds
   if (isWSConnected && (now - lastActivity > 60000)) {
     if (playback_active) {
       Serial.println("[TIMEOUT] No activity, forcing stop");
@@ -480,7 +546,6 @@ void loop() {
     return;
   }
 
-  // Don't record if playing or preparing
   if (playback_active || isPreparingPlayback) return;
 
   int16_t sample_buffer[BUFFER_SIZE / 2];
