@@ -21,19 +21,19 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — HOTSPOT OPTIMIZED
+// AUDIO CONFIG — SYNCED WITH ESP32 V30
 // ============================================================================
+// AI: 16kHz mono, 1024 bytes = 32ms audio → send every 32ms
+// Music: 44.1kHz mono, 2048 bytes = 23.2ms audio → send every 23ms
 const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE_MONO = 512;      // 32ms @ 16kHz mono
+const AI_CHUNK_SIZE_MONO = 1024;     // 32ms @ 16kHz mono
+const SEND_INTERVAL_MS_AI = 32;     // Must match audio duration
+const PREBUFFER_CHUNKS_AI = 12;     // ~384ms prebuffer
 
 const MUSIC_SAMPLE_RATE = 44100;
-const MUSIC_CHUNK_SIZE_MONO = 1024;  // 23ms @ 44.1kHz mono
-
-// ADAPTIVE: Start conservative, speed up if network is good
-const SEND_INTERVAL_MS_AI = 35;      // Was 20 — ~29fps, gentler on hotspot
-const SEND_INTERVAL_MS_MUSIC = 25;   // Was 20 — ~40fps for music
-const PREBUFFER_CHUNKS_AI = 8;       // ~256ms prebuffer before telling ESP to start
-const PREBUFFER_CHUNKS_MUSIC = 12;   // ~276ms prebuffer for music
+const MUSIC_CHUNK_SIZE_MONO = 2048;  // 23.2ms @ 44.1kHz mono
+const SEND_INTERVAL_MS_MUSIC = 23;    // Must match audio duration
+const PREBUFFER_CHUNKS_MUSIC = 16;    // ~368ms prebuffer
 
 // ============================================================================
 // DEBOUNCE
@@ -169,22 +169,21 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO) — WITH PRE-BUFFER
+// STREAM AI RESPONSE PCM (16kHz MONO) — SYNCED WITH ESP
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
 
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
   const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
-  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "prebuffer:", PREBUFFER_CHUNKS_AI);
+  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms");
 
   ws.send("SESSION:" + sessionId);
   await delay(100);
   ws.send("PREPARE_RESPONSE:" + totalChunks);
   await delay(300);
 
-  // === PRE-BUFFER: Send first N chunks WITHOUT telling ESP to start yet ===
-  // This gives the ESP time to fill its jitter buffer before playback
+  // === PRE-BUFFER: Send first N chunks silently ===
   let seq = 0;
   const prebufferLimit = Math.min(PREBUFFER_CHUNKS_AI, totalChunks);
 
@@ -199,12 +198,12 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     await delay(SEND_INTERVAL_MS_AI);
   }
 
-  // Now tell ESP to start — it already has prebuffered chunks
+  // Now tell ESP to start — jitter buffer already has data
   ws.send("START_RESPONSE");
   await delay(100);
-  console.log("[STREAM] AI prebuffer done, started playback");
+  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks), started playback");
 
-  // Continue rest of chunks
+  // Continue rest of chunks — synced at exactly 32ms intervals
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
       if (ws.readyState !== ws.OPEN) return;
@@ -232,12 +231,12 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — WITH PRE-BUFFER
+// REAL-TIME MUSIC STREAMING — SYNCED WITH ESP
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting REAL-TIME stream:", sessionId);
+  console.log("[MUSIC] Starting REAL-TIME stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms");
 
   return new Promise<void>((resolve, reject) => {
     const ffmpegArgs = [
@@ -347,7 +346,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
         return;
       }
 
-      // Normal streaming after prebuffer
+      // Normal streaming after prebuffer — synced at exactly 23ms intervals
       while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && !finished) {
         if (ws.readyState !== ws.OPEN) {
           console.log("[MUSIC] WS closed, killing FFmpeg");
@@ -523,7 +522,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V29 HOTSPOT STABLE [fil-PH-AngeloNeural TTS]");
+    console.log("ESP connected - V30 SYNCED STREAMING [fil-PH-AngeloNeural TTS]");
     let processing = false;
     let currentUserId: number | null = null;
     let messageCount = 0;
