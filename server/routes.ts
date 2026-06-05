@@ -118,7 +118,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
 // ============================================================================
 // PCM GENERATION (AI)
 // ============================================================================
-async function generatePCM(input: string): Promise<<Buffer> {
+async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
@@ -142,7 +142,7 @@ async function generatePCM(input: string): Promise<<Buffer> {
 interface YTSearchResult { title: string; thumbnail: string; timestamp: string; url: string; }
 interface YTDownloadResult { status: boolean; title: string; url: string; author: string; }
 
-async function searchYouTube(query: string): Promise<<YTSearchResult | null> {
+async function searchYouTube(query: string): Promise<YTSearchResult | null> {
   try {
     const searchUrl = `https://mostakim.onrender.com/mostakim/ytSearch?search=${encodeURIComponent(query)}`;
     console.log("[MUSIC] Searching:", query);
@@ -464,7 +464,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
         language: "en",
         prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan."
       }),
-      new Promise<<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
     
     const text = stt.text?.trim();
@@ -527,7 +527,7 @@ Return ONLY the JSON.`;
 
     const ai = await Promise.race([
       llmClient.chat.completions.create({ model: "llama-3.3-70b-versatile", messages, max_tokens: 150, temperature: 0.7 }),
-      new Promise<<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
     ]);
 
     const raw = ai.choices[0].message.content || "{}";
