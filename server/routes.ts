@@ -89,7 +89,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
     try {
       const tts = new MsEdgeTTS();
       await tts.setMetadata(
-        "fil-PH-AngeloNeural",
+        "fil-PH-BlessicaNeural",
         OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
       );
       const { audioStream } = tts.toStream(text);
