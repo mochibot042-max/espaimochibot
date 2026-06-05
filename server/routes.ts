@@ -423,7 +423,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    const systemPrompt = `You are a helpful voice assistant. Keep responses short and natural.
+    const systemPrompt = `You are Mochi a helpful voice assistant. Keep responses natural.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
