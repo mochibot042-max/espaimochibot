@@ -21,17 +21,27 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — FIXED: Faster intervals to prevent ESP32 buffer underrun
+// AUDIO CONFIG — AI RESPONSE (16kHz MONO)
 // ============================================================================
 const AI_SAMPLE_RATE = 16000;
 const AI_CHUNK_SIZE_MONO = 1024;     // 32ms @ 16kHz mono
-const SEND_INTERVAL_MS_AI = 28;       // <<< FIXED: 28ms (faster than 32ms real-time)
+const SEND_INTERVAL_MS_AI = 28;       // Faster than real-time
 const PREBUFFER_CHUNKS_AI = 24;       // ~768ms prebuffer
 
 const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;  // 23.2ms @ 44.1kHz mono
-const SEND_INTERVAL_MS_MUSIC = 20;    // <<< FIXED: 20ms (faster than 23.2ms real-time)
+const SEND_INTERVAL_MS_MUSIC = 20;    // Faster than real-time
 const PREBUFFER_CHUNKS_MUSIC = 32;    // ~742ms prebuffer
+
+// ============================================================================
+// STREAMING STT CONFIG
+// ============================================================================
+const STT_STREAM_SAMPLE_RATE = 16000;
+const STT_STREAM_CHUNK_MS = 320;      // 320ms chunks from ESP32
+const STT_STREAM_BYTES_PER_CHUNK = (STT_STREAM_SAMPLE_RATE * 2 * STT_STREAM_CHUNK_MS) / 1000; // 10240 bytes
+const STT_MIN_AUDIO_MS = 500;         // Minimum audio before STT
+const STT_MAX_AUDIO_MS = 10000;       // Max 10 seconds per utterance
+const STT_SILENCE_MS = 800;           // Silence threshold to finalize STT
 
 // ============================================================================
 // DEBOUNCE
@@ -82,7 +92,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// EDGE TTS — FILIPINO (fil-PH-AngeloNeural)
+// EDGE TTS — FILIPINO
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string): Promise<void> {
   return new Promise(async (resolve, reject) => {
@@ -99,7 +109,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
         const buf = Buffer.concat(chunks);
         if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] fil-PH-AngeloNeural success, size:", buf.length);
+        console.log("[TTS] fil-PH-BlessicaNeural success, size:", buf.length);
         resolve();
       });
       audioStream.on("error", reject);
@@ -167,7 +177,7 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO) — FIXED INTERVALS
+// STREAM AI RESPONSE PCM (16kHz MONO)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
@@ -226,7 +236,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — FIXED INTERVALS
+// REAL-TIME MUSIC STREAMING
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
@@ -381,35 +391,100 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// PROCESS WITH MEMORY, DEDUPLICATION & MUSIC
+// STREAMING STT PROCESSOR
 // ============================================================================
-async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: number) {
-  if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
+interface StreamingSTTSession {
+  userId: number;
+  ws: WebSocket;
+  audioBuffer: Buffer;
+  isRecording: boolean;
+  silenceStart: number;
+  lastSpeechTime: number;
+  totalAudioMs: number;
+  processing: boolean;
+  sessionId: string;
+}
 
-  let processingComplete = false;
-  const uniqueId = Date.now() + "_" + Math.random().toString(36).slice(2, 8);
-  const wavPath = path.join(UPLOAD_DIR, uniqueId + ".wav");
-  const filesToCleanup: string[] = [];
+const activeSTTSessions = new Map<WebSocket, StreamingSTTSession>();
 
+function createSTTSession(ws: WebSocket, userId: number): StreamingSTTSession {
+  return {
+    userId,
+    ws,
+    audioBuffer: Buffer.alloc(0),
+    isRecording: false,
+    silenceStart: 0,
+    lastSpeechTime: 0,
+    totalAudioMs: 0,
+    processing: false,
+    sessionId: Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+  };
+}
+
+async function processStreamingSTT(session: StreamingSTTSession): Promise<string | null> {
+  if (session.processing || session.audioBuffer.length < (STT_MIN_AUDIO_MS * 32)) return null;
+  
+  session.processing = true;
+  const audioToProcess = Buffer.from(session.audioBuffer);
+  
   try {
-    if (audioBuffer.length < 1000) { ws.send("ERROR:AUDIO_TOO_SHORT"); return; }
-    const riff = audioBuffer.slice(0, 4).toString();
-    const wave = audioBuffer.slice(8, 12).toString();
-    if (riff !== "RIFF" || wave !== "WAVE") { ws.send("ERROR:INVALID_FORMAT"); return; }
-
-    fs.writeFileSync(wavPath, audioBuffer);
-    filesToCleanup.push(wavPath);
-    console.log("[UPLOAD] Saved:", audioBuffer.length, "bytes");
-
+    // Create temporary WAV file for Groq Whisper
+    const tmpWav = path.join(UPLOAD_DIR, session.sessionId + "_stt.wav");
+    const dataLen = audioToProcess.length;
+    const wavBuffer = Buffer.alloc(44 + dataLen);
+    
+    // WAV header
+    wavBuffer.write("RIFF", 0);
+    wavBuffer.writeUInt32LE(36 + dataLen, 4);
+    wavBuffer.write("WAVE", 8);
+    wavBuffer.write("fmt ", 12);
+    wavBuffer.writeUInt32LE(16, 16);
+    wavBuffer.writeUInt16LE(1, 20);
+    wavBuffer.writeUInt16LE(1, 22);
+    wavBuffer.writeUInt32LE(STT_STREAM_SAMPLE_RATE, 24);
+    wavBuffer.writeUInt32LE(STT_STREAM_SAMPLE_RATE * 2, 28);
+    wavBuffer.writeUInt16LE(2, 32);
+    wavBuffer.writeUInt16LE(16, 34);
+    wavBuffer.write("data", 36);
+    wavBuffer.writeUInt32LE(dataLen, 40);
+    audioToProcess.copy(wavBuffer, 44);
+    
+    fs.writeFileSync(tmpWav, wavBuffer);
+    
     const stt = await Promise.race([
-      sttClient.audio.transcriptions.create({ file: fs.createReadStream(wavPath), model: "whisper-large-v3-turbo", language: "en" }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
+      sttClient.audio.transcriptions.create({ 
+        file: fs.createReadStream(tmpWav), 
+        model: "whisper-large-v3-turbo", 
+        language: "en",
+        prompt: "This is a voice command or question in English or Tagalog."
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 8000))
     ]);
+    
+    fs.unlinkSync(tmpWav);
+    
+    const text = stt.text?.trim();
+    if (!text) return null;
+    
+    console.log("[STT STREAM] Result:", text);
+    return text;
+  } catch (e: any) {
+    console.error("[STT STREAM] Error:", e.message);
+    return null;
+  } finally {
+    session.processing = false;
+  }
+}
 
-    const userText = stt.text?.trim();
-    if (!userText) { ws.send("ERROR:NO_SPEECH"); return; }
-    console.log("USER:", userText);
-
+// ============================================================================
+// PROCESS AI RESPONSE
+// ============================================================================
+async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
+  if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
+  
+  const filesToCleanup: string[] = [];
+  
+  try {
     const nameAction = extractName(userText);
     let nameResponse = "";
     if (nameAction.action === "save" && nameAction.name) {
@@ -423,7 +498,7 @@ async function processAndRespond(ws: WebSocket, audioBuffer: Buffer, userId: num
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    const systemPrompt = `You are Mochi a helpful voice assistant. Keep responses natural.
+    const systemPrompt = `You are Mochi a helpful voice assistant. Keep responses natural and concise.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
@@ -461,7 +536,7 @@ Return ONLY the JSON.`;
       if (!musicUrl) { ws.send("ERROR:MUSIC_NOT_FOUND"); return; }
 
       if (text && !nameResponse) {
-        const introId = uniqueId + "_intro";
+        const introId = sessionId + "_intro";
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
 
         await generateEdgeTTS(text, introMp3);
@@ -472,24 +547,23 @@ Return ONLY the JSON.`;
         await delay(1000);
       }
 
-      await streamMusicRealtime(ws, musicUrl, uniqueId + "_music");
+      await streamMusicRealtime(ws, musicUrl, sessionId + "_music");
     } else {
-      const mp3 = path.join(AUDIO_DIR, uniqueId + ".mp3");
+      const mp3 = path.join(AUDIO_DIR, sessionId + ".mp3");
 
       await generateEdgeTTS(text, mp3);
       filesToCleanup.push(mp3);
 
       const pcm = await generatePCM(mp3);
-      await streamPCM(ws, pcm, uniqueId);
+      await streamPCM(ws, pcm, sessionId);
     }
-    processingComplete = true;
   } catch (e: any) {
     console.error("[PROCESS] Error:", e.message);
     ws.send("ERROR:" + (e.message || "UNKNOWN"));
     try { ws.send("FINISH_RESPONSE:ERROR"); } catch {}
   } finally {
     for (const f of filesToCleanup) { try { fs.unlinkSync(f); } catch {} }
-    if (processingComplete) setTimeout(() => RECENT_REQUESTS.delete(userId), DEBOUNCE_MS);
+    setTimeout(() => RECENT_REQUESTS.delete(userId), DEBOUNCE_MS);
   }
 }
 
@@ -506,23 +580,54 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
   const wss = new WebSocketServer({
     server: httpServer, path: "/ws/audio",
-    perMessageDeflate: false, maxPayload: 512 * 1024
+    perMessageDeflate: false, maxPayload: 64 * 1024  // Increased for streaming chunks
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - FIXED CHOPPY AUDIO [fil-PH-AngeloNeural TTS]");
-    let processing = false;
+    console.log("ESP connected - STREAMING STT + FIXED AUDIO [fil-PH-BlessicaNeural TTS]");
     let currentUserId: number | null = null;
     let messageCount = 0;
+    let sttSession: StreamingSTTSession | null = null;
 
     ws.on("message", async (data: any, isBinary: boolean) => {
       messageCount++;
       const currentMsgNum = messageCount;
+      
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
-        if (msg === "READY") { ws.send("STATE:IDLE"); }
-        if (msg.startsWith("USER:")) {
+        
+        if (msg === "READY") { 
+          ws.send("STATE:IDLE"); 
+        }
+        else if (msg === "STREAM_START") {
+          // ESP32 signals start of streaming STT
+          if (!currentUserId) {
+            try { 
+              const anon = await storage.getOrCreateUser("anon_" + Date.now()); 
+              currentUserId = anon.id; 
+            } catch (e: any) { 
+              ws.send("ERROR:DB_FAILED"); 
+              return; 
+            }
+          }
+          sttSession = createSTTSession(ws, currentUserId);
+          ws.send("STREAM_READY");
+          console.log("[STT] Streaming session started for user:", currentUserId);
+        }
+        else if (msg === "STREAM_END") {
+          // Force finalize STT
+          if (sttSession && sttSession.audioBuffer.length > 0) {
+            const text = await processStreamingSTT(sttSession);
+            if (text) {
+              ws.send("STT_RESULT:" + text);
+              await processAIResponse(ws, text, sttSession.userId, sttSession.sessionId);
+            }
+            sttSession.audioBuffer = Buffer.alloc(0);
+          }
+          sttSession = null;
+        }
+        else if (msg.startsWith("USER:")) {
           const userName = msg.replace("USER:", "").trim();
           try {
             const user = await storage.getOrCreateUser(userName);
@@ -532,19 +637,72 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         }
         return;
       }
+      
+      // BINARY: Audio chunk from ESP32
       console.log("[WS] BINARY #" + currentMsgNum + ":", Buffer.from(data).length, "bytes");
-      if (processing) { ws.send("ERROR:PROCESSING_BUSY"); return; }
-      processing = true;
-      if (!currentUserId) {
-        try { const anon = await storage.getOrCreateUser("anon_" + Date.now()); currentUserId = anon.id; }
-        catch (e: any) { ws.send("ERROR:DB_FAILED"); processing = false; return; }
+      
+      if (!sttSession) {
+        // Fallback: old behavior if streaming not initialized
+        ws.send("ERROR:STREAM_NOT_STARTED");
+        return;
       }
-      const audioBuffer = Buffer.from(data);
-      try { await processAndRespond(ws, audioBuffer, currentUserId); }
-      finally { processing = false; }
+      
+      const chunk = Buffer.from(data);
+      
+      // Validate chunk size (should be STT_STREAM_BYTES_PER_CHUNK or smaller)
+      if (chunk.length > STT_STREAM_BYTES_PER_CHUNK * 2) {
+        console.log("[STT] Chunk too large:", chunk.length);
+        return;
+      }
+      
+      // Append to session buffer
+      sttSession.audioBuffer = Buffer.concat([sttSession.audioBuffer, chunk]);
+      sttSession.totalAudioMs += (chunk.length / 2 / STT_STREAM_SAMPLE_RATE) * 1000;
+      sttSession.lastSpeechTime = Date.now();
+      
+      // VAD-like processing: if we have enough audio and not currently processing, do STT
+      const audioMs = (sttSession.audioBuffer.length / 2 / STT_STREAM_SAMPLE_RATE) * 1000;
+      
+      if (audioMs >= STT_MIN_AUDIO_MS && !sttSession.processing) {
+        // Check if we should process (enough audio or max reached)
+        if (audioMs >= 2000 || sttSession.totalAudioMs >= STT_MAX_AUDIO_MS) {
+          const text = await processStreamingSTT(sttSession);
+          if (text) {
+            // Clear buffer after successful STT
+            sttSession.audioBuffer = Buffer.alloc(0);
+            ws.send("STT_RESULT:" + text);
+            
+            // Process AI response
+            await processAIResponse(ws, text, sttSession.userId, sttSession.sessionId);
+            
+            // Reset session for next utterance
+            sttSession = createSTTSession(ws, currentUserId!);
+          }
+        }
+      }
+      
+      // Safety: cap buffer size
+      if (sttSession.audioBuffer.length > STT_STREAM_SAMPLE_RATE * 2 * 15) { // Max 15 seconds
+        console.log("[STT] Buffer overflow, forcing process");
+        const text = await processStreamingSTT(sttSession);
+        if (text) {
+          sttSession.audioBuffer = Buffer.alloc(0);
+          ws.send("STT_RESULT:" + text);
+          await processAIResponse(ws, text, sttSession.userId, sttSession.sessionId);
+          sttSession = createSTTSession(ws, currentUserId!);
+        }
+      }
     });
 
-    ws.on("close", () => { console.log("ESP disconnected"); processing = false; currentUserId = null; });
+    ws.on("close", () => { 
+      console.log("ESP disconnected"); 
+      if (sttSession) {
+        activeSTTSessions.delete(ws);
+        sttSession = null;
+      }
+      currentUserId = null; 
+    });
+    
     ws.on("error", (err) => console.error("[WS] Error:", err.message));
 
     const pingInterval = setInterval(() => {
