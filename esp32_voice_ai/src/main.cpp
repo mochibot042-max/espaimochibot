@@ -1,8 +1,9 @@
 // ============================================================================
-// ESP32 AUDIO CHATBOT - V25 (FIXED CHOPPY AUDIO)
+// ESP32 AUDIO CHATBOT - V26 (HQ MIC PINS ALIGNED)
 // ============================================================================
-// FIXED: i2s_write now loops with longer timeout to prevent partial writes
-// Server sends faster than real-time to keep buffer full
+// FIXED: Mic pins now aligned with HQ tester (15,16,17)
+// FIXED: use_apll = false for ESP32-S3 compatibility
+// FIXED: dma_buf_len max 1024 for ESP32-S3
 // ============================================================================
 
 #include <WiFi.h>
@@ -16,14 +17,18 @@
 // ============================================================================
 // CONFIG
 // ============================================================================
-const char* WS_HOST = "assistant-xf3o.onrender.com";
+const char* WS_HOST = "espaimochibot-q3xu.onrender.com";
 const int WS_PORT = 443;
 const char* WS_PATH = "/ws/audio";
 
 #define LED_PIN 48
-#define MIC_BCK 16
-#define MIC_WS  17
-#define MIC_SD  18
+
+// MIC PINS - ALIGNED WITH HQ TESTER (15,16,17)
+#define MIC_BCK 15    // SCK
+#define MIC_WS  16    // LRCK
+#define MIC_SD  17    // DATA
+
+// DAC PINS (for speaker output)
 #define I2S_BCK 4
 #define I2S_WS  5
 #define I2S_DOUT 6
@@ -209,12 +214,12 @@ void directI2SWrite(uint8_t* data, size_t len) {
     
     if (written == 0) {
       retries++;
-      delay(1);  // Brief yield if DMA buffer is full
+      delay(1);
       continue;
     }
     
     totalWritten += written;
-    retries = 0;  // Reset retries on successful write
+    retries = 0;
   }
   
   if (totalWritten < len) {
@@ -260,7 +265,7 @@ void stopPlayback() {
 }
 
 // ============================================================================
-// WEBSOCKET EVENT — V25 FIXED
+// WEBSOCKET EVENT
 // ============================================================================
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
@@ -450,16 +455,21 @@ void setup() {
   setColor(pixels.Color(0, 255, 0));
   WiFi.setSleep(false);
 
-  // I2S MIC (always 16kHz)
+  // ============================================================================
+  // I2S MIC - FIXED FOR ESP32-S3 (aligned with HQ tester pins)
+  // ============================================================================
   i2s_config_t mic_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = RECORD_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 128
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = I2S_PIN_NO_CHANGE
   };
   i2s_pin_config_t mic_p = {
     .bck_io_num = MIC_BCK,
@@ -467,10 +477,18 @@ void setup() {
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = MIC_SD
   };
-  i2s_driver_install(I2S_NUM_1, &mic_cfg, 0, NULL);
+  
+  esp_err_t err = i2s_driver_install(I2S_NUM_1, &mic_cfg, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("[FATAL] MIC I2S err: %d\n", err);
+    while (1) delay(100);
+  }
   i2s_set_pin(I2S_NUM_1, &mic_p);
+  i2s_set_clk(I2S_NUM_1, RECORD_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-  // I2S DAC (starts at 16kHz, switches to 48kHz for music)
+  // ============================================================================
+  // I2S DAC - FIXED FOR ESP32-S3
+  // ============================================================================
   i2s_config_t dac_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = RECORD_RATE,
@@ -478,10 +496,11 @@ void setup() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 16,
-    .dma_buf_len = 256,
-    .use_apll = true,
-    .tx_desc_auto_clear = true
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = I2S_PIN_NO_CHANGE
   };
   
   i2s_pin_config_t dac_p = {
@@ -491,7 +510,7 @@ void setup() {
     .data_in_num = I2S_PIN_NO_CHANGE
   };
   
-  esp_err_t err = i2s_driver_install(I2S_NUM_0, &dac_cfg, 0, NULL);
+  err = i2s_driver_install(I2S_NUM_0, &dac_cfg, 0, NULL);
   if (err != ESP_OK) {
     Serial.printf("[FATAL] DAC err: %d\n", err);
     while (1) delay(100);
@@ -507,8 +526,10 @@ void setup() {
   webSocket.enableHeartbeat(30000, 10000, 2);
 
   Serial.println("=================================");
-  Serial.println("[SETUP] V25 FIXED CHOPPY AUDIO");
+  Serial.println("[SETUP] V26 HQ MIC PINS ALIGNED");
   Serial.println("=================================");
+  Serial.printf("[MIC] SCK: GPIO%d, WS: GPIO%d, SD: GPIO%d\n", MIC_BCK, MIC_WS, MIC_SD);
+  Serial.printf("[DAC] BCK: GPIO%d, WS: GPIO%d, DOUT: GPIO%d\n", I2S_BCK, I2S_WS, I2S_DOUT);
   setColor(pixels.Color(0, 100, 0));
 
   lastActivity = millis();
