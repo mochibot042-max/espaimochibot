@@ -1,9 +1,9 @@
 // ============================================================================
-// ESP32 AUDIO CHATBOT - V26 (HQ MIC PINS ALIGNED)
+// ESP32 AUDIO CHATBOT - V30 (UNLIMITED STT STREAMING)
 // ============================================================================
-// FIXED: Mic pins now aligned with HQ tester (15,16,17)
-// FIXED: use_apll = false for ESP32-S3 compatibility
-// FIXED: dma_buf_len max 1024 for ESP32-S3
+// FIXED: No max recording time limit — only silence stops recording
+// FIXED: Circular buffer for overflow protection instead of hard stop
+// FIXED: Streaming protocol aligned with server V28
 // ============================================================================
 
 #include <WiFi.h>
@@ -23,12 +23,12 @@ const char* WS_PATH = "/ws/audio";
 
 #define LED_PIN 48
 
-// MIC PINS - ALIGNED WITH HQ TESTER (15,16,17)
-#define MIC_BCK 15    // SCK
-#define MIC_WS  16    // LRCK
-#define MIC_SD  17    // DATA
+// MIC PINS
+#define MIC_BCK 15
+#define MIC_WS  16
+#define MIC_SD  17
 
-// DAC PINS (for speaker output)
+// DAC PINS (PCM5100A)
 #define I2S_BCK 4
 #define I2S_WS  5
 #define I2S_DOUT 6
@@ -48,14 +48,18 @@ bool isMusicMode = false;
 float currentVolume = 0.32f;
 
 // ============================================================================
-// RECORDING
+// RECORDING — UNLIMITED STREAMING
 // ============================================================================
 #define RECORD_RATE 16000
 #define BUFFER_SIZE 512
-#define MAX_RECORDING_SIZE (16000 * 2 * 3)
 
-uint8_t* record_buffer = NULL;
-size_t record_pos = 0;
+// Circular buffer for local overflow protection (keeps last ~2 seconds)
+// Instead of stopping, we overwrite old data so user can keep talking
+#define CIRCULAR_BUFFER_SIZE (16000 * 2 * 2)  // 2 seconds of 16-bit mono = 64KB
+
+uint8_t* circular_buffer = NULL;
+size_t circ_write_pos = 0;
+size_t circ_data_len = 0;
 
 const int START_THRESHOLD = 200;
 const int SILENCE_RMS = 60;
@@ -63,9 +67,6 @@ const int SILENCE_THRESH = 25;
 int silence_counter = 0;
 int speech_frames = 0;
 const int SPEECH_CONFIRM = 2;
-
-unsigned long record_start_time = 0;
-const unsigned long MAX_RECORD_MS = 3000;
 
 // ============================================================================
 // PLAYBACK STATE
@@ -76,6 +77,11 @@ volatile uint32_t chunks_received = 0;
 volatile uint32_t chunks_expected = 0;
 unsigned long finish_receive_time = 0;
 const unsigned long FINISH_GRACE_MS = 300;
+
+// ============================================================================
+// STREAMING STATE
+// ============================================================================
+bool stream_started = false;
 
 // ============================================================================
 // TIMING
@@ -117,84 +123,30 @@ float calculateRMS(int16_t* buffer, size_t samples) {
 }
 
 // ============================================================================
-// WAV HEADER
+// CIRCULAR BUFFER HELPERS
 // ============================================================================
-void buildWavHeader(uint8_t* header, uint32_t dataLen) {
-  memcpy(header + 0, "RIFF", 4);
-  uint32_t fileSize = 36 + dataLen;
-  header[4] = fileSize & 0xFF;
-  header[5] = (fileSize >> 8) & 0xFF;
-  header[6] = (fileSize >> 16) & 0xFF;
-  header[7] = (fileSize >> 24) & 0xFF;
-  memcpy(header + 8, "WAVE", 4);
-  memcpy(header + 12, "fmt ", 4);
-  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
-  header[20] = 1; header[21] = 0;
-  header[22] = 1; header[23] = 0;
-  uint32_t sr = RECORD_RATE;
-  header[24] = sr & 0xFF;
-  header[25] = (sr >> 8) & 0xFF;
-  header[26] = (sr >> 16) & 0xFF;
-  header[27] = (sr >> 24) & 0xFF;
-  uint32_t br = RECORD_RATE * 2;
-  header[28] = br & 0xFF;
-  header[29] = (br >> 8) & 0xFF;
-  header[30] = (br >> 16) & 0xFF;
-  header[31] = (br >> 24) & 0xFF;
-  header[32] = 2; header[33] = 0;
-  header[34] = 16; header[35] = 0;
-  memcpy(header + 36, "data", 4);
-  header[40] = dataLen & 0xFF;
-  header[41] = (dataLen >> 8) & 0xFF;
-  header[42] = (dataLen >> 16) & 0xFF;
-  header[43] = (dataLen >> 24) & 0xFF;
-}
-
-// ============================================================================
-// UPLOAD
-// ============================================================================
-void uploadRecording() {
-  if (record_pos == 0 || !webSocket.isConnected()) {
-    record_pos = 0;
-    return;
-  }
-  if (record_pos % 2 != 0) record_pos--;
+void circWrite(uint8_t* data, size_t len) {
+  if (!circular_buffer || len == 0) return;
   
-  uint32_t dataLen = record_pos;
-  uint32_t totalSize = 44 + dataLen;
-  
-  uint8_t* uploadBuffer = (uint8_t*)ps_malloc(totalSize);
-  if (!uploadBuffer) {
-    record_pos = 0;
-    return;
+  for (size_t i = 0; i < len; i++) {
+    circular_buffer[circ_write_pos] = data[i];
+    circ_write_pos = (circ_write_pos + 1) % CIRCULAR_BUFFER_SIZE;
   }
   
-  buildWavHeader(uploadBuffer, dataLen);
-  memcpy(uploadBuffer + 44, record_buffer, dataLen);
-  
-  Serial.printf("[UPLOAD] %d bytes\n", totalSize);
-  webSocket.sendBIN(uploadBuffer, totalSize);
-  free(uploadBuffer);
-  record_pos = 0;
-  Serial.println("[UPLOAD] Sent");
-}
-
-// ============================================================================
-// RECORD
-// ============================================================================
-void recordToBuffer(uint8_t* data, size_t len) {
-  if (record_buffer == NULL) return;
-  size_t avail = MAX_RECORDING_SIZE - record_pos;
-  if (len > avail) len = avail;
-  if (len % 2 != 0) len--;
-  if (len > 0) {
-    memcpy(record_buffer + record_pos, data, len);
-    record_pos += len;
+  circ_data_len += len;
+  if (circ_data_len > CIRCULAR_BUFFER_SIZE) {
+    circ_data_len = CIRCULAR_BUFFER_SIZE; // cap at max
   }
 }
 
+void circReset() {
+  circ_write_pos = 0;
+  circ_data_len = 0;
+  memset(circular_buffer, 0, CIRCULAR_BUFFER_SIZE);
+}
+
 // ============================================================================
-// FIXED: DIRECT I2S WRITE — Loop with retry to prevent partial writes
+// DIRECT I2S WRITE
 // ============================================================================
 void directI2SWrite(uint8_t* data, size_t len) {
   if (!playback_active || len == 0) return;
@@ -277,7 +229,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       isPreparingPlayback = false;
       isMusicMode = false;
       is_recording = false;
-      record_pos = 0;
+      stream_started = false;
+      circReset();
       setI2SRate(RECORD_RATE);
       setColor(pixels.Color(100, 0, 0));
       break;
@@ -289,7 +242,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       isPreparingPlayback = false;
       isMusicMode = false;
       is_recording = false;
-      record_pos = 0;
+      stream_started = false;
+      circReset();
       setI2SRate(RECORD_RATE);
       setColor(pixels.Color(0, 0, 100));
       Serial.println("[WS] Connected");
@@ -387,6 +341,15 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         is_recording = false;
         setColor(pixels.Color(100, 0, 0));
       }
+      else if (msg == "STREAM_READY") {
+        Serial.println("[STREAM] Server ready for audio chunks");
+      }
+      else if (msg.startsWith("STT_RESULT:")) {
+        Serial.printf("[STT] Server result: %s\n", msg.c_str());
+      }
+      else if (msg == "STATE:IDLE") {
+        Serial.println("[STATE] Server idle, ready for next");
+      }
       break;
     }
 
@@ -430,9 +393,10 @@ void setup() {
   prefs.begin("alexatron", false);
   currentVolume = prefs.getFloat("volume", 0.32f);
 
-  record_buffer = (uint8_t*)ps_malloc(MAX_RECORDING_SIZE);
-  if (!record_buffer) {
-    Serial.println("[FATAL] No mem");
+  // Allocate circular buffer for overflow protection
+  circular_buffer = (uint8_t*)ps_malloc(CIRCULAR_BUFFER_SIZE);
+  if (!circular_buffer) {
+    Serial.println("[FATAL] No mem for circular buffer");
     while (1) {
       setColor(pixels.Color(255, 0, 0));
       delay(200);
@@ -440,6 +404,7 @@ void setup() {
       delay(200);
     }
   }
+  circReset();
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(60);
@@ -455,9 +420,7 @@ void setup() {
   setColor(pixels.Color(0, 255, 0));
   WiFi.setSleep(false);
 
-  // ============================================================================
-  // I2S MIC - FIXED FOR ESP32-S3 (aligned with HQ tester pins)
-  // ============================================================================
+  // I2S MIC
   i2s_config_t mic_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = RECORD_RATE,
@@ -486,9 +449,7 @@ void setup() {
   i2s_set_pin(I2S_NUM_1, &mic_p);
   i2s_set_clk(I2S_NUM_1, RECORD_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-  // ============================================================================
-  // I2S DAC - FIXED FOR ESP32-S3
-  // ============================================================================
+  // I2S DAC (PCM5100A)
   i2s_config_t dac_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = RECORD_RATE,
@@ -526,10 +487,11 @@ void setup() {
   webSocket.enableHeartbeat(30000, 10000, 2);
 
   Serial.println("=================================");
-  Serial.println("[SETUP] V26 HQ MIC PINS ALIGNED");
+  Serial.println("[SETUP] V30 UNLIMITED STT STREAMING");
   Serial.println("=================================");
   Serial.printf("[MIC] SCK: GPIO%d, WS: GPIO%d, SD: GPIO%d\n", MIC_BCK, MIC_WS, MIC_SD);
   Serial.printf("[DAC] BCK: GPIO%d, WS: GPIO%d, DOUT: GPIO%d\n", I2S_BCK, I2S_WS, I2S_DOUT);
+  Serial.printf("[BUF] Circular buffer: %d bytes (~%d seconds)\n", CIRCULAR_BUFFER_SIZE, CIRCULAR_BUFFER_SIZE / 32000);
   setColor(pixels.Color(0, 100, 0));
 
   lastActivity = millis();
@@ -537,7 +499,7 @@ void setup() {
 }
 
 // ============================================================================
-// LOOP
+// LOOP — UNLIMITED STREAMING, NO TIME LIMIT
 // ============================================================================
 void loop() {
   webSocket.loop();
@@ -562,11 +524,13 @@ void loop() {
   if (!isWSConnected) {
     if (is_recording) {
       is_recording = false;
-      record_pos = 0;
+      stream_started = false;
+      circReset();
     }
     return;
   }
 
+  // Don't read mic during playback
   if (playback_active || isPreparingPlayback) return;
 
   int16_t sample_buffer[BUFFER_SIZE / 2];
@@ -583,23 +547,54 @@ void loop() {
 
     if (speech_frames >= SPEECH_CONFIRM) {
       is_recording = true;
-      record_pos = 0;
       silence_counter = 0;
       speech_frames = 0;
-      record_start_time = millis();
+      stream_started = false;
+      circReset();  // Clear old data, start fresh
       setColor(pixels.Color(0, 255, 255));
-      Serial.println("[REC] Start");
+      Serial.println("[REC] Start — UNLIMITED (silence only stops)");
     }
   }
   else {
-    recordToBuffer((uint8_t*)sample_buffer, bytes_read);
+    // ============================================
+    // UNLIMITED STREAMING — NO TIME LIMIT
+    // Only silence stops recording
+    // ============================================
+    
+    // Send STREAM_START on first chunk
+    if (!stream_started) {
+      if (webSocket.isConnected()) {
+        webSocket.sendTXT("STREAM_START");
+        Serial.println("[STREAM] Sent STREAM_START");
+      }
+      stream_started = true;
+      delay(50);
+    }
+    
+    // Send raw PCM data immediately (real-time streaming)
+    if (bytes_read > 0 && webSocket.isConnected()) {
+      size_t sendLen = bytes_read;
+      if (sendLen % 2 != 0) sendLen--;
+      webSocket.sendBIN((uint8_t*)sample_buffer, sendLen);
+    }
 
+    // Also save to circular buffer (keeps last 2 seconds as backup)
+    circWrite((uint8_t*)sample_buffer, bytes_read);
+
+    // Check silence — THIS IS THE ONLY WAY TO STOP RECORDING
     if (rms < SILENCE_RMS) {
       silence_counter++;
       if (silence_counter > SILENCE_THRESH) {
-        Serial.println("[REC] Silence -> Upload");
-        uploadRecording();
+        Serial.println("[REC] Silence detected -> STREAM_END");
+        
+        if (webSocket.isConnected()) {
+          webSocket.sendTXT("STREAM_END");
+          Serial.println("[STREAM] Sent STREAM_END");
+        }
+        
         is_recording = false;
+        stream_started = false;
+        circReset();
         return;
       }
     }
@@ -607,10 +602,7 @@ void loop() {
       silence_counter = 0;
     }
 
-    if (millis() - record_start_time > MAX_RECORD_MS) {
-      Serial.println("[REC] Max -> Upload");
-      uploadRecording();
-      is_recording = false;
-    }
+    // REMOVED: No max recording time check!
+    // You can talk as long as you want, only silence stops it
   }
 }
