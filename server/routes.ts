@@ -9,7 +9,7 @@ import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { spawn } from "child_process";
 import { storage, pushSchema, verifySchema } from "./storage.js";
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
