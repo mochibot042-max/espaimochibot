@@ -23,7 +23,7 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — AI RESPONSE (16kHz MONO)
+// AUDIO CONFIG — MAX QUALITY AI RESPONSE (16kHz MONO for ESP32 compatibility)
 // ============================================================================
 const AI_SAMPLE_RATE = 16000;
 const AI_CHUNK_SIZE_MONO = 1024;
@@ -49,7 +49,7 @@ const WEATHER_LOCATION = "Alfonso,Cavite,Philippines";
 // ============================================================================
 // CACHE CONFIG
 // ============================================================================
-const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+const CACHE_DURATION = 10 * 60 * 1000;
 
 function getCachePath(key: string): string {
   const safeKey = key.replace(/[^a-zA-Z0-9]/g, "_");
@@ -247,13 +247,14 @@ function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string
 }
 
 // ============================================================================
-// EDGE TTS — DYNAMIC LANGUAGE
+// EDGE TTS — MAX QUALITY (24kHz 96kbps — best balance for voice)
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
     try {
       const tts = new MsEdgeTTS();
       const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
+      // MAX QUALITY: 24kHz 96kbps mono MP3 (best for voice streaming)
       await tts.setMetadata(
         voice,
         OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
@@ -265,7 +266,7 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
         const buf = Buffer.concat(chunks);
         if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS]", voice, "success, size:", buf.length);
+        console.log("[TTS] MAX QUALITY", voice, "24kHz/96kbps, size:", buf.length);
         resolve();
       });
       audioStream.on("error", reject);
@@ -276,17 +277,20 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
 }
 
 // ============================================================================
-// PCM GENERATION (AI)
+// PCM GENERATION — ENHANCED FOR CLARITY
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=80", "lowpass=f=8000",
+        "highpass=f=60",           // Lower cutoff for more bass
+        "lowpass=f=8500",          // Slightly higher for clarity
         "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.85", "dynaudnorm=p=0.95:g=15"
+        "volume=1.0",              // Full volume (was 0.85)
+        "dynaudnorm=p=0.95:g=15",  // Dynamic normalization
+        "loudnorm=I=-14:TP=-1.0:LRA=11"  // Broadcast loudness
       ])
       .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(AI_SAMPLE_RATE)
       .format("s16le")
@@ -718,7 +722,6 @@ Return ONLY the JSON object.`;
       lang: parsed.lang || detectLanguage(userText)
     };
   } catch {
-    // Fallback: try to extract intent from raw text
     const lower = raw.toLowerCase();
     const lang = detectLanguage(userText);
     
@@ -754,7 +757,6 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    // AI decides what to do
     const action = await getAIDecision(userText, history, savedName);
     console.log("[AI DECISION]", action.type, "lang:", action.lang, "weather:", action.weather, "music:", action.music);
 
@@ -796,7 +798,6 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       }
     }
 
-    // Save to history
     await storage.addMessage(userId, "user", userText);
     await storage.addMessage(userId, "assistant", finalText);
 
@@ -864,7 +865,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - wttr.in WEATHER + AI-DRIVEN + LANG_SWITCH");
+    console.log("ESP connected - MAX QUALITY TTS + wttr.in WEATHER + AI-DRIVEN");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
