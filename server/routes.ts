@@ -10,7 +10,7 @@ import { spawn } from "child_process";
 import { storage, pushSchema, verifySchema } from "./storage.js";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
-const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || "0925ec58684006d349a4c0556d20e802";
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || "3e073c28c8f85d28ad03553225674c12";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
