@@ -23,12 +23,12 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — MAX QUALITY AI RESPONSE (16kHz MONO for ESP32 compatibility)
+// AUDIO CONFIG — 48kHz MAX QUALITY (match TTS output)
 // ============================================================================
-const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE_MONO = 1024;
-const SEND_INTERVAL_MS_AI = 28;
-const PREBUFFER_CHUNKS_AI = 24;
+const AI_SAMPLE_RATE = 48000;        // CHANGED: 16kHz -> 48kHz to match TTS
+const AI_CHUNK_SIZE_MONO = 3072;     // CHANGED: 1024 -> 3072 for 48kHz (64ms chunks)
+const SEND_INTERVAL_MS_AI = 21;      // CHANGED: 28 -> 21ms for 48kHz smooth streaming
+const PREBUFFER_CHUNKS_AI = 32;      // CHANGED: 24 -> 32 for 48kHz
 
 const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
@@ -36,7 +36,7 @@ const SEND_INTERVAL_MS_MUSIC = 20;
 const PREBUFFER_CHUNKS_MUSIC = 32;
 
 // ============================================================================
-// STREAMING STT CONFIG
+// STREAMING STT CONFIG (MIC stays 16kHz, only playback is 48kHz)
 // ============================================================================
 const STT_STREAM_SAMPLE_RATE = 16000;
 const STT_MAX_AUDIO_SECONDS = 12;
@@ -135,7 +135,9 @@ function detectLanguage(text: string): "en" | "fil" {
     "naman", "talaga", "siguro", "pala", "din", "rin", "dito", "diyan", "doon",
     "panahon", "ulan", "mainit", "malamig", "bagyo", "araw", "gabi", "umaga",
     "tumugtog", "kanta", "musika", "tawagin", "pangalan", "tawag", "gusto", "ayaw",
-    "maganda", "masaya", "malungkot", "pagod", "gutom", "uhaw", "lamig"
+    "maganda", "masaya", "malungkot", "pagod", "gutom", "uhaw", "lamig",
+    "ilaw", "kulay", "pula", "asul", "berde", "dilaw", "puti", "itim",
+    "restart", "reboot", "volume", "lakas", "mahina", "tahimik", "malakas"
   ];
   const words = lower.split(/\s+/);
   let filCount = 0;
@@ -143,6 +145,98 @@ function detectLanguage(text: string): "en" | "fil" {
     if (filWords.includes(word)) filCount++;
   }
   return filCount / words.length > 0.3 ? "fil" : "en";
+}
+
+// ============================================================================
+// VOLUME PARSER — "set volume to 50%" -> 0.5
+// ============================================================================
+function extractVolumeCommand(text: string): { isVolumeCommand: boolean; volumeLevel: number | null } {
+  const lower = text.toLowerCase();
+  const patterns = [
+    /(?:set|change|adjust)\s+(?:the\s+)?volume\s+(?:to\s+)?(\d+)%?/i,
+    /volume\s+(?:to\s+)?(\d+)%?/i,
+    /(\d+)%?\s+volume/i,
+    /(?:lakas|mahina|tahimik)\s+(?:ng\s+)?volume/i,
+    /volume\s+(?:ay\s+)?(\d+)%?/i,
+  ];
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match && match[1]) {
+      const level = parseInt(match[1]);
+      if (level >= 0 && level <= 100) {
+        return { isVolumeCommand: true, volumeLevel: level / 100.0 };
+      }
+    }
+  }
+  // Filipino keywords
+  if (lower.includes("tahimik") || lower.includes("mahina")) {
+    return { isVolumeCommand: true, volumeLevel: 0.2 };
+  }
+  if (lower.includes("malakas") || lower.includes("lakas")) {
+    return { isVolumeCommand: true, volumeLevel: 0.8 };
+  }
+  return { isVolumeCommand: false, volumeLevel: null };
+}
+
+// ============================================================================
+// LED COLOR PARSER — "set LED to red" -> {r:255,g:0,b:0}
+// ============================================================================
+function extractLEDCommand(text: string): { isLEDCommand: boolean; color: {r:number,g:number,b:number} | null; colorName: string | null } {
+  const lower = text.toLowerCase();
+  const colorMap: Record<string, {r:number,g:number,b:number}> = {
+    "red": {r:255,g:0,b:0}, "pula": {r:255,g:0,b:0},
+    "green": {r:0,g:255,b:0}, "berde": {r:0,g:255,b:0}, "luntian": {r:0,g:255,b:0},
+    "blue": {r:0,g:0,b:255}, "asul": {r:0,g:0,b:255}, "bughaw": {r:0,g:0,b:255},
+    "yellow": {r:255,g:255,b:0}, "dilaw": {r:255,g:255,b:0},
+    "white": {r:255,g:255,b:255}, "puti": {r:255,g:255,b:255},
+    "black": {r:0,g:0,b:0}, "itim": {r:0,g:0,b:0},
+    "purple": {r:200,g:0,b:200}, "violet": {r:200,g:0,b:200}, "lila": {r:200,g:0,b:200},
+    "orange": {r:255,g:165,b:0}, "kahel": {r:255,g:165,b:0},
+    "cyan": {r:0,g:255,b:255}, "sian": {r:0,g:255,b:255},
+    "pink": {r:255,g:192,b:203}, "rosas": {r:255,g:192,b:203},
+    "off": {r:0,g:0,b:0}, "patay": {r:0,g:0,b:0},
+  };
+  
+  const patterns = [
+    /(?:set|change)\s+(?:the\s+)?(?:led|light|color)\s+(?:to\s+)?(\w+)/i,
+    /(?:ilaw|kulay|led)\s+(?:ay\s+)?(\w+)/i,
+    /gawing\s+(\w+)\s+(?:ang\s+)?(?:ilaw|kulay|led)/i,
+    /(\w+)\s+(?:na\s+)?(?:ilaw|kulay|led)/i,
+  ];
+  
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match && match[1]) {
+      const colorName = match[1].toLowerCase();
+      if (colorMap[colorName]) {
+        return { isLEDCommand: true, color: colorMap[colorName], colorName };
+      }
+    }
+  }
+  
+  // Check if any color keyword is in the text
+  for (const [name, rgb] of Object.entries(colorMap)) {
+    if (lower.includes(name)) {
+      return { isLEDCommand: true, color: rgb, colorName: name };
+    }
+  }
+  
+  return { isLEDCommand: false, color: null, colorName: null };
+}
+
+// ============================================================================
+// RESTART DETECTION — "restart yourself" / "reboot"
+// ============================================================================
+function isRestartCommand(text: string): boolean {
+  const lower = text.toLowerCase();
+  const patterns = [
+    /restart\s+(?:yourself|system|device|robot)/i,
+    /reboot\s+(?:yourself|system|device|robot)/i,
+    /mag\s*[-]?restart/i,
+    /i\s*[-]?reboot/i,
+    /patayin\s+at\s+buhayin/i,
+  ];
+  return patterns.some(p => p.test(lower));
 }
 
 // ============================================================================
@@ -219,45 +313,36 @@ async function fetchWeather(): Promise<WeatherData | null> {
 function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string {
   if (lang === "fil") {
     const conditionFil: Record<string, string> = {
-      "Clear": "Malinis na langit",
-      "Sunny": "Maaraw",
-      "Partly cloudy": "Bahagyang maulap",
-      "Cloudy": "Maulap",
-      "Overcast": "Makapal na maulap",
-      "Mist": "Mahamog",
-      "Fog": "Makapal na hamog",
-      "Rain": "Umuulan",
-      "Light rain": "Mahinang ulan",
-      "Moderate rain": "Katamtamang ulan",
-      "Heavy rain": "Malakas na ulan",
-      "Drizzle": "Ambon",
-      "Thunderstorm": "May bagyo",
-      "Snow": "Nagsisnow",
-      "Haze": "Mabahong hangin",
-      "Patchy rain possible": "Posibleng umulan",
-      "Patchy light rain": "Bahagyang mahinang ulan"
+      "Clear": "Malinis na langit", "Sunny": "Maaraw",
+      "Partly cloudy": "Bahagyang maulap", "Cloudy": "Maulap",
+      "Overcast": "Makapal na maulap", "Mist": "Mahamog",
+      "Fog": "Makapal na hamog", "Rain": "Umuulan",
+      "Light rain": "Mahinang ulan", "Moderate rain": "Katamtamang ulan",
+      "Heavy rain": "Malakas na ulan", "Drizzle": "Ambon",
+      "Thunderstorm": "May bagyo", "Snow": "Nagsisnow",
+      "Haze": "Mabahong hangin", "Patchy rain possible": "Posibleng umulan",
     };
     const cond = conditionFil[weather.condition] || weather.condition;
     const timeDesc = weather.isDay ? "ngayon" : "ngayong gabi";
-    return `Ang temperatura ${timeDesc} sa ${weather.city}, ${weather.country} ay ${weather.temperature}°C. Pakiramdam ay ${weather.feelsLike}°C. ${cond}. Ang humidity ay ${weather.humidity}%, ang bilis ng hangin ay ${weather.windSpeed} km/h, at ang pressure ay ${weather.pressure} hPa. Ang UV index ay ${weather.uvIndex} at ang visibility ay ${weather.visibility} km. Ang maximum temperatura ngayong araw ay ${weather.maxTemp}°C at ang minimum ay ${weather.minTemp}°C.`;
+    return `Ang temperatura ${timeDesc} sa ${weather.city}, ${weather.country} ay ${weather.temperature}°C. Pakiramdam ay ${weather.feelsLike}°C. ${cond}. Humidity ${weather.humidity}%, hangin ${weather.windSpeed} km/h, pressure ${weather.pressure} hPa. UV index ${weather.uvIndex}, visibility ${weather.visibility} km. High ${weather.maxTemp}°C, low ${weather.minTemp}°C.`;
   } else {
     const timeDesc = weather.isDay ? "right now" : "tonight";
-    return `The temperature ${timeDesc} in ${weather.city}, ${weather.country} is ${weather.temperature}°C. It feels like ${weather.feelsLike}°C with ${weather.condition}. Humidity is ${weather.humidity}%, wind speed is ${weather.windSpeed} km/h, and pressure is ${weather.pressure} hPa. The UV index is ${weather.uvIndex} and visibility is ${weather.visibility} km. Today's high is ${weather.maxTemp}°C and low is ${weather.minTemp}°C.`;
+    return `The temperature ${timeDesc} in ${weather.city}, ${weather.country} is ${weather.temperature}°C. Feels like ${weather.feelsLike}°C with ${weather.condition}. Humidity ${weather.humidity}%, wind ${weather.windSpeed} km/h, pressure ${weather.pressure} hPa. UV index ${weather.uvIndex}, visibility ${weather.visibility} km. High ${weather.maxTemp}°C, low ${weather.minTemp}°C.`;
   }
 }
 
 // ============================================================================
-// EDGE TTS — MAX QUALITY (24kHz 96kbps — best balance for voice)
+// EDGE TTS — ABSOLUTE MAX QUALITY (48kHz 192kbps)
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
     try {
       const tts = new MsEdgeTTS();
       const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
-      // MAX QUALITY: 24kHz 96kbps mono MP3 (best for voice streaming)
+      // MAX QUALITY: 48kHz 192kbps mono MP3 (absolute best)
       await tts.setMetadata(
         voice,
-        OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
+        OUTPUT_FORMAT.AUDIO_48KHZ_192KBITRATE_MONO_MP3
       );
       const { audioStream } = tts.toStream(text);
       const chunks: Buffer[] = [];
@@ -266,7 +351,7 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
         const buf = Buffer.concat(chunks);
         if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] MAX QUALITY", voice, "24kHz/96kbps, size:", buf.length);
+        console.log("[TTS] MAX 48kHz/192kbps", voice, "size:", buf.length);
         resolve();
       });
       audioStream.on("error", reject);
@@ -277,20 +362,22 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
 }
 
 // ============================================================================
-// PCM GENERATION — ENHANCED FOR CLARITY
+// PCM GENERATION — 48kHz, NO BASS BOOST, CRISP CLEAR
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=60",           // Lower cutoff for more bass
-        "lowpass=f=8500",          // Slightly higher for clarity
+        "highpass=f=120",          // Higher cutoff to remove muddy bass
+        "lowpass=f=14000",         // Limit to speech range
         "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=1.0",              // Full volume (was 0.85)
+        "volume=0.95",             // Slight headroom
         "dynaudnorm=p=0.95:g=15",  // Dynamic normalization
-        "loudnorm=I=-14:TP=-1.0:LRA=11"  // Broadcast loudness
+        "loudnorm=I=-16:TP=-1.5:LRA=11",  // Broadcast standard
+        "equalizer=f=3000:t=h:width=500:g=2",  // Slight speech clarity boost
+        "equalizer=f=200:t=h:width=100:g=-3"   // Reduce low-mid mud
       ])
       .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(AI_SAMPLE_RATE)
       .format("s16le")
@@ -337,14 +424,14 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO)
+// STREAM AI RESPONSE PCM (48kHz MONO)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
 
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
   const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
-  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms", "prebuffer:", PREBUFFER_CHUNKS_AI);
+  console.log("[STREAM] AI 48kHz:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms");
 
   ws.send("SESSION:" + sessionId);
   await delay(100);
@@ -367,7 +454,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 
   ws.send("START_RESPONSE");
   await delay(100);
-  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", prebufferLimit * 32, "ms), started playback");
+  console.log("[STREAM] AI prebuffer done, started 48kHz playback");
 
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
@@ -388,7 +475,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
         await delay(200); 
       }
     }
-    console.log("[STREAM] AI done:", seq, "chunks");
+    console.log("[STREAM] AI done:", seq, "chunks @ 48kHz");
   } catch (e: any) {
     console.error("[STREAM] Error:", e.message);
     try { ws.send("FINISH_RESPONSE:ERROR"); } catch {}
@@ -401,7 +488,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
+  console.log("[MUSIC] Starting stream:", sessionId);
 
   return new Promise<void>((resolve, reject) => {
     const ffmpegArgs = [
@@ -479,7 +566,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks)");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
@@ -626,7 +713,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
         file: fs.createReadStream(tmpClean), 
         model: "whisper-large-v3-turbo", 
         language: "en",
-        prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan, weather, panahon, ulan, mainit, lamig."
+        prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan, weather, panahon, ulan, mainit, lamig, volume, lakas, kulay, ilaw, restart, reboot."
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
@@ -655,41 +742,53 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 // AI-DRIVEN PROCESSOR — LLM DECIDES EVERYTHING
 // ============================================================================
 interface AIAction {
-  type: "chat" | "weather" | "music";
+  type: "chat" | "weather" | "music" | "led" | "volume" | "restart";
   text: string;
   music?: string | null;
   weather?: boolean;
+  ledColor?: {r:number,g:number,b:number} | null;
+  ledColorName?: string | null;
+  volumeLevel?: number | null;
+  shouldRestart?: boolean;
   lang: "en" | "fil";
 }
 
 async function getAIDecision(userText: string, history: any[], savedName: string | null): Promise<AIAction> {
-  const systemPrompt = `You are Mochi, a helpful voice assistant. The user is in Alfonso, Cavite, Philippines.
+  const systemPrompt = `You are Mochi, a helpful voice assistant robot. The user is in Alfonso, Cavite, Philippines.
 
 CRITICAL RULES:
 1. You MUST respond in valid JSON ONLY. No extra text, no markdown.
 2. Detect the user's language (English or Filipino/Tagalog) and respond in that same language.
-3. If the user asks about weather, temperature, rain, forecast, or anything related to current conditions, set "type": "weather" and "weather": true.
+3. If the user asks about weather, temperature, rain, forecast, set "type": "weather" and "weather": true.
 4. If the user wants to play music or a song, set "type": "music" and provide the "music" search query.
-5. For normal conversation, set "type": "chat".
-6. Keep responses natural, concise, and conversational (1-2 sentences max for voice).
-7. If the user says something vague like "play music" without specifying a song, ask what song they want.
+5. If the user asks to change LED color or light color, set "type": "led" and provide "ledColorName" (red, green, blue, yellow, white, black, purple, orange, cyan, pink, off).
+6. If the user asks to set volume, set "type": "volume" and provide "volumeLevel" (0.0 to 1.0).
+7. If the user asks to restart or reboot the system, set "type": "restart" and "shouldRestart": true.
+8. For normal conversation, set "type": "chat".
+9. Keep responses natural, concise, and conversational (1-2 sentences max for voice).
+10. If the user says something vague like "play music" without specifying a song, ask what song they want.
 
 JSON FORMAT:
 {
-  "type": "chat" | "weather" | "music",
+  "type": "chat" | "weather" | "music" | "led" | "volume" | "restart",
   "text": "your response text",
   "music": "song search query or null",
   "weather": true or false,
+  "ledColorName": "color name or null",
+  "volumeLevel": 0.0 to 1.0 or null,
+  "shouldRestart": true or false,
   "lang": "en" or "fil"
 }
 
 Examples:
-- "What's the weather?" -> {"type":"weather","text":"Let me check the weather for you.","weather":true,"music":null,"lang":"en"}
-- "Kumusta ang panahon?" -> {"type":"weather","text":"Tingnan ko ang panahon ngayon.","weather":true,"music":null,"lang":"fil"}
-- "Play Tibok" -> {"type":"music","text":"Playing Tibok by Earl Agustin","music":"Tibok by Earl Agustin","weather":false,"lang":"en"}
-- "Tumugtog ka ng music" -> {"type":"music","text":"Anong kanta gusto mo?","music":null,"weather":false,"lang":"fil"}
-- "Hello" -> {"type":"chat","text":"Hello! How can I help you today?","music":null,"weather":false,"lang":"en"}
-- "Kumusta" -> {"type":"chat","text":"Mabuti naman! Paano kita matutulungan?","music":null,"weather":false,"lang":"fil"}
+- "What's the weather?" -> {"type":"weather","text":"Let me check the weather.","weather":true,"music":null,"ledColorName":null,"volumeLevel":null,"shouldRestart":false,"lang":"en"}
+- "Set LED to red" -> {"type":"led","text":"LED set to red.","weather":false,"music":null,"ledColorName":"red","volumeLevel":null,"shouldRestart":false,"lang":"en"}
+- "Gawing pula ang ilaw" -> {"type":"led","text":"Pula na ang ilaw.","weather":false,"music":null,"ledColorName":"red","volumeLevel":null,"shouldRestart":false,"lang":"fil"}
+- "Set volume to 50%" -> {"type":"volume","text":"Volume set to 50%.","weather":false,"music":null,"ledColorName":null,"volumeLevel":0.5,"shouldRestart":false,"lang":"en"}
+- "Lakasan mo ang volume" -> {"type":"volume","text":"Lakas na ang volume.","weather":false,"music":null,"ledColorName":null,"volumeLevel":0.8,"shouldRestart":false,"lang":"fil"}
+- "Restart yourself" -> {"type":"restart","text":"Restarting now.","weather":false,"music":null,"ledColorName":null,"volumeLevel":null,"shouldRestart":true,"lang":"en"}
+- "Mag restart ka" -> {"type":"restart","text":"Magre-restart na ako.","weather":false,"music":null,"ledColorName":null,"volumeLevel":null,"shouldRestart":true,"lang":"fil"}
+- "Play Tibok" -> {"type":"music","text":"Playing Tibok.","music":"Tibok by Earl Agustin","weather":false,"ledColorName":null,"volumeLevel":null,"shouldRestart":false,"lang":"en"}
 
 Return ONLY the JSON object.`;
 
@@ -703,7 +802,7 @@ Return ONLY the JSON object.`;
     llmClient.chat.completions.create({ 
       model: "llama-3.3-70b-versatile", 
       messages, 
-      max_tokens: 200, 
+      max_tokens: 250, 
       temperature: 0.3 
     }),
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
@@ -719,19 +818,27 @@ Return ONLY the JSON object.`;
       text: parsed.text || "Sorry, I didn't understand.",
       music: parsed.music || null,
       weather: parsed.weather === true,
+      ledColor: parsed.ledColorName ? extractLEDCommand(parsed.ledColorName).color : null,
+      ledColorName: parsed.ledColorName || null,
+      volumeLevel: parsed.volumeLevel !== undefined ? parsed.volumeLevel : null,
+      shouldRestart: parsed.shouldRestart === true,
       lang: parsed.lang || detectLanguage(userText)
     };
   } catch {
+    // Fallback parsing
     const lower = raw.toLowerCase();
     const lang = detectLanguage(userText);
     
-    if (lower.includes("weather") || lower.includes("panahon") || lower.includes("temperature")) {
-      return { type: "weather", text: raw, music: null, weather: true, lang };
+    if (lower.includes("weather") || lower.includes("panahon")) {
+      return { type: "weather", text: raw, music: null, weather: true, ledColor: null, ledColorName: null, volumeLevel: null, shouldRestart: false, lang };
     }
-    if (lower.includes("music") || lower.includes("song") || lower.includes("kanta") || lower.includes("tumugtog")) {
-      return { type: "music", text: raw, music: null, weather: false, lang };
+    if (lower.includes("music") || lower.includes("song") || lower.includes("kanta")) {
+      return { type: "music", text: raw, music: null, weather: false, ledColor: null, ledColorName: null, volumeLevel: null, shouldRestart: false, lang };
     }
-    return { type: "chat", text: raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(), music: null, weather: false, lang };
+    if (lower.includes("restart") || lower.includes("reboot")) {
+      return { type: "restart", text: raw, music: null, weather: false, ledColor: null, ledColorName: null, volumeLevel: null, shouldRestart: true, lang };
+    }
+    return { type: "chat", text: raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(), music: null, weather: false, ledColor: null, ledColorName: null, volumeLevel: null, shouldRestart: false, lang };
   }
 }
 
@@ -742,6 +849,7 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
   
   const filesToCleanup: string[] = [];
+  let pendingRestart = false;
   
   try {
     const nameAction = extractName(userText);
@@ -758,7 +866,7 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const savedName = await storage.getSavedName(userId);
 
     const action = await getAIDecision(userText, history, savedName);
-    console.log("[AI DECISION]", action.type, "lang:", action.lang, "weather:", action.weather, "music:", action.music);
+    console.log("[AI DECISION]", action.type, "lang:", action.lang);
 
     let finalText = action.text;
     let musicQuery = action.music;
@@ -766,6 +874,46 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     if (nameResponse) {
       finalText = nameResponse;
       musicQuery = null;
+    }
+
+    // Handle LED Command (AI decided)
+    if (action.type === "led" && action.ledColor) {
+      const ledMsg = `LED:${action.ledColor.r},${action.ledColor.g},${action.ledColor.b}`;
+      ws.send(ledMsg);
+      console.log("[LED] Sent:", ledMsg);
+      
+      await storage.addMessage(userId, "user", userText);
+      await storage.addMessage(userId, "assistant", finalText);
+      
+      const mp3 = path.join(AUDIO_DIR, sessionId + "_led.mp3");
+      filesToCleanup.push(mp3);
+      await generateEdgeTTS(finalText, mp3, action.lang);
+      const pcm = await generatePCM(mp3);
+      await streamPCM(ws, pcm, sessionId);
+      return;
+    }
+
+    // Handle Volume Command (AI decided)
+    if (action.type === "volume" && action.volumeLevel !== null) {
+      const volMsg = `VOLUME:${action.volumeLevel.toFixed(2)}`;
+      ws.send(volMsg);
+      console.log("[VOLUME] Sent:", volMsg);
+      
+      await storage.addMessage(userId, "user", userText);
+      await storage.addMessage(userId, "assistant", finalText);
+      
+      const mp3 = path.join(AUDIO_DIR, sessionId + "_vol.mp3");
+      filesToCleanup.push(mp3);
+      await generateEdgeTTS(finalText, mp3, action.lang);
+      const pcm = await generatePCM(mp3);
+      await streamPCM(ws, pcm, sessionId);
+      return;
+    }
+
+    // Handle Restart Command (AI decided)
+    if (action.type === "restart" && action.shouldRestart) {
+      pendingRestart = true;
+      console.log("[RESTART] Scheduled after TTS");
     }
 
     // Handle Weather (AI decided)
@@ -784,11 +932,17 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
         
         await storage.addMessage(userId, "user", userText);
         await storage.addMessage(userId, "assistant", weatherText);
+        
+        if (pendingRestart) {
+          await delay(1000);
+          ws.send("RESTART_NOW");
+          console.log("[RESTART] Sent command to ESP32");
+        }
         return;
       } else {
         const failText = action.lang === "fil" 
-          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon ngayon. Subukan mo ulit mamaya." 
-          : "Sorry, I couldn't fetch the weather right now. Please try again later.";
+          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon." 
+          : "Sorry, I couldn't fetch the weather.";
         const mp3 = path.join(AUDIO_DIR, sessionId + "_weather_fail.mp3");
         filesToCleanup.push(mp3);
         await generateEdgeTTS(failText, mp3, action.lang);
@@ -806,8 +960,8 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       const musicUrl = await fetchMusicUrl(musicQuery);
       if (!musicUrl) { 
         const notFound = action.lang === "fil" 
-          ? "Hindi ko mahanap ang kanta. Subukan mo ulit." 
-          : "I couldn't find that song. Please try again.";
+          ? "Hindi ko mahanap ang kanta." 
+          : "I couldn't find that song.";
         const mp3 = path.join(AUDIO_DIR, sessionId + "_notfound.mp3");
         filesToCleanup.push(mp3);
         await generateEdgeTTS(notFound, mp3, action.lang);
@@ -819,10 +973,8 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       if (finalText && !nameResponse) {
         const introId = sessionId + "_intro";
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
-
         await generateEdgeTTS(finalText, introMp3, action.lang);
         filesToCleanup.push(introMp3);
-
         const introPcm = await generatePCM(introMp3);
         await streamPCM(ws, introPcm, introId);
         await delay(1000);
@@ -830,13 +982,20 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
 
       await streamMusicRealtime(ws, musicUrl, sessionId + "_music");
     } 
-    // Handle Chat (default)
+    // Handle Chat / Restart
     else {
       const mp3 = path.join(AUDIO_DIR, sessionId + ".mp3");
       await generateEdgeTTS(finalText, mp3, action.lang);
       filesToCleanup.push(mp3);
       const pcm = await generatePCM(mp3);
       await streamPCM(ws, pcm, sessionId);
+      
+      // Send restart command AFTER TTS finishes
+      if (pendingRestart) {
+        await delay(1000);
+        ws.send("RESTART_NOW");
+        console.log("[RESTART] Sent command to ESP32 after TTS");
+      }
     }
   } catch (e: any) {
     console.error("[PROCESS] Error:", e.message);
@@ -865,7 +1024,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - MAX QUALITY TTS + wttr.in WEATHER + AI-DRIVEN");
+    console.log("ESP connected - V32 48kHz MAX + AI LED/VOL/RESTART");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
