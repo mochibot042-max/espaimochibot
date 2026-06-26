@@ -31,7 +31,7 @@ const PREBUFFER_CHUNKS_AI = 24;
 // FIXED: Music now uses 48000Hz to match ESP32 DAC
 const MUSIC_SAMPLE_RATE = 48000;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
-const SEND_INTERVAL_MS_MUSIC = 21;  // 512 samples / 48000Hz = ~10.7ms, x2 = ~21ms
+const SEND_INTERVAL_MS_MUSIC = 21;
 const PREBUFFER_CHUNKS_MUSIC = 32;
 
 // ============================================================================
@@ -241,7 +241,6 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
   console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
 
   return new Promise<void>((resolve, reject) => {
-    // FIXED: Music resampled to 48000Hz to match ESP32 DAC
     const ffmpegArgs = [
       "-re",
       "-i", musicUrl,
@@ -249,7 +248,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "48000",        // FIXED: 48000Hz instead of 44100Hz
+      "-ar", "48000",
       "-f", "s16le",
       "pipe:1"
     ];
@@ -389,7 +388,7 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// STREAMING STT PROCESSOR
+// STREAMING STT PROCESSOR — FIXED: Simplified whisper-large-v3 with verbose_json
 // ============================================================================
 interface StreamingSTTSession {
   userId: number;
@@ -409,6 +408,7 @@ function createSTTSession(ws: WebSocket, userId: number): StreamingSTTSession {
   };
 }
 
+// FIXED: Simplified STT using whisper-large-v3 with verbose_json
 async function processFinalSTT(session: StreamingSTTSession): Promise<string | null> {
   if (session.audioBuffer.length < 1600) {
     console.log("[STT] Audio too short, ignoring");
@@ -416,10 +416,10 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
   }
 
   const tmpWav = path.join(UPLOAD_DIR, session.sessionId + "_stt.wav");
-  const tmpClean = path.join(UPLOAD_DIR, session.sessionId + "_clean.wav");
   const dataLen = session.audioBuffer.length;
 
   try {
+    // Build WAV header for the raw PCM buffer
     const wavBuffer = Buffer.alloc(44 + dataLen);
     wavBuffer.write("RIFF", 0);
     wavBuffer.writeUInt32LE(36 + dataLen, 4);
@@ -439,40 +439,21 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     fs.writeFileSync(tmpWav, wavBuffer);
     console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
-    await new Promise<void>((resolve, reject) => {
-      ffmpeg(tmpWav)
-        .audioFilters([
-          "highpass=f=80",
-          "lowpass=f=8000",
-          "dynaudnorm=p=0.95:g=15",
-          "afftdn=nf=-25"
-        ])
-        .audioCodec("pcm_s16le")
-        .audioChannels(1)
-        .audioFrequency(16000)
-        .on("error", (err) => {
-          console.log("[STT] FFmpeg normalize failed, using raw:", err.message);
-          fs.copyFileSync(tmpWav, tmpClean);
-          resolve();
-        })
-        .on("end", resolve)
-        .save(tmpClean);
-    });
-
-    const stt = await Promise.race([
-      sttClient.audio.transcriptions.create({ 
-        file: fs.createReadStream(tmpClean), 
-        model: "whisper-large-v3-turbo", 
-        language: "en",
-        prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan."
+    // FIXED: Simplified STT using whisper-large-v3 with verbose_json
+    const transcription = await Promise.race([
+      sttClient.audio.transcriptions.create({
+        file: fs.createReadStream(tmpWav),
+        model: "whisper-large-v3",
+        temperature: 0,
+        response_format: "verbose_json",
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
 
-    const text = stt.text?.trim();
+    // verbose_json returns object with .text property
+    const text = transcription.text?.trim();
 
     try { fs.unlinkSync(tmpWav); } catch {}
-    try { fs.unlinkSync(tmpClean); } catch {}
 
     if (!text) {
       console.log("[STT] No speech detected");
@@ -484,7 +465,6 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
   } catch (e: any) {
     console.error("[STT] Error:", e.message);
     try { fs.unlinkSync(tmpWav); } catch {}
-    try { fs.unlinkSync(tmpClean); } catch {}
     return null;
   }
 }
@@ -511,11 +491,10 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    // FIXED: Groq Compound system prompt with web search capability
     const systemPrompt = `You are Mochi, a helpful Filipino voice assistant with real-time web access via Groq Compound.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
-You can search the web, visit websites, and use code interpreter when needed BTW for weather, My location is Cavite,Alfonso,kaysuyo.
-Keep responses natural, concise, and conversational.
+You can search the web, visit websites, and use code interpreter when needed.
+Keep responses natural, concise, and conversational — max 2-3 sentences for voice.
 If the user asks about current events, news, weather, or anything time-sensitive, USE web_search.
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
@@ -531,10 +510,9 @@ Return ONLY the JSON.`;
       { role: "user", content: userText }
     ];
 
-    // FIXED: Groq Compound with web_search, code_interpreter, visit_website tools
     const ai = await Promise.race([
       llmClient.chat.completions.create({
-        model: "groq/compound-mini",
+        model: "groq/compound",
         messages,
         temperature: 1,
         max_completion_tokens: 1024,
@@ -563,7 +541,6 @@ Return ONLY the JSON.`;
       text = parsed.text || text;
       musicQuery = parsed.music || null;
     } catch {
-      // Hindi JSON, gamitin as plain text
       text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
     }
 
@@ -626,7 +603,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V31 FIXED 48kHz MUSIC + GROQ COMPOUND");
+    console.log("ESP connected - V33 SIMPLIFIED STT + 48kHz MUSIC + GROQ COMPOUND");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
