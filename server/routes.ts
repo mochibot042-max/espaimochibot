@@ -40,6 +40,14 @@ const STT_STREAM_SAMPLE_RATE = 16000;
 const STT_MAX_AUDIO_SECONDS = 12;
 
 // ============================================================================
+// WEATHER CONFIG — Open-Meteo (Free, No API Key)
+// ============================================================================
+// Coordinates for Alfonso, Cavite (Kaysuyo area approximation)
+const WEATHER_LAT = 14.1239;
+const WEATHER_LON = 120.8547;
+const WEATHER_LOCATION_NAME = "Alfonso, Cavite";
+
+// ============================================================================
 // DEBOUNCE
 // ============================================================================
 const RECENT_REQUESTS = new Map<number, number>();
@@ -88,14 +96,119 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// EDGE TTS — FILIPINO
+// LANGUAGE DETECTION
 // ============================================================================
-async function generateEdgeTTS(text: string, outputPath: string): Promise<void> {
+function detectLanguage(text: string): "en" | "fil" {
+  const lower = text.toLowerCase();
+  // Filipino keywords
+  const filWords = [
+    "ano", "ang", "bakit", "paano", "sino", "saan", "kailan", "kumusta", "salamat",
+    "opo", "hindi", "oo", "mga", "ng", "sa", "na", "ay", "ko", "mo", "po", "lang",
+    "naman", "talaga", "siguro", "pala", "din", "rin", "dito", "diyan", "doon",
+    "panahon", "ulan", "mainit", "malamig", "bagyo", "araw", "gabi", "umaga",
+    "tumugtog", "kanta", "musika", "tawagin", "pangalan", "tawag", "gusto", "ayaw",
+    "maganda", "masaya", "malungkot", "pagod", "gutom", "uhaw", "mainit", "lamig"
+  ];
+  const words = lower.split(/\s+/);
+  let filCount = 0;
+  for (const word of words) {
+    if (filWords.includes(word)) filCount++;
+  }
+  // If more than 30% of words are Filipino, assume Filipino
+  return filCount / words.length > 0.3 ? "fil" : "en";
+}
+
+// ============================================================================
+// WEATHER API — Open-Meteo (Free, No API Key)
+// ============================================================================
+interface WeatherData {
+  temperature: number;
+  feelsLike: number;
+  humidity: number;
+  windSpeed: number;
+  condition: string;
+  isDay: boolean;
+}
+
+async function fetchWeather(): Promise<WeatherData | null> {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day&timezone=Asia%2FManila`;
+    const response = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const current = data.current;
+    
+    // WMO Weather interpretation codes (https://open-meteo.com/en/docs)
+    const weatherCodes: Record<number, string> = {
+      0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+      45: "fog", 48: "depositing rime fog",
+      51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+      56: "light freezing drizzle", 57: "dense freezing drizzle",
+      61: "slight rain", 63: "moderate rain", 65: "heavy rain",
+      66: "light freezing rain", 67: "heavy freezing rain",
+      71: "slight snow", 73: "moderate snow", 75: "heavy snow",
+      77: "snow grains",
+      80: "slight rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+      85: "slight snow showers", 86: "heavy snow showers",
+      95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail"
+    };
+
+    return {
+      temperature: current.temperature_2m,
+      feelsLike: current.apparent_temperature,
+      humidity: current.relative_humidity_2m,
+      windSpeed: current.wind_speed_10m,
+      condition: weatherCodes[current.weather_code] || "unknown",
+      isDay: current.is_day === 1
+    };
+  } catch (e: any) {
+    console.error("[WEATHER] Fetch error:", e.message);
+    return null;
+  }
+}
+
+function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string {
+  if (lang === "fil") {
+    const timeDesc = weather.isDay ? "ngayon" : "ngayong gabi";
+    const conditionFil: Record<string, string> = {
+      "clear sky": "malinis na langit",
+      "mainly clear": "malinis na langit",
+      "partly cloudy": "bahagyang maulap",
+      "overcast": "maulap",
+      "fog": "mahamog",
+      "light drizzle": "mahinang ambon",
+      "moderate drizzle": "katamtamang ambon",
+      "dense drizzle": "malakas na ambon",
+      "slight rain": "mahinang ulan",
+      "moderate rain": "katamtamang ulan",
+      "heavy rain": "malakas na ulan",
+      "slight rain showers": "mahinang ulan",
+      "moderate rain showers": "katamtamang ulan",
+      "violent rain showers": "malakas na ulan",
+      "thunderstorm": "bagyo",
+      "thunderstorm with slight hail": "bagyo na may yelo",
+      "thunderstorm with heavy hail": "malakas na bagyo na may yelo"
+    };
+    const cond = conditionFil[weather.condition] || weather.condition;
+    return `Ang temperatura ${timeDesc} sa ${WEATHER_LOCATION_NAME} ay ${weather.temperature}°C. ${cond}. Ang humidity ay ${weather.humidity}%. Ang hangin ay ${weather.windSpeed} km/h.`;
+  } else {
+    const timeDesc = weather.isDay ? "right now" : "tonight";
+    return `The temperature ${timeDesc} in ${WEATHER_LOCATION_NAME} is ${weather.temperature}°C with ${weather.condition}. It feels like ${weather.feelsLike}°C. Humidity is ${weather.humidity}% and wind speed is ${weather.windSpeed} km/h.`;
+  }
+}
+
+// ============================================================================
+// EDGE TTS — DYNAMIC LANGUAGE
+// ============================================================================
+async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
     try {
       const tts = new MsEdgeTTS();
+      const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
       await tts.setMetadata(
-        "fil-PH-BlessicaNeural",
+        voice,
         OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
       );
       const { audioStream } = tts.toStream(text);
@@ -105,7 +218,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
         const buf = Buffer.concat(chunks);
         if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] fil-PH-BlessicaNeural success, size:", buf.length);
+        console.log("[TTS]", voice, "success, size:", buf.length);
         resolve();
       });
       audioStream.on("error", reject);
@@ -462,7 +575,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
         file: fs.createReadStream(tmpClean), 
         model: "whisper-large-v3-turbo", 
         language: "en",
-        prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan."
+        prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan, weather, panahon, ulan, mainit, lamig."
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
@@ -488,6 +601,22 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 }
 
 // ============================================================================
+// WEATHER INTENT DETECTION
+// ============================================================================
+function isWeatherQuery(text: string): boolean {
+  const lower = text.toLowerCase();
+  const weatherPatterns = [
+    /weather/i, /forecast/i, /temperature/i, /humidity/i,
+    /panahon/i, /temperatura/i, /ulan/i, /mainit/i, /malamig/i,
+    /bagyo/i, /kumusta\s+ang\s+panahon/i, /ano\s+ang\s+panahon/i,
+    /what's\s+the\s+weather/i, /how's\s+the\s+weather/i,
+    /will\s+it\s+rain/i, /is\s+it\s+going\s+to\s+rain/i,
+    /mag[-]?uulan/i, /magiging\s+mainit/i
+  ];
+  return weatherPatterns.some(p => p.test(lower));
+}
+
+// ============================================================================
 // PROCESS AI RESPONSE
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
@@ -504,6 +633,40 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     } else if (nameAction.action === "delete") {
       await storage.deleteSavedName(userId);
       nameResponse = "Name deleted.";
+    }
+
+    // Detect language for TTS
+    const lang = detectLanguage(userText);
+    console.log("[LANG] Detected:", lang);
+
+    // Check if weather query
+    if (isWeatherQuery(userText)) {
+      const weather = await fetchWeather();
+      if (weather) {
+        const weatherText = formatWeatherResponse(weather, lang);
+        console.log("[WEATHER] Response:", weatherText);
+        
+        const mp3 = path.join(AUDIO_DIR, sessionId + "_weather.mp3");
+        filesToCleanup.push(mp3);
+        
+        await generateEdgeTTS(weatherText, mp3, lang);
+        const pcm = await generatePCM(mp3);
+        await streamPCM(ws, pcm, sessionId);
+        
+        await storage.addMessage(userId, "user", userText);
+        await storage.addMessage(userId, "assistant", weatherText);
+        return;
+      } else {
+        const failText = lang === "fil" 
+          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon ngayon." 
+          : "Sorry, I couldn't fetch the weather information right now.";
+        const mp3 = path.join(AUDIO_DIR, sessionId + "_weather_fail.mp3");
+        filesToCleanup.push(mp3);
+        await generateEdgeTTS(failText, mp3, lang);
+        const pcm = await generatePCM(mp3);
+        await streamPCM(ws, pcm, sessionId);
+        return;
+      }
     }
 
     const history = await storage.getConversationHistory(userId);
@@ -550,7 +713,7 @@ Return ONLY the JSON.`;
         const introId = sessionId + "_intro";
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
 
-        await generateEdgeTTS(text, introMp3);
+        await generateEdgeTTS(text, introMp3, lang);
         filesToCleanup.push(introMp3);
 
         const introPcm = await generatePCM(introMp3);
@@ -562,7 +725,7 @@ Return ONLY the JSON.`;
     } else {
       const mp3 = path.join(AUDIO_DIR, sessionId + ".mp3");
 
-      await generateEdgeTTS(text, mp3);
+      await generateEdgeTTS(text, mp3, lang);
       filesToCleanup.push(mp3);
 
       const pcm = await generatePCM(mp3);
@@ -595,7 +758,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V28 ADAPTIVE VAD [rain-proof]");
+    console.log("ESP connected - V28 ADAPTIVE VAD [rain-proof] + WEATHER + LANG_SWITCH");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
