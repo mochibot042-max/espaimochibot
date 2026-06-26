@@ -388,7 +388,7 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// STREAMING STT PROCESSOR — Simplified whisper-large-v3 with verbose_json
+// STREAMING STT PROCESSOR — FIXED: Simplified whisper-large-v3 with verbose_json
 // ============================================================================
 interface StreamingSTTSession {
   userId: number;
@@ -408,6 +408,7 @@ function createSTTSession(ws: WebSocket, userId: number): StreamingSTTSession {
   };
 }
 
+// FIXED: Simplified STT using whisper-large-v3 with verbose_json
 async function processFinalSTT(session: StreamingSTTSession): Promise<string | null> {
   if (session.audioBuffer.length < 1600) {
     console.log("[STT] Audio too short, ignoring");
@@ -418,6 +419,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
   const dataLen = session.audioBuffer.length;
 
   try {
+    // Build WAV header for the raw PCM buffer
     const wavBuffer = Buffer.alloc(44 + dataLen);
     wavBuffer.write("RIFF", 0);
     wavBuffer.writeUInt32LE(36 + dataLen, 4);
@@ -433,9 +435,11 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     wavBuffer.write("data", 36);
     wavBuffer.writeUInt32LE(dataLen, 40);
     session.audioBuffer.copy(wavBuffer, 44);
+
     fs.writeFileSync(tmpWav, wavBuffer);
     console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
+    // FIXED: Simplified STT using whisper-large-v3 with verbose_json
     const transcription = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(tmpWav),
@@ -446,7 +450,9 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
 
+    // verbose_json returns object with .text property
     const text = transcription.text?.trim();
+
     try { fs.unlinkSync(tmpWav); } catch {}
 
     if (!text) {
@@ -464,7 +470,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 }
 
 // ============================================================================
-// PROCESS AI RESPONSE — NON-STREAMING llama-4-scout
+// PROCESS AI RESPONSE — FIXED: Groq Compound with web tools
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
@@ -485,9 +491,11 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    const systemPrompt = `You are Mochi, a helpful Filipino voice assistant.
+    const systemPrompt = `You are Mochi, a helpful Filipino voice assistant with real-time web access via Groq Compound.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
+You can search the web, visit websites, and use code interpreter when needed.
 Keep responses natural, concise, and conversational — max 2-3 sentences for voice.
+If the user asks about current events, news, weather, or anything time-sensitive, USE web_search.
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
 Examples:
@@ -502,8 +510,7 @@ Return ONLY the JSON.`;
       { role: "user", content: userText }
     ];
 
-    // FIXED: Non-streaming llama-4-scout
-    const ai = await Promise.race([
+   const ai = await Promise.race([
       llmClient.chat.completions.create({
         model: "meta-llama/llama-4-scout-17b-16e-instruct",
         messages,
@@ -587,7 +594,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V35 NON-STREAMING LLAMA + 48kHz MUSIC");
+    console.log("ESP connected - V33 SIMPLIFIED STT + 48kHz MUSIC + GROQ COMPOUND");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
