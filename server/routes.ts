@@ -534,7 +534,7 @@ Return ONLY the JSON.`;
     // FIXED: Groq Compound with web_search, code_interpreter, visit_website tools
     const ai = await Promise.race([
       llmClient.chat.completions.create({
-        model: "groq/compound",
+        model: "groq/compound-mini",
         messages,
         temperature: 1,
         max_completion_tokens: 1024,
