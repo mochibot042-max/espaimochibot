@@ -26,7 +26,7 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const AI_SAMPLE_RATE = 16000;
 const AI_CHUNK_SIZE_MONO = 1024;
 const SEND_INTERVAL_MS_AI = 28;
-const PREBUFFER_CHUNKS_AI = 24;
+const PREBUFFER_CHUNKS_AI = 12;  // Reduced for faster start
 
 // FIXED: Music now uses 48000Hz to match ESP32 DAC
 const MUSIC_SAMPLE_RATE = 48000;
@@ -39,6 +39,14 @@ const PREBUFFER_CHUNKS_MUSIC = 32;
 // ============================================================================
 const STT_STREAM_SAMPLE_RATE = 16000;
 const STT_MAX_AUDIO_SECONDS = 12;
+
+// ============================================================================
+// STREAMING TTS CONFIG
+// ============================================================================
+const SENTENCE_END_CHARS = /[.!?。！？\n]+/;
+const MIN_TTS_CHARS = 15;      // Minimum chars before sending to TTS
+const MAX_TTS_CHARS = 120;     // Maximum chars per TTS chunk
+const TTS_BUFFER_MS = 800;     // Buffer time before starting playback
 
 // ============================================================================
 // DEBOUNCE
@@ -89,7 +97,7 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// EDGE TTS — FILIPINO
+// EDGE TTS — FILIPINO (single sentence)
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string): Promise<void> {
   return new Promise(async (resolve, reject) => {
@@ -106,7 +114,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
         const buf = Buffer.concat(chunks);
         if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] fil-PH-BlessicaNeural success, size:", buf.length);
+        console.log("[TTS] fil-PH-BlessicaNeural success, size:", buf.length, "text:", text.substring(0, 40));
         resolve();
       });
       audioStream.on("error", reject);
@@ -174,40 +182,20 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO)
+// STREAM PCM TO ESP32
 // ============================================================================
-async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
+async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string, isFirstChunk: boolean = false) {
   if (ws.readyState !== ws.OPEN) return;
 
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
   const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
-  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms", "prebuffer:", PREBUFFER_CHUNKS_AI);
 
-  ws.send("SESSION:" + sessionId);
-  await delay(100);
-  ws.send("PREPARE_RESPONSE:" + totalChunks);
-  await delay(300);
+  if (totalChunks === 0) return;
 
   let seq = 0;
-  const prebufferLimit = Math.min(PREBUFFER_CHUNKS_AI, totalChunks);
-
-  for (let i = 0; i < prebufferLimit * AI_CHUNK_SIZE_MONO; i += AI_CHUNK_SIZE_MONO) {
-    if (ws.readyState !== ws.OPEN) return;
-    const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE_MONO);
-    const packet = Buffer.allocUnsafe(2 + chunk.length);
-    packet.writeUInt16BE(seq & 0xFFFF, 0);
-    packet.set(chunk, 2);
-    ws.send(packet, { binary: true });
-    seq++;
-    await delay(SEND_INTERVAL_MS_AI);
-  }
-
-  ws.send("START_RESPONSE");
-  await delay(100);
-  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", prebufferLimit * 32, "ms), started playback");
 
   try {
-    for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
+    for (let i = 0; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
       if (ws.readyState !== ws.OPEN) return;
       const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE_MONO);
       const packet = Buffer.allocUnsafe(2 + chunk.length);
@@ -217,46 +205,27 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
       seq++;
       await delay(SEND_INTERVAL_MS_AI);
     }
-
-    await delay(500);
-    for (let retry = 0; retry < 3; retry++) {
-      if (ws.readyState === ws.OPEN) { 
-        ws.send("FINISH_RESPONSE:" + sessionId); 
-        await delay(200); 
-      }
-    }
-    console.log("[STREAM] AI done:", seq, "chunks");
   } catch (e: any) {
     console.error("[STREAM] Error:", e.message);
-    try { ws.send("FINISH_RESPONSE:ERROR"); } catch {}
   }
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — FIXED: 48000Hz to match ESP32
+// REAL-TIME MUSIC STREAMING
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
+  console.log("[MUSIC] Starting stream:", sessionId);
 
   return new Promise<void>((resolve, reject) => {
     const ffmpegArgs = [
-      "-re",
-      "-i", musicUrl,
-      "-vn",
-      "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
-      "-acodec", "pcm_s16le",
-      "-ac", "1",
-      "-ar", "48000",
-      "-f", "s16le",
-      "pipe:1"
+      "-re", "-i", musicUrl, "-vn",
+      "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11",
+      "-acodec", "pcm_s16le", "-ac", "1", "-ar", "48000", "-f", "s16le", "pipe:1"
     ];
 
-    const ffmpegProc = spawn("ffmpeg", ffmpegArgs, {
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-
+    const ffmpegProc = spawn("ffmpeg", ffmpegArgs, { stdio: ["ignore", "pipe", "pipe"] });
     let buffer = Buffer.alloc(0);
     let seq = 0;
     let started = false;
@@ -266,40 +235,19 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
     ffmpegProc.stderr.on("data", (data) => {
       const line = data.toString().trim();
-      if (line.includes("Error") || line.includes("error")) {
-        console.log("[FFMPEG]", line.substring(0, 100));
-      }
+      if (line.includes("Error") || line.includes("error")) console.log("[FFMPEG]", line.substring(0, 100));
     });
 
     ffmpegProc.on("error", (err) => {
-      console.error("[MUSIC] FFmpeg spawn error:", err.message);
-      if (!finished) {
-        finished = true;
-        try { ws.send("ERROR:MUSIC_FAILED"); ws.send("FINISH_MUSIC:ERROR"); } catch {}
-        reject(err);
-      }
+      console.error("[MUSIC] FFmpeg error:", err.message);
+      if (!finished) { finished = true; try { ws.send("ERROR:MUSIC_FAILED"); } catch {}; reject(err); }
     });
 
     ffmpegProc.on("close", (code) => {
       console.log("[MUSIC] FFmpeg exited:", code);
       if (!finished) {
         finished = true;
-        if (buffer.length >= MUSIC_CHUNK_SIZE_MONO && ws.readyState === ws.OPEN) {
-          const alignedLen = Math.floor(buffer.length / MUSIC_CHUNK_SIZE_MONO) * MUSIC_CHUNK_SIZE_MONO;
-          for (let i = 0; i < alignedLen; i += MUSIC_CHUNK_SIZE_MONO) {
-            const chunk = buffer.subarray(i, i + MUSIC_CHUNK_SIZE_MONO);
-            const packet = Buffer.allocUnsafe(2 + chunk.length);
-            packet.writeUInt16BE(seq & 0xFFFF, 0);
-            packet.set(chunk, 2);
-            try { ws.send(packet, { binary: true }); seq++; } catch {}
-          }
-        }
-        for (let retry = 0; retry < 3; retry++) {
-          if (ws.readyState === ws.OPEN) {
-            try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
-          }
-        }
-        console.log("[MUSIC] Stream done:", chunkCount, "chunks");
+        try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
         resolve();
       }
     });
@@ -309,73 +257,44 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
       if (!started) {
         while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && prebufferChunks.length < PREBUFFER_CHUNKS_MUSIC) {
-          const chunk = buffer.subarray(0, MUSIC_CHUNK_SIZE_MONO);
+          prebufferChunks.push(Buffer.from(buffer.subarray(0, MUSIC_CHUNK_SIZE_MONO)));
           buffer = buffer.subarray(MUSIC_CHUNK_SIZE_MONO);
-          prebufferChunks.push(Buffer.from(chunk));
         }
-
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 21), "ms), starting stream...");
-
           ws.send("SESSION:" + sessionId);
           await delay(100);
           ws.send("PREPARE_MUSIC:0");
           await delay(300);
-
           for (const chunk of prebufferChunks) {
-            if (ws.readyState !== ws.OPEN) {
-              finished = true;
-              ffmpegProc.kill("SIGKILL");
-              return;
-            }
+            if (ws.readyState !== ws.OPEN) { finished = true; ffmpegProc.kill("SIGKILL"); return; }
             const packet = Buffer.allocUnsafe(2 + chunk.length);
             packet.writeUInt16BE(seq & 0xFFFF, 0);
             packet.set(chunk, 2);
             ws.send(packet, { binary: true });
-            seq++;
-            chunkCount++;
+            seq++; chunkCount++;
             await delay(SEND_INTERVAL_MS_MUSIC);
           }
-
           ws.send("START_MUSIC");
-          await delay(100);
-          console.log("[MUSIC] Playback started after prebuffer");
         }
         return;
       }
 
       while (buffer.length >= MUSIC_CHUNK_SIZE_MONO && !finished) {
-        if (ws.readyState !== ws.OPEN) {
-          console.log("[MUSIC] WS closed, killing FFmpeg");
-          finished = true;
-          ffmpegProc.kill("SIGKILL");
-          return;
-        }
-
+        if (ws.readyState !== ws.OPEN) { finished = true; ffmpegProc.kill("SIGKILL"); return; }
         const chunk = buffer.subarray(0, MUSIC_CHUNK_SIZE_MONO);
         buffer = buffer.subarray(MUSIC_CHUNK_SIZE_MONO);
-
         const packet = Buffer.allocUnsafe(2 + chunk.length);
         packet.writeUInt16BE(seq & 0xFFFF, 0);
         packet.set(chunk, 2);
-
         ws.send(packet, { binary: true });
-        seq++;
-        chunkCount++;
-
+        seq++; chunkCount++;
         await delay(SEND_INTERVAL_MS_MUSIC);
       }
     });
 
     setTimeout(() => {
-      if (!finished) {
-        console.log("[MUSIC] Timeout, stopping stream");
-        finished = true;
-        ffmpegProc.kill("SIGKILL");
-        try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
-        resolve();
-      }
+      if (!finished) { finished = true; ffmpegProc.kill("SIGKILL"); try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}; resolve(); }
     }, 600000);
   });
 }
@@ -388,7 +307,7 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// STREAMING STT PROCESSOR — FIXED: Simplified whisper-large-v3 with verbose_json
+// STREAMING STT PROCESSOR
 // ============================================================================
 interface StreamingSTTSession {
   userId: number;
@@ -400,18 +319,16 @@ interface StreamingSTTSession {
 
 function createSTTSession(ws: WebSocket, userId: number): StreamingSTTSession {
   return {
-    userId,
-    ws,
+    userId, ws,
     audioBuffer: Buffer.alloc(0),
     isRecording: false,
     sessionId: Date.now() + "_" + Math.random().toString(36).slice(2, 8),
   };
 }
 
-// FIXED: Simplified STT using whisper-large-v3 with verbose_json
 async function processFinalSTT(session: StreamingSTTSession): Promise<string | null> {
   if (session.audioBuffer.length < 1600) {
-    console.log("[STT] Audio too short, ignoring");
+    console.log("[STT] Audio too short");
     return null;
   }
 
@@ -419,7 +336,6 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
   const dataLen = session.audioBuffer.length;
 
   try {
-    // Build WAV header for the raw PCM buffer
     const wavBuffer = Buffer.alloc(44 + dataLen);
     wavBuffer.write("RIFF", 0);
     wavBuffer.writeUInt32LE(36 + dataLen, 4);
@@ -435,11 +351,8 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     wavBuffer.write("data", 36);
     wavBuffer.writeUInt32LE(dataLen, 40);
     session.audioBuffer.copy(wavBuffer, 44);
-
     fs.writeFileSync(tmpWav, wavBuffer);
-    console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
-    // FIXED: Simplified STT using whisper-large-v3 with verbose_json
     const transcription = await Promise.race([
       sttClient.audio.transcriptions.create({
         file: fs.createReadStream(tmpWav),
@@ -450,16 +363,10 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
 
-    // verbose_json returns object with .text property
     const text = transcription.text?.trim();
-
     try { fs.unlinkSync(tmpWav); } catch {}
 
-    if (!text) {
-      console.log("[STT] No speech detected");
-      return null;
-    }
-
+    if (!text) { console.log("[STT] No speech"); return null; }
     console.log("[STT] RESULT:", text);
     return text;
   } catch (e: any) {
@@ -470,7 +377,162 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 }
 
 // ============================================================================
-// PROCESS AI RESPONSE — FIXED: Groq Compound with web tools
+// STREAMING TTS QUEUE — Process text chunks as they arrive from LLM
+// ============================================================================
+interface TTSQueueItem {
+  text: string;
+  isLast: boolean;
+}
+
+class StreamingTTSProcessor {
+  private ws: WebSocket;
+  private sessionId: string;
+  private textBuffer: string = "";
+  private queue: TTSQueueItem[] = [];
+  private isProcessing: boolean = false;
+  private hasStarted: boolean = false;
+  private totalChunksSent: number = 0;
+  private audioChunks: Buffer[] = [];
+  private finishSent: boolean = false;
+
+  constructor(ws: WebSocket, sessionId: string) {
+    this.ws = ws;
+    this.sessionId = sessionId;
+  }
+
+  // Add text from LLM stream
+  addText(text: string, isLast: boolean = false) {
+    this.textBuffer += text;
+
+    // Try to extract complete sentences
+    while (this.textBuffer.length >= MIN_TTS_CHARS) {
+      // Find sentence boundary
+      let splitIndex = -1;
+
+      // Look for sentence end within MAX_TTS_CHARS
+      const searchLimit = Math.min(this.textBuffer.length, MAX_TTS_CHARS);
+      for (let i = MIN_TTS_CHARS; i < searchLimit; i++) {
+        if (SENTENCE_END_CHARS.test(this.textBuffer[i])) {
+          splitIndex = i + 1;
+          break;
+        }
+      }
+
+      // If no sentence end found but buffer is getting long, force split at last space
+      if (splitIndex === -1 && this.textBuffer.length >= MAX_TTS_CHARS) {
+        const lastSpace = this.textBuffer.lastIndexOf(" ", MAX_TTS_CHARS);
+        if (lastSpace > MIN_TTS_CHARS) {
+          splitIndex = lastSpace + 1;
+        } else {
+          splitIndex = MAX_TTS_CHARS;
+        }
+      }
+
+      // If last chunk and no more text coming, send whatever we have
+      if (isLast && splitIndex === -1 && this.textBuffer.length > 0) {
+        splitIndex = this.textBuffer.length;
+      }
+
+      if (splitIndex > 0) {
+        const sentence = this.textBuffer.substring(0, splitIndex).trim();
+        this.textBuffer = this.textBuffer.substring(splitIndex).trim();
+        if (sentence.length > 0) {
+          this.queue.push({ text: sentence, isLast: false });
+        }
+      } else {
+        break;
+      }
+    }
+
+    // If last chunk and still have buffer, send it
+    if (isLast && this.textBuffer.length > 0) {
+      this.queue.push({ text: this.textBuffer.trim(), isLast: true });
+      this.textBuffer = "";
+    }
+
+    // Start processing if not already
+    if (!this.isProcessing) {
+      this.processQueue();
+    }
+  }
+
+  private async processQueue() {
+    if (this.isProcessing || this.queue.length === 0) return;
+    this.isProcessing = true;
+
+    while (this.queue.length > 0) {
+      const item = this.queue.shift()!;
+
+      if (this.ws.readyState !== this.ws.OPEN) {
+        this.isProcessing = false;
+        return;
+      }
+
+      try {
+        // Skip if it's a JSON/music command
+        if (item.text.includes('"music"') || item.text.includes('"text"')) {
+          continue;
+        }
+
+        console.log("[STREAM_TTS] Processing:", item.text.substring(0, 50));
+
+        // Generate TTS for this sentence
+        const ttsPath = path.join(AUDIO_DIR, `stream_${this.sessionId}_${Date.now()}.mp3`);
+        await generateEdgeTTS(item.text, ttsPath);
+
+        // Convert to PCM
+        const pcm = await generatePCM(ttsPath);
+
+        // Clean up
+        try { fs.unlinkSync(ttsPath); } catch {}
+
+        // Send START_RESPONSE on first chunk
+        if (!this.hasStarted) {
+          this.ws.send("START_RESPONSE");
+          this.hasStarted = true;
+          console.log("[STREAM] Started playback");
+          await delay(100);
+        }
+
+        // Stream PCM to ESP32
+        await streamPCM(this.ws, pcm, this.sessionId);
+        this.totalChunksSent += Math.floor(pcm.length / AI_CHUNK_SIZE_MONO);
+
+      } catch (e: any) {
+        console.error("[STREAM_TTS] Error:", e.message);
+      }
+    }
+
+    // Send finish if last item was processed
+    if (this.textBuffer.length === 0 && !this.finishSent) {
+      this.finishSent = true;
+      await delay(300);
+      for (let retry = 0; retry < 3; retry++) {
+        if (this.ws.readyState === this.ws.OPEN) {
+          this.ws.send("FINISH_RESPONSE:" + this.sessionId);
+          await delay(200);
+        }
+      }
+      console.log("[STREAM] Finished, total chunks:", this.totalChunksSent);
+    }
+
+    this.isProcessing = false;
+  }
+
+  async waitForComplete(): Promise<void> {
+    while (this.isProcessing || this.queue.length > 0 || this.textBuffer.length > 0) {
+      await delay(100);
+    }
+    // Ensure finish is sent
+    if (!this.finishSent && this.ws.readyState === this.ws.OPEN) {
+      this.finishSent = true;
+      this.ws.send("FINISH_RESPONSE:" + this.sessionId);
+    }
+  }
+}
+
+// ============================================================================
+// PROCESS AI RESPONSE — STREAMING LLM + STREAMING TTS
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
@@ -491,11 +553,9 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    const systemPrompt = `You are Mochi, a helpful Filipino voice assistant with real-time web access via Groq Compound.
+    const systemPrompt = `You are Mochi, a helpful Filipino voice assistant.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
-You can search the web, visit websites, and use code interpreter when needed.
 Keep responses natural, concise, and conversational — max 2-3 sentences for voice.
-If the user asks about current events, news, weather, or anything time-sensitive, USE web_search.
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
 Examples:
@@ -510,72 +570,110 @@ Return ONLY the JSON.`;
       { role: "user", content: userText }
     ];
 
-    const ai = await Promise.race([
-      llmClient.chat.completions.create({
-        model: "groq/compound",
-        messages,
-        temperature: 1,
-        max_completion_tokens: 1024,
-        top_p: 1,
-        stream: false,
-        stop: null,
-        compound_custom: {
-          tools: {
-            enabled_tools: [
-              "web_search",
-              "code_interpreter",
-              "visit_website"
-            ]
+    // FIXED: Streaming LLM with llama-4-scout
+    const stream = await llmClient.chat.completions.create({
+      model: "meta-llama/llama-4-scout-17b-16e-instruct",
+      messages,
+      temperature: 1,
+      max_completion_tokens: 1024,
+      top_p: 1,
+      stream: true,
+      stop: null
+    });
+
+    let fullResponse = "";
+    let isMusicRequest = false;
+    let musicQuery: string | null = null;
+    let jsonBuffer = "";
+    let inJson = false;
+
+    // Create streaming TTS processor
+    const ttsProcessor = new StreamingTTSProcessor(ws, sessionId);
+
+    console.log("[LLM] Streaming started...");
+
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || "";
+      if (!content) continue;
+
+      fullResponse += content;
+
+      // Check if this is a JSON response (music command)
+      if (fullResponse.trim().startsWith("{") && !inJson) {
+        inJson = true;
+        jsonBuffer = fullResponse;
+      }
+
+      if (inJson) {
+        jsonBuffer += content;
+        // Try to parse complete JSON
+        if (jsonBuffer.includes("}")) {
+          try {
+            const parsed = JSON.parse(jsonBuffer);
+            if (parsed.music) {
+              isMusicRequest = true;
+              musicQuery = parsed.music;
+              fullResponse = parsed.text || fullResponse;
+            }
+            break; // Stop streaming, we got the JSON
+          } catch {
+            // JSON not complete yet, continue
           }
         }
-      }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 15000))
-    ]);
+        continue;
+      }
 
-    const raw = ai.choices[0].message.content || "{}";
-    let text = "Sorry, I didn't understand.";
-    let musicQuery: string | null = null;
-
-    try {
-      const parsed = JSON.parse(raw);
-      text = parsed.text || text;
-      musicQuery = parsed.music || null;
-    } catch {
-      text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
+      // Stream text to TTS processor
+      ttsProcessor.addText(content, false);
     }
 
-    if (nameResponse) { text = nameResponse; musicQuery = null; }
-    console.log("AI:", text, musicQuery ? `(Music: ${musicQuery})` : "");
+    // Signal end of stream
+    if (!inJson) {
+      ttsProcessor.addText("", true);
+      await ttsProcessor.waitForComplete();
+    }
+
+    // Handle name response override
+    if (nameResponse) {
+      fullResponse = nameResponse;
+      isMusicRequest = false;
+      musicQuery = null;
+    }
+
+    console.log("[LLM] Full response:", fullResponse.substring(0, 100));
+    console.log("[LLM] Music:", musicQuery || "none");
 
     await storage.addMessage(userId, "user", userText);
-    await storage.addMessage(userId, "assistant", text);
+    await storage.addMessage(userId, "assistant", fullResponse);
 
-    if (musicQuery) {
+    // Handle music request
+    if (isMusicRequest && musicQuery) {
       const musicUrl = await fetchMusicUrl(musicQuery);
-      if (!musicUrl) { ws.send("ERROR:MUSIC_NOT_FOUND"); return; }
+      if (!musicUrl) { 
+        ws.send("ERROR:MUSIC_NOT_FOUND"); 
+        ws.send("STATE:IDLE");
+        return; 
+      }
 
-      if (text && !nameResponse) {
+      // Play intro text if any
+      if (fullResponse && !nameResponse) {
         const introId = sessionId + "_intro";
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
-
-        await generateEdgeTTS(text, introMp3);
+        await generateEdgeTTS(fullResponse, introMp3);
         filesToCleanup.push(introMp3);
-
         const introPcm = await generatePCM(introMp3);
+
+        ws.send("START_RESPONSE");
+        await delay(100);
         await streamPCM(ws, introPcm, introId);
+        await delay(500);
+        ws.send("FINISH_RESPONSE:" + introId);
         await delay(1000);
       }
 
       await streamMusicRealtime(ws, musicUrl, sessionId + "_music");
-    } else {
-      const mp3 = path.join(AUDIO_DIR, sessionId + ".mp3");
-
-      await generateEdgeTTS(text, mp3);
-      filesToCleanup.push(mp3);
-
-      const pcm = await generatePCM(mp3);
-      await streamPCM(ws, pcm, sessionId);
     }
+
   } catch (e: any) {
     console.error("[PROCESS] Error:", e.message);
     ws.send("ERROR:" + (e.message || "UNKNOWN"));
@@ -603,7 +701,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V33 SIMPLIFIED STT + 48kHz MUSIC + GROQ COMPOUND");
+    console.log("ESP connected - V34 STREAMING LLM + STREAMING TTS");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
@@ -664,17 +762,13 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       const chunkLen = Buffer.from(data).length;
       console.log("[WS] BINARY #" + currentMsgNum + ":", chunkLen, "bytes");
 
-      if (!sttSession || !sttSession.isRecording) {
-        return;
-      }
+      if (!sttSession || !sttSession.isRecording) return;
 
       const chunk = Buffer.from(data);
-
       const maxBytes = STT_STREAM_SAMPLE_RATE * 2 * STT_MAX_AUDIO_SECONDS;
       if (sttSession.audioBuffer.length + chunk.length > maxBytes) {
         console.log("[STT] Buffer full, forcing finalize");
         sttSession.isRecording = false;
-
         const text = await processFinalSTT(sttSession);
         if (text) {
           ws.send("STT_RESULT:" + text);
@@ -692,9 +786,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
     ws.on("close", () => { 
       console.log("ESP disconnected"); 
-      if (sttSession) {
-        sttSession = null;
-      }
+      if (sttSession) sttSession = null;
       currentUserId = null; 
     });
 
