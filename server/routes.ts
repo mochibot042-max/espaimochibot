@@ -10,16 +10,17 @@ import { spawn } from "child_process";
 import { storage, pushSchema, verifySchema } from "./storage.js";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
-const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || "3e073c28c8f85d28ad03553225674c12";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
 
 const AUDIO_DIR = path.join(process.cwd(), "audio");
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+const CACHE_DIR = path.join(process.cwd(), "cache", "weather");
 
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
 // AUDIO CONFIG — AI RESPONSE (16kHz MONO)
@@ -41,11 +42,39 @@ const STT_STREAM_SAMPLE_RATE = 16000;
 const STT_MAX_AUDIO_SECONDS = 12;
 
 // ============================================================================
-// WEATHER CONFIG — OpenWeatherMap (Requires API Key)
+// WEATHER CONFIG — wttr.in (Free, No API Key)
 // ============================================================================
-const WEATHER_CITY = "Alfonso,PH";
-const WEATHER_LAT = 14.1239;
-const WEATHER_LON = 120.8547;
+const WEATHER_LOCATION = "Alfonso,Cavite,Philippines";
+
+// ============================================================================
+// CACHE CONFIG
+// ============================================================================
+const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+
+function getCachePath(key: string): string {
+  const safeKey = key.replace(/[^a-zA-Z0-9]/g, "_");
+  return path.join(CACHE_DIR, `weather_${safeKey}.json`);
+}
+
+function getCache(key: string): any | null {
+  const cachePath = getCachePath(key);
+  if (!fs.existsSync(cachePath)) return null;
+  const data = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+  const age = Date.now() - data.timestamp;
+  if (age > CACHE_DURATION) {
+    try { fs.unlinkSync(cachePath); } catch {}
+    return null;
+  }
+  return data.value;
+}
+
+function setCache(key: string, value: any): void {
+  const cachePath = getCachePath(key);
+  fs.writeFileSync(cachePath, JSON.stringify({
+    timestamp: Date.now(),
+    value: value
+  }));
+}
 
 // ============================================================================
 // DEBOUNCE
@@ -117,7 +146,7 @@ function detectLanguage(text: string): "en" | "fil" {
 }
 
 // ============================================================================
-// OPENWEATHERMAP API (Requires API Key)
+// WEATHER API — wttr.in (Free, No API Key)
 // ============================================================================
 interface WeatherData {
   temperature: number;
@@ -128,32 +157,59 @@ interface WeatherData {
   description: string;
   city: string;
   country: string;
+  uvIndex: number;
+  visibility: number;
+  pressure: number;
+  maxTemp: number;
+  minTemp: number;
   isDay: boolean;
 }
 
 async function fetchWeather(): Promise<WeatherData | null> {
   try {
-    const url = `https://api.openweathermap.org/data/2.5/weather?lat=${WEATHER_LAT}&lon=${WEATHER_LON}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+    const cacheKey = "alfonso_weather";
+    const cached = getCache(cacheKey);
+    if (cached) {
+      console.log("[WEATHER] Using cached data");
+      return cached;
+    }
+
+    const url = `https://wttr.in/${encodeURIComponent(WEATHER_LOCATION)}?format=j1`;
     const response = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
+      signal: AbortSignal.timeout(15000)
     });
+    
     if (!response.ok) {
-      console.error("[WEATHER] API error:", response.status, await response.text());
+      console.error("[WEATHER] API error:", response.status);
       return null;
     }
-    const data = await response.json();
     
-    return {
-      temperature: Math.round(data.main.temp),
-      feelsLike: Math.round(data.main.feels_like),
-      humidity: data.main.humidity,
-      windSpeed: Math.round(data.wind.speed * 3.6), // m/s to km/h
-      condition: data.weather[0]?.main || "Unknown",
-      description: data.weather[0]?.description || "unknown",
-      city: data.name || "Alfonso",
-      country: data.sys?.country || "PH",
-      isDay: data.weather[0]?.icon?.includes("d") || true
+    const data = await response.json();
+    const current = data.current_condition[0];
+    const area = data.nearest_area[0];
+    const today = data.weather[0];
+
+    const weatherData: WeatherData = {
+      temperature: parseInt(current.temp_C),
+      feelsLike: parseInt(current.FeelsLikeC),
+      humidity: parseInt(current.humidity),
+      windSpeed: parseInt(current.windspeedKmph),
+      condition: current.weatherDesc[0].value,
+      description: current.weatherDesc[0].value,
+      city: area.areaName[0].value,
+      country: area.country[0].value,
+      uvIndex: parseInt(current.uvIndex),
+      visibility: parseInt(current.visibility),
+      pressure: parseInt(current.pressure),
+      maxTemp: parseInt(today.maxtempC),
+      minTemp: parseInt(today.mintempC),
+      isDay: current.isdaytime === "yes"
     };
+
+    setCache(cacheKey, weatherData);
+    console.log("[WEATHER] Fetched fresh data:", weatherData.temperature + "°C", weatherData.condition);
+    return weatherData;
   } catch (e: any) {
     console.error("[WEATHER] Fetch error:", e.message);
     return null;
@@ -164,22 +220,29 @@ function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string
   if (lang === "fil") {
     const conditionFil: Record<string, string> = {
       "Clear": "Malinis na langit",
-      "Clouds": "Maulap",
-      "Rain": "Umuulan",
-      "Drizzle": "Mahinang ulan",
-      "Thunderstorm": "May bagyo",
-      "Snow": "Nagsisnow",
+      "Sunny": "Maaraw",
+      "Partly cloudy": "Bahagyang maulap",
+      "Cloudy": "Maulap",
+      "Overcast": "Makapal na maulap",
       "Mist": "Mahamog",
       "Fog": "Makapal na hamog",
+      "Rain": "Umuulan",
+      "Light rain": "Mahinang ulan",
+      "Moderate rain": "Katamtamang ulan",
+      "Heavy rain": "Malakas na ulan",
+      "Drizzle": "Ambon",
+      "Thunderstorm": "May bagyo",
+      "Snow": "Nagsisnow",
       "Haze": "Mabahong hangin",
-      "Dust": "Alikabok",
-      "Sand": "Buhangin"
+      "Patchy rain possible": "Posibleng umulan",
+      "Patchy light rain": "Bahagyang mahinang ulan"
     };
     const cond = conditionFil[weather.condition] || weather.condition;
     const timeDesc = weather.isDay ? "ngayon" : "ngayong gabi";
-    return `Ang temperatura ${timeDesc} sa ${weather.city}, ${weather.country} ay ${weather.temperature}°C. ${cond}. Ang humidity ay ${weather.humidity}% at ang bilis ng hangin ay ${weather.windSpeed} km/h.`;
+    return `Ang temperatura ${timeDesc} sa ${weather.city}, ${weather.country} ay ${weather.temperature}°C. Pakiramdam ay ${weather.feelsLike}°C. ${cond}. Ang humidity ay ${weather.humidity}%, ang bilis ng hangin ay ${weather.windSpeed} km/h, at ang pressure ay ${weather.pressure} hPa. Ang UV index ay ${weather.uvIndex} at ang visibility ay ${weather.visibility} km. Ang maximum temperatura ngayong araw ay ${weather.maxTemp}°C at ang minimum ay ${weather.minTemp}°C.`;
   } else {
-    return `The temperature right now in ${weather.city}, ${weather.country} is ${weather.temperature}°C with ${weather.description}. It feels like ${weather.feelsLike}°C. Humidity is ${weather.humidity}% and wind speed is ${weather.windSpeed} km/h.`;
+    const timeDesc = weather.isDay ? "right now" : "tonight";
+    return `The temperature ${timeDesc} in ${weather.city}, ${weather.country} is ${weather.temperature}°C. It feels like ${weather.feelsLike}°C with ${weather.condition}. Humidity is ${weather.humidity}%, wind speed is ${weather.windSpeed} km/h, and pressure is ${weather.pressure} hPa. The UV index is ${weather.uvIndex} and visibility is ${weather.visibility} km. Today's high is ${weather.maxTemp}°C and low is ${weather.minTemp}°C.`;
   }
 }
 
@@ -596,7 +659,7 @@ interface AIAction {
 }
 
 async function getAIDecision(userText: string, history: any[], savedName: string | null): Promise<AIAction> {
-  const systemPrompt = `You are Mochi, a helpful voice assistant. The user is in Alfonso, Cavite, Philippines (coordinates: 14.1239, 120.8547).
+  const systemPrompt = `You are Mochi, a helpful voice assistant. The user is in Alfonso, Cavite, Philippines.
 
 CRITICAL RULES:
 1. You MUST respond in valid JSON ONLY. No extra text, no markdown.
@@ -722,8 +785,8 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
         return;
       } else {
         const failText = action.lang === "fil" 
-          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon ngayon. Siguraduhin mo na may OpenWeatherMap API key." 
-          : "Sorry, I couldn't fetch the weather right now. Please make sure your OpenWeatherMap API key is set.";
+          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon ngayon. Subukan mo ulit mamaya." 
+          : "Sorry, I couldn't fetch the weather right now. Please try again later.";
         const mp3 = path.join(AUDIO_DIR, sessionId + "_weather_fail.mp3");
         filesToCleanup.push(mp3);
         await generateEdgeTTS(failText, mp3, action.lang);
@@ -801,7 +864,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - AI-DRIVEN WEATHER + LANG_SWITCH");
+    console.log("ESP connected - wttr.in WEATHER + AI-DRIVEN + LANG_SWITCH");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
