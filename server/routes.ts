@@ -10,6 +10,7 @@ import { spawn } from "child_process";
 import { storage, pushSchema, verifySchema } from "./storage.js";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || "0925ec58684006d349a4c0556d20e802";
 
 const sttClient = new Groq({ apiKey: GROQ_API_KEY });
 const llmClient = new Groq({ apiKey: GROQ_API_KEY });
@@ -40,12 +41,11 @@ const STT_STREAM_SAMPLE_RATE = 16000;
 const STT_MAX_AUDIO_SECONDS = 12;
 
 // ============================================================================
-// WEATHER CONFIG — Open-Meteo (Free, No API Key)
+// WEATHER CONFIG — OpenWeatherMap (Requires API Key)
 // ============================================================================
-// Coordinates for Alfonso, Cavite (Kaysuyo area approximation)
+const WEATHER_CITY = "Alfonso,PH";
 const WEATHER_LAT = 14.1239;
 const WEATHER_LON = 120.8547;
-const WEATHER_LOCATION_NAME = "Alfonso, Cavite";
 
 // ============================================================================
 // DEBOUNCE
@@ -100,26 +100,24 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 // ============================================================================
 function detectLanguage(text: string): "en" | "fil" {
   const lower = text.toLowerCase();
-  // Filipino keywords
   const filWords = [
     "ano", "ang", "bakit", "paano", "sino", "saan", "kailan", "kumusta", "salamat",
     "opo", "hindi", "oo", "mga", "ng", "sa", "na", "ay", "ko", "mo", "po", "lang",
     "naman", "talaga", "siguro", "pala", "din", "rin", "dito", "diyan", "doon",
     "panahon", "ulan", "mainit", "malamig", "bagyo", "araw", "gabi", "umaga",
     "tumugtog", "kanta", "musika", "tawagin", "pangalan", "tawag", "gusto", "ayaw",
-    "maganda", "masaya", "malungkot", "pagod", "gutom", "uhaw", "mainit", "lamig"
+    "maganda", "masaya", "malungkot", "pagod", "gutom", "uhaw", "lamig"
   ];
   const words = lower.split(/\s+/);
   let filCount = 0;
   for (const word of words) {
     if (filWords.includes(word)) filCount++;
   }
-  // If more than 30% of words are Filipino, assume Filipino
   return filCount / words.length > 0.3 ? "fil" : "en";
 }
 
 // ============================================================================
-// WEATHER API — Open-Meteo (Free, No API Key)
+// OPENWEATHERMAP API (Requires API Key)
 // ============================================================================
 interface WeatherData {
   temperature: number;
@@ -127,41 +125,34 @@ interface WeatherData {
   humidity: number;
   windSpeed: number;
   condition: string;
+  description: string;
+  city: string;
+  country: string;
   isDay: boolean;
 }
 
 async function fetchWeather(): Promise<WeatherData | null> {
   try {
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day&timezone=Asia%2FManila`;
+    const url = `https://api.openweathermap.org/data/2.5/weather?lat=${WEATHER_LAT}&lon=${WEATHER_LON}&appid=${OPENWEATHER_API_KEY}&units=metric`;
     const response = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      console.error("[WEATHER] API error:", response.status, await response.text());
+      return null;
+    }
     const data = await response.json();
-    const current = data.current;
     
-    // WMO Weather interpretation codes (https://open-meteo.com/en/docs)
-    const weatherCodes: Record<number, string> = {
-      0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
-      45: "fog", 48: "depositing rime fog",
-      51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
-      56: "light freezing drizzle", 57: "dense freezing drizzle",
-      61: "slight rain", 63: "moderate rain", 65: "heavy rain",
-      66: "light freezing rain", 67: "heavy freezing rain",
-      71: "slight snow", 73: "moderate snow", 75: "heavy snow",
-      77: "snow grains",
-      80: "slight rain showers", 81: "moderate rain showers", 82: "violent rain showers",
-      85: "slight snow showers", 86: "heavy snow showers",
-      95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail"
-    };
-
     return {
-      temperature: current.temperature_2m,
-      feelsLike: current.apparent_temperature,
-      humidity: current.relative_humidity_2m,
-      windSpeed: current.wind_speed_10m,
-      condition: weatherCodes[current.weather_code] || "unknown",
-      isDay: current.is_day === 1
+      temperature: Math.round(data.main.temp),
+      feelsLike: Math.round(data.main.feels_like),
+      humidity: data.main.humidity,
+      windSpeed: Math.round(data.wind.speed * 3.6), // m/s to km/h
+      condition: data.weather[0]?.main || "Unknown",
+      description: data.weather[0]?.description || "unknown",
+      city: data.name || "Alfonso",
+      country: data.sys?.country || "PH",
+      isDay: data.weather[0]?.icon?.includes("d") || true
     };
   } catch (e: any) {
     console.error("[WEATHER] Fetch error:", e.message);
@@ -171,31 +162,24 @@ async function fetchWeather(): Promise<WeatherData | null> {
 
 function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string {
   if (lang === "fil") {
-    const timeDesc = weather.isDay ? "ngayon" : "ngayong gabi";
     const conditionFil: Record<string, string> = {
-      "clear sky": "malinis na langit",
-      "mainly clear": "malinis na langit",
-      "partly cloudy": "bahagyang maulap",
-      "overcast": "maulap",
-      "fog": "mahamog",
-      "light drizzle": "mahinang ambon",
-      "moderate drizzle": "katamtamang ambon",
-      "dense drizzle": "malakas na ambon",
-      "slight rain": "mahinang ulan",
-      "moderate rain": "katamtamang ulan",
-      "heavy rain": "malakas na ulan",
-      "slight rain showers": "mahinang ulan",
-      "moderate rain showers": "katamtamang ulan",
-      "violent rain showers": "malakas na ulan",
-      "thunderstorm": "bagyo",
-      "thunderstorm with slight hail": "bagyo na may yelo",
-      "thunderstorm with heavy hail": "malakas na bagyo na may yelo"
+      "Clear": "Malinis na langit",
+      "Clouds": "Maulap",
+      "Rain": "Umuulan",
+      "Drizzle": "Mahinang ulan",
+      "Thunderstorm": "May bagyo",
+      "Snow": "Nagsisnow",
+      "Mist": "Mahamog",
+      "Fog": "Makapal na hamog",
+      "Haze": "Mabahong hangin",
+      "Dust": "Alikabok",
+      "Sand": "Buhangin"
     };
     const cond = conditionFil[weather.condition] || weather.condition;
-    return `Ang temperatura ${timeDesc} sa ${WEATHER_LOCATION_NAME} ay ${weather.temperature}°C. ${cond}. Ang humidity ay ${weather.humidity}%. Ang hangin ay ${weather.windSpeed} km/h.`;
+    const timeDesc = weather.isDay ? "ngayon" : "ngayong gabi";
+    return `Ang temperatura ${timeDesc} sa ${weather.city}, ${weather.country} ay ${weather.temperature}°C. ${cond}. Ang humidity ay ${weather.humidity}% at ang bilis ng hangin ay ${weather.windSpeed} km/h.`;
   } else {
-    const timeDesc = weather.isDay ? "right now" : "tonight";
-    return `The temperature ${timeDesc} in ${WEATHER_LOCATION_NAME} is ${weather.temperature}°C with ${weather.condition}. It feels like ${weather.feelsLike}°C. Humidity is ${weather.humidity}% and wind speed is ${weather.windSpeed} km/h.`;
+    return `The temperature right now in ${weather.city}, ${weather.country} is ${weather.temperature}°C with ${weather.description}. It feels like ${weather.feelsLike}°C. Humidity is ${weather.humidity}% and wind speed is ${weather.windSpeed} km/h.`;
   }
 }
 
@@ -500,7 +484,7 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// STREAMING STT PROCESSOR — FIXED: Full-buffer STT only
+// STREAMING STT PROCESSOR
 // ============================================================================
 interface StreamingSTTSession {
   userId: number;
@@ -601,19 +585,88 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 }
 
 // ============================================================================
-// WEATHER INTENT DETECTION
+// AI-DRIVEN PROCESSOR — LLM DECIDES EVERYTHING
 // ============================================================================
-function isWeatherQuery(text: string): boolean {
-  const lower = text.toLowerCase();
-  const weatherPatterns = [
-    /weather/i, /forecast/i, /temperature/i, /humidity/i,
-    /panahon/i, /temperatura/i, /ulan/i, /mainit/i, /malamig/i,
-    /bagyo/i, /kumusta\s+ang\s+panahon/i, /ano\s+ang\s+panahon/i,
-    /what's\s+the\s+weather/i, /how's\s+the\s+weather/i,
-    /will\s+it\s+rain/i, /is\s+it\s+going\s+to\s+rain/i,
-    /mag[-]?uulan/i, /magiging\s+mainit/i
+interface AIAction {
+  type: "chat" | "weather" | "music";
+  text: string;
+  music?: string | null;
+  weather?: boolean;
+  lang: "en" | "fil";
+}
+
+async function getAIDecision(userText: string, history: any[], savedName: string | null): Promise<AIAction> {
+  const systemPrompt = `You are Mochi, a helpful voice assistant. The user is in Alfonso, Cavite, Philippines (coordinates: 14.1239, 120.8547).
+
+CRITICAL RULES:
+1. You MUST respond in valid JSON ONLY. No extra text, no markdown.
+2. Detect the user's language (English or Filipino/Tagalog) and respond in that same language.
+3. If the user asks about weather, temperature, rain, forecast, or anything related to current conditions, set "type": "weather" and "weather": true.
+4. If the user wants to play music or a song, set "type": "music" and provide the "music" search query.
+5. For normal conversation, set "type": "chat".
+6. Keep responses natural, concise, and conversational (1-2 sentences max for voice).
+7. If the user says something vague like "play music" without specifying a song, ask what song they want.
+
+JSON FORMAT:
+{
+  "type": "chat" | "weather" | "music",
+  "text": "your response text",
+  "music": "song search query or null",
+  "weather": true or false,
+  "lang": "en" or "fil"
+}
+
+Examples:
+- "What's the weather?" -> {"type":"weather","text":"Let me check the weather for you.","weather":true,"music":null,"lang":"en"}
+- "Kumusta ang panahon?" -> {"type":"weather","text":"Tingnan ko ang panahon ngayon.","weather":true,"music":null,"lang":"fil"}
+- "Play Tibok" -> {"type":"music","text":"Playing Tibok by Earl Agustin","music":"Tibok by Earl Agustin","weather":false,"lang":"en"}
+- "Tumugtog ka ng music" -> {"type":"music","text":"Anong kanta gusto mo?","music":null,"weather":false,"lang":"fil"}
+- "Hello" -> {"type":"chat","text":"Hello! How can I help you today?","music":null,"weather":false,"lang":"en"}
+- "Kumusta" -> {"type":"chat","text":"Mabuti naman! Paano kita matutulungan?","music":null,"weather":false,"lang":"fil"}
+
+Return ONLY the JSON object.`;
+
+  const messages: any[] = [
+    { role: "system", content: systemPrompt },
+    ...history.map(h => ({ role: h.role, content: h.content })),
+    { role: "user", content: userText }
   ];
-  return weatherPatterns.some(p => p.test(lower));
+
+  const ai = await Promise.race([
+    llmClient.chat.completions.create({ 
+      model: "llama-3.3-70b-versatile", 
+      messages, 
+      max_tokens: 200, 
+      temperature: 0.3 
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
+  ]);
+
+  const raw = ai.choices[0].message.content || "{}";
+  console.log("[AI RAW]", raw);
+
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      type: parsed.type || "chat",
+      text: parsed.text || "Sorry, I didn't understand.",
+      music: parsed.music || null,
+      weather: parsed.weather === true,
+      lang: parsed.lang || detectLanguage(userText)
+    };
+  } catch {
+    // Fallback: try to extract intent from raw text
+    const lower = raw.toLowerCase();
+    const lang = detectLanguage(userText);
+    
+    if (lower.includes("weather") || lower.includes("panahon") || lower.includes("temperature")) {
+      return { type: "weather", text: raw, music: null, weather: true, lang };
+    }
+    if (lower.includes("music") || lower.includes("song") || lower.includes("kanta") || lower.includes("tumugtog")) {
+      return { type: "music", text: raw, music: null, weather: false, lang };
+    }
+    return { type: "chat", text: raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(), music: null, weather: false, lang };
+  }
 }
 
 // ============================================================================
@@ -635,21 +688,32 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       nameResponse = "Name deleted.";
     }
 
-    // Detect language for TTS
-    const lang = detectLanguage(userText);
-    console.log("[LANG] Detected:", lang);
+    const history = await storage.getConversationHistory(userId);
+    const savedName = await storage.getSavedName(userId);
 
-    // Check if weather query
-    if (isWeatherQuery(userText)) {
+    // AI decides what to do
+    const action = await getAIDecision(userText, history, savedName);
+    console.log("[AI DECISION]", action.type, "lang:", action.lang, "weather:", action.weather, "music:", action.music);
+
+    let finalText = action.text;
+    let musicQuery = action.music;
+
+    if (nameResponse) {
+      finalText = nameResponse;
+      musicQuery = null;
+    }
+
+    // Handle Weather (AI decided)
+    if (action.type === "weather" || action.weather) {
       const weather = await fetchWeather();
       if (weather) {
-        const weatherText = formatWeatherResponse(weather, lang);
+        const weatherText = formatWeatherResponse(weather, action.lang);
         console.log("[WEATHER] Response:", weatherText);
         
         const mp3 = path.join(AUDIO_DIR, sessionId + "_weather.mp3");
         filesToCleanup.push(mp3);
         
-        await generateEdgeTTS(weatherText, mp3, lang);
+        await generateEdgeTTS(weatherText, mp3, action.lang);
         const pcm = await generatePCM(mp3);
         await streamPCM(ws, pcm, sessionId);
         
@@ -657,63 +721,42 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
         await storage.addMessage(userId, "assistant", weatherText);
         return;
       } else {
-        const failText = lang === "fil" 
-          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon ngayon." 
-          : "Sorry, I couldn't fetch the weather information right now.";
+        const failText = action.lang === "fil" 
+          ? "Pasensya na, hindi ko makuha ang impormasyon ng panahon ngayon. Siguraduhin mo na may OpenWeatherMap API key." 
+          : "Sorry, I couldn't fetch the weather right now. Please make sure your OpenWeatherMap API key is set.";
         const mp3 = path.join(AUDIO_DIR, sessionId + "_weather_fail.mp3");
         filesToCleanup.push(mp3);
-        await generateEdgeTTS(failText, mp3, lang);
+        await generateEdgeTTS(failText, mp3, action.lang);
         const pcm = await generatePCM(mp3);
         await streamPCM(ws, pcm, sessionId);
         return;
       }
     }
 
-    const history = await storage.getConversationHistory(userId);
-    const savedName = await storage.getSavedName(userId);
-
-    const systemPrompt = `You are Mochi a helpful voice assistant. Keep responses natural and concise.
-${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
-If the user wants to play music or a song, return JSON with "music" field:
-{"text":"short acknowledgment","music":"song search query"}
-Examples:
-- "Play Tibok" -> {"text":"Playing Tibok by Earl Agustin","music":"Tibok by Earl Agustin"}
-- "Tumugtog ka ng music" -> {"text":"Anong kanta gusto mo?","music":null}
-Otherwise return: {"text":"your response"}
-Return ONLY the JSON.`;
-
-    const messages: any[] = [
-      { role: "system", content: systemPrompt },
-      ...history.map(h => ({ role: h.role, content: h.content })),
-      { role: "user", content: userText }
-    ];
-
-    const ai = await Promise.race([
-      llmClient.chat.completions.create({ model: "llama-3.3-70b-versatile", messages, max_tokens: 150, temperature: 0.7 }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
-    ]);
-
-    const raw = ai.choices[0].message.content || "{}";
-    let text = "Sorry, I didn't understand.";
-    let musicQuery: string | null = null;
-    try { const parsed = JSON.parse(raw); text = parsed.text || text; musicQuery = parsed.music || null; }
-    catch { text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(); }
-
-    if (nameResponse) { text = nameResponse; musicQuery = null; }
-    console.log("AI:", text, musicQuery ? `(Music: ${musicQuery})` : "");
-
+    // Save to history
     await storage.addMessage(userId, "user", userText);
-    await storage.addMessage(userId, "assistant", text);
+    await storage.addMessage(userId, "assistant", finalText);
 
-    if (musicQuery) {
+    // Handle Music
+    if (action.type === "music" && musicQuery) {
       const musicUrl = await fetchMusicUrl(musicQuery);
-      if (!musicUrl) { ws.send("ERROR:MUSIC_NOT_FOUND"); return; }
+      if (!musicUrl) { 
+        const notFound = action.lang === "fil" 
+          ? "Hindi ko mahanap ang kanta. Subukan mo ulit." 
+          : "I couldn't find that song. Please try again.";
+        const mp3 = path.join(AUDIO_DIR, sessionId + "_notfound.mp3");
+        filesToCleanup.push(mp3);
+        await generateEdgeTTS(notFound, mp3, action.lang);
+        const pcm = await generatePCM(mp3);
+        await streamPCM(ws, pcm, sessionId);
+        return; 
+      }
 
-      if (text && !nameResponse) {
+      if (finalText && !nameResponse) {
         const introId = sessionId + "_intro";
         const introMp3 = path.join(AUDIO_DIR, introId + ".mp3");
 
-        await generateEdgeTTS(text, introMp3, lang);
+        await generateEdgeTTS(finalText, introMp3, action.lang);
         filesToCleanup.push(introMp3);
 
         const introPcm = await generatePCM(introMp3);
@@ -722,12 +765,12 @@ Return ONLY the JSON.`;
       }
 
       await streamMusicRealtime(ws, musicUrl, sessionId + "_music");
-    } else {
+    } 
+    // Handle Chat (default)
+    else {
       const mp3 = path.join(AUDIO_DIR, sessionId + ".mp3");
-
-      await generateEdgeTTS(text, mp3, lang);
+      await generateEdgeTTS(finalText, mp3, action.lang);
       filesToCleanup.push(mp3);
-
       const pcm = await generatePCM(mp3);
       await streamPCM(ws, pcm, sessionId);
     }
@@ -758,7 +801,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V28 ADAPTIVE VAD [rain-proof] + WEATHER + LANG_SWITCH");
+    console.log("ESP connected - AI-DRIVEN WEATHER + LANG_SWITCH");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
