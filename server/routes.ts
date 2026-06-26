@@ -28,9 +28,10 @@ const AI_CHUNK_SIZE_MONO = 1024;
 const SEND_INTERVAL_MS_AI = 28;
 const PREBUFFER_CHUNKS_AI = 24;
 
-const MUSIC_SAMPLE_RATE = 44100;
+// FIXED: Music now uses 48000Hz to match ESP32 DAC
+const MUSIC_SAMPLE_RATE = 48000;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
-const SEND_INTERVAL_MS_MUSIC = 20;
+const SEND_INTERVAL_MS_MUSIC = 21;  // 512 samples / 48000Hz = ~10.7ms, x2 = ~21ms
 const PREBUFFER_CHUNKS_MUSIC = 32;
 
 // ============================================================================
@@ -232,7 +233,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING
+// REAL-TIME MUSIC STREAMING — FIXED: 48000Hz to match ESP32
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
@@ -240,14 +241,15 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
   console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
 
   return new Promise<void>((resolve, reject) => {
+    // FIXED: Music resampled to 48000Hz to match ESP32 DAC
     const ffmpegArgs = [
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=18000,aresample=44100:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
+      "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "44100",
+      "-ar", "48000",        // FIXED: 48000Hz instead of 44100Hz
       "-f", "s16le",
       "pipe:1"
     ];
@@ -315,7 +317,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 21), "ms), starting stream...");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
@@ -387,7 +389,7 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// STREAMING STT PROCESSOR — FIXED: Full-buffer STT only
+// STREAMING STT PROCESSOR
 // ============================================================================
 interface StreamingSTTSession {
   userId: number;
@@ -412,11 +414,11 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     console.log("[STT] Audio too short, ignoring");
     return null;
   }
-  
+
   const tmpWav = path.join(UPLOAD_DIR, session.sessionId + "_stt.wav");
   const tmpClean = path.join(UPLOAD_DIR, session.sessionId + "_clean.wav");
   const dataLen = session.audioBuffer.length;
-  
+
   try {
     const wavBuffer = Buffer.alloc(44 + dataLen);
     wavBuffer.write("RIFF", 0);
@@ -433,7 +435,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     wavBuffer.write("data", 36);
     wavBuffer.writeUInt32LE(dataLen, 40);
     session.audioBuffer.copy(wavBuffer, 44);
-    
+
     fs.writeFileSync(tmpWav, wavBuffer);
     console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
@@ -466,17 +468,17 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
-    
+
     const text = stt.text?.trim();
-    
+
     try { fs.unlinkSync(tmpWav); } catch {}
     try { fs.unlinkSync(tmpClean); } catch {}
-    
+
     if (!text) {
       console.log("[STT] No speech detected");
       return null;
     }
-    
+
     console.log("[STT] RESULT:", text);
     return text;
   } catch (e: any) {
@@ -488,13 +490,13 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 }
 
 // ============================================================================
-// PROCESS AI RESPONSE
+// PROCESS AI RESPONSE — FIXED: Groq Compound with web tools
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
-  
+
   const filesToCleanup: string[] = [];
-  
+
   try {
     const nameAction = extractName(userText);
     let nameResponse = "";
@@ -509,8 +511,12 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    const systemPrompt = `You are Mochi a helpful voice assistant. Keep responses natural and concise.
+    // FIXED: Groq Compound system prompt with web search capability
+    const systemPrompt = `You are Mochi, a helpful Filipino voice assistant with real-time web access via Groq Compound.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
+You can search the web, visit websites, and use code interpreter when needed.
+Keep responses natural, concise, and conversational.
+If the user asks about current events, news, weather, or anything time-sensitive, USE web_search.
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
 Examples:
@@ -525,16 +531,41 @@ Return ONLY the JSON.`;
       { role: "user", content: userText }
     ];
 
+    // FIXED: Groq Compound with web_search, code_interpreter, visit_website tools
     const ai = await Promise.race([
-      llmClient.chat.completions.create({ model: "llama-3.3-70b-versatile", messages, max_tokens: 150, temperature: 0.7 }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
+      llmClient.chat.completions.create({
+        model: "groq/compound",
+        messages,
+        temperature: 1,
+        max_completion_tokens: 1024,
+        top_p: 1,
+        stream: false,
+        stop: null,
+        compound_custom: {
+          tools: {
+            enabled_tools: [
+              "web_search",
+              "code_interpreter",
+              "visit_website"
+            ]
+          }
+        }
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 15000))
     ]);
 
     const raw = ai.choices[0].message.content || "{}";
     let text = "Sorry, I didn't understand.";
     let musicQuery: string | null = null;
-    try { const parsed = JSON.parse(raw); text = parsed.text || text; musicQuery = parsed.music || null; }
-    catch { text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(); }
+
+    try {
+      const parsed = JSON.parse(raw);
+      text = parsed.text || text;
+      musicQuery = parsed.music || null;
+    } catch {
+      // Hindi JSON, gamitin as plain text
+      text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
+    }
 
     if (nameResponse) { text = nameResponse; musicQuery = null; }
     console.log("AI:", text, musicQuery ? `(Music: ${musicQuery})` : "");
@@ -595,7 +626,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V28 ADAPTIVE VAD [rain-proof]");
+    console.log("ESP connected - V31 FIXED 48kHz MUSIC + GROQ COMPOUND");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
@@ -603,11 +634,11 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     ws.on("message", async (data: any, isBinary: boolean) => {
       messageCount++;
       const currentMsgNum = messageCount;
-      
+
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
-        
+
         if (msg === "READY") { 
           ws.send("STATE:IDLE"); 
         }
@@ -630,7 +661,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           if (sttSession && sttSession.isRecording) {
             sttSession.isRecording = false;
             console.log("[STT] Finalizing, buffer size:", sttSession.audioBuffer.length);
-            
+
             const text = await processFinalSTT(sttSession);
             if (text) {
               ws.send("STT_RESULT:" + text);
@@ -652,21 +683,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         }
         return;
       }
-      
+
       const chunkLen = Buffer.from(data).length;
       console.log("[WS] BINARY #" + currentMsgNum + ":", chunkLen, "bytes");
-      
+
       if (!sttSession || !sttSession.isRecording) {
         return;
       }
-      
+
       const chunk = Buffer.from(data);
-      
+
       const maxBytes = STT_STREAM_SAMPLE_RATE * 2 * STT_MAX_AUDIO_SECONDS;
       if (sttSession.audioBuffer.length + chunk.length > maxBytes) {
         console.log("[STT] Buffer full, forcing finalize");
         sttSession.isRecording = false;
-        
+
         const text = await processFinalSTT(sttSession);
         if (text) {
           ws.send("STT_RESULT:" + text);
@@ -678,7 +709,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         sttSession = null;
         return;
       }
-      
+
       sttSession.audioBuffer = Buffer.concat([sttSession.audioBuffer, chunk]);
     });
 
@@ -689,7 +720,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       }
       currentUserId = null; 
     });
-    
+
     ws.on("error", (err) => console.error("[WS] Error:", err.message));
 
     const pingInterval = setInterval(() => {
