@@ -28,18 +28,15 @@ const AI_CHUNK_SIZE_MONO = 1024;
 const SEND_INTERVAL_MS_AI = 28;
 const PREBUFFER_CHUNKS_AI = 24;
 
-// Music at 48000Hz to match ESP32 DAC
-const MUSIC_SAMPLE_RATE = 48000;
+const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
-const SEND_INTERVAL_MS_MUSIC = 21;
+const SEND_INTERVAL_MS_MUSIC = 20;
 const PREBUFFER_CHUNKS_MUSIC = 32;
 
 // ============================================================================
 // STREAMING STT CONFIG
 // ============================================================================
-// FIXED: ESP32 now sends 48kHz audio, server resamples to 16kHz for STT
-const STT_STREAM_SAMPLE_RATE = 48000;  // Incoming from ESP32
-const STT_TARGET_SAMPLE_RATE = 16000;  // For Whisper STT
+const STT_STREAM_SAMPLE_RATE = 16000;
 const STT_MAX_AUDIO_SECONDS = 12;
 
 // ============================================================================
@@ -235,7 +232,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — 48000Hz to match ESP32
+// REAL-TIME MUSIC STREAMING
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
@@ -247,10 +244,10 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
+      "-af", "highpass=f=60,lowpass=f=18000,aresample=44100:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "48000",
+      "-ar", "44100",
       "-f", "s16le",
       "pipe:1"
     ];
@@ -318,7 +315,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 21), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
@@ -390,7 +387,7 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// STREAMING STT PROCESSOR
+// STREAMING STT PROCESSOR — FIXED: Full-buffer STT only
 // ============================================================================
 interface StreamingSTTSession {
   userId: number;
@@ -410,89 +407,94 @@ function createSTTSession(ws: WebSocket, userId: number): StreamingSTTSession {
   };
 }
 
-// FIXED: Process 48kHz audio from ESP32, resample to 16kHz for STT
 async function processFinalSTT(session: StreamingSTTSession): Promise<string | null> {
-  if (session.audioBuffer.length < 3200) {  // Higher threshold for 48kHz
+  if (session.audioBuffer.length < 1600) {
     console.log("[STT] Audio too short, ignoring");
     return null;
   }
-
-  const tmpRaw = path.join(UPLOAD_DIR, session.sessionId + "_48k.raw");
+  
   const tmpWav = path.join(UPLOAD_DIR, session.sessionId + "_stt.wav");
+  const tmpClean = path.join(UPLOAD_DIR, session.sessionId + "_clean.wav");
   const dataLen = session.audioBuffer.length;
-
+  
   try {
-    // Save raw 48kHz PCM first
-    fs.writeFileSync(tmpRaw, session.audioBuffer);
-    console.log("[STT] Raw 48kHz saved:", dataLen, "bytes (~", (dataLen/2/48000).toFixed(2), "seconds)");
+    const wavBuffer = Buffer.alloc(44 + dataLen);
+    wavBuffer.write("RIFF", 0);
+    wavBuffer.writeUInt32LE(36 + dataLen, 4);
+    wavBuffer.write("WAVE", 8);
+    wavBuffer.write("fmt ", 12);
+    wavBuffer.writeUInt32LE(16, 16);
+    wavBuffer.writeUInt16LE(1, 20);
+    wavBuffer.writeUInt16LE(1, 22);
+    wavBuffer.writeUInt32LE(STT_STREAM_SAMPLE_RATE, 24);
+    wavBuffer.writeUInt32LE(STT_STREAM_SAMPLE_RATE * 2, 28);
+    wavBuffer.writeUInt16LE(2, 32);
+    wavBuffer.writeUInt16LE(16, 34);
+    wavBuffer.write("data", 36);
+    wavBuffer.writeUInt32LE(dataLen, 40);
+    session.audioBuffer.copy(wavBuffer, 44);
+    
+    fs.writeFileSync(tmpWav, wavBuffer);
+    console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
-    // FIXED: Use ffmpeg to convert 48kHz → 16kHz WAV with noise filtering
     await new Promise<void>((resolve, reject) => {
-      ffmpeg(tmpRaw)
-        .inputOptions(["-f s16le", "-ar 48000", "-ac 1"])  // Input: 48kHz 16-bit mono
+      ffmpeg(tmpWav)
         .audioFilters([
-          "highpass=f=80",           // Remove low freq rumble
-          "lowpass=f=8000",          // Limit to voice freq
-          "aresample=16000:resampler=soxr:precision=28",  // FIXED: Resample to 16kHz
-          "dynaudnorm=p=0.95:g=15",  // Normalize volume
-          "afftdn=nf=-25",           // Noise reduction
-          "volume=2.0"               // Boost signal (INMP441 can be quiet)
+          "highpass=f=80",
+          "lowpass=f=8000",
+          "dynaudnorm=p=0.95:g=15",
+          "afftdn=nf=-25"
         ])
         .audioCodec("pcm_s16le")
         .audioChannels(1)
         .audioFrequency(16000)
-        .format("wav")
         .on("error", (err) => {
-          console.error("[STT] FFmpeg resample error:", err.message);
-          reject(err);
-        })
-        .on("end", () => {
-          console.log("[STT] Resampled to 16kHz WAV");
+          console.log("[STT] FFmpeg normalize failed, using raw:", err.message);
+          fs.copyFileSync(tmpWav, tmpClean);
           resolve();
         })
-        .save(tmpWav);
+        .on("end", resolve)
+        .save(tmpClean);
     });
 
-    // Run STT on the 16kHz WAV
-    const transcription = await Promise.race([
-      sttClient.audio.transcriptions.create({
-        file: fs.createReadStream(tmpWav),
-        model: "whisper-large-v3",
-        temperature: 0,
-        response_format: "verbose_json",
+    const stt = await Promise.race([
+      sttClient.audio.transcriptions.create({ 
+        file: fs.createReadStream(tmpClean), 
+        model: "whisper-large-v3-turbo", 
+        language: "en",
+        prompt: "The user speaks English or Tagalog (Filipino). Common words: ano, ang, photosynthesis, bakit, paano, sino, saan, kailan, tumugtog, music, pangalan."
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
-
-    const text = transcription.text?.trim();
-
-    // Cleanup
-    try { fs.unlinkSync(tmpRaw); } catch {}
+    
+    const text = stt.text?.trim();
+    
     try { fs.unlinkSync(tmpWav); } catch {}
-
+    try { fs.unlinkSync(tmpClean); } catch {}
+    
     if (!text) {
       console.log("[STT] No speech detected");
       return null;
     }
-
+    
     console.log("[STT] RESULT:", text);
     return text;
   } catch (e: any) {
     console.error("[STT] Error:", e.message);
-    try { fs.unlinkSync(tmpRaw); } catch {}
     try { fs.unlinkSync(tmpWav); } catch {}
+    try { fs.unlinkSync(tmpClean); } catch {}
     return null;
   }
 }
 
 // ============================================================================
-// PROCESS AI RESPONSE — llama-4-scout non-streaming
+// PROCESS AI RESPONSE
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
-
+  
   const filesToCleanup: string[] = [];
-
+  
   try {
     const nameAction = extractName(userText);
     let nameResponse = "";
@@ -507,9 +509,8 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const history = await storage.getConversationHistory(userId);
     const savedName = await storage.getSavedName(userId);
 
-    const systemPrompt = `You are Mochi, a helpful Filipino voice assistant.
+    const systemPrompt = `You are Mochi a helpful voice assistant. Keep responses natural and concise.
 ${savedName ? `The user's name is ${savedName}. Address them by name.` : ""}
-Keep responses natural, concise, and conversational — max 2-3 sentences for voice.
 If the user wants to play music or a song, return JSON with "music" field:
 {"text":"short acknowledgment","music":"song search query"}
 Examples:
@@ -525,29 +526,15 @@ Return ONLY the JSON.`;
     ];
 
     const ai = await Promise.race([
-      llmClient.chat.completions.create({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        messages,
-        temperature: 1,
-        max_completion_tokens: 1024,
-        top_p: 1,
-        stream: false,
-        stop: null
-      }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 15000))
+      llmClient.chat.completions.create({ model: "llama-3.3-70b-versatile", messages, max_tokens: 150, temperature: 0.7 }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
     ]);
 
     const raw = ai.choices[0].message.content || "{}";
     let text = "Sorry, I didn't understand.";
     let musicQuery: string | null = null;
-
-    try {
-      const parsed = JSON.parse(raw);
-      text = parsed.text || text;
-      musicQuery = parsed.music || null;
-    } catch {
-      text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim();
-    }
+    try { const parsed = JSON.parse(raw); text = parsed.text || text; musicQuery = parsed.music || null; }
+    catch { text = raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(); }
 
     if (nameResponse) { text = nameResponse; musicQuery = null; }
     console.log("AI:", text, musicQuery ? `(Music: ${musicQuery})` : "");
@@ -608,7 +595,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - V37 MAX QUALITY MIC (48kHz -> 16kHz STT)");
+    console.log("ESP connected - V28 ADAPTIVE VAD [rain-proof]");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
@@ -616,22 +603,22 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     ws.on("message", async (data: any, isBinary: boolean) => {
       messageCount++;
       const currentMsgNum = messageCount;
-
+      
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
-
-        if (msg === "READY") {
-          ws.send("STATE:IDLE");
+        
+        if (msg === "READY") { 
+          ws.send("STATE:IDLE"); 
         }
         else if (msg === "STREAM_START") {
           if (!currentUserId) {
-            try {
-              const anon = await storage.getOrCreateUser("anon_" + Date.now());
-              currentUserId = anon.id;
-            } catch (e: any) {
-              ws.send("ERROR:DB_FAILED");
-              return;
+            try { 
+              const anon = await storage.getOrCreateUser("anon_" + Date.now()); 
+              currentUserId = anon.id; 
+            } catch (e: any) { 
+              ws.send("ERROR:DB_FAILED"); 
+              return; 
             }
           }
           sttSession = createSTTSession(ws, currentUserId);
@@ -643,7 +630,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           if (sttSession && sttSession.isRecording) {
             sttSession.isRecording = false;
             console.log("[STT] Finalizing, buffer size:", sttSession.audioBuffer.length);
-
+            
             const text = await processFinalSTT(sttSession);
             if (text) {
               ws.send("STT_RESULT:" + text);
@@ -665,22 +652,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         }
         return;
       }
-
+      
       const chunkLen = Buffer.from(data).length;
       console.log("[WS] BINARY #" + currentMsgNum + ":", chunkLen, "bytes");
-
+      
       if (!sttSession || !sttSession.isRecording) {
         return;
       }
-
+      
       const chunk = Buffer.from(data);
-
-      // FIXED: Max buffer for 48kHz (12 seconds = 48k * 2 * 12 = 1.15MB)
+      
       const maxBytes = STT_STREAM_SAMPLE_RATE * 2 * STT_MAX_AUDIO_SECONDS;
       if (sttSession.audioBuffer.length + chunk.length > maxBytes) {
         console.log("[STT] Buffer full, forcing finalize");
         sttSession.isRecording = false;
-
+        
         const text = await processFinalSTT(sttSession);
         if (text) {
           ws.send("STT_RESULT:" + text);
@@ -692,18 +678,18 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         sttSession = null;
         return;
       }
-
+      
       sttSession.audioBuffer = Buffer.concat([sttSession.audioBuffer, chunk]);
     });
 
-    ws.on("close", () => {
-      console.log("ESP disconnected");
+    ws.on("close", () => { 
+      console.log("ESP disconnected"); 
       if (sttSession) {
         sttSession = null;
       }
-      currentUserId = null;
+      currentUserId = null; 
     });
-
+    
     ws.on("error", (err) => console.error("[WS] Error:", err.message));
 
     const pingInterval = setInterval(() => {
