@@ -25,11 +25,10 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 // ============================================================================
 // AUDIO CONFIG — TRUE 24-BIT MAX QUALITY (NOT 16-BIT)
 // ============================================================================
-const AI_SAMPLE_RATE = 24000;        // 24kHz for crisp voice
-const AI_CHUNK_SIZE_MONO = 1536;     // 24kHz * 0.064s = 1536 bytes (16-bit) or 3072 (24-bit packed)
-const SEND_INTERVAL_MS_AI = 32;      // ~31.25 fps smooth
-const PREBUFFER_CHUNKS_AI = 20;
-
+const AI_SAMPLE_RATE = 48000;        // 48kHz MAX
+const AI_CHUNK_SIZE_MONO = 2048;     // 48kHz * 0.042s = 2048 bytes (32-bit)
+const SEND_INTERVAL_MS_AI = 21;      // ~47.6 fps
+const PREBUFFER_CHUNKS_AI = 24;
 const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
 const SEND_INTERVAL_MS_MUSIC = 20;
@@ -360,23 +359,14 @@ async function generatePCM(input: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        // Step 1: Resample to 24kHz using soxr (best quality resampler)
         "aresample=24000:resampler=soxr:precision=33",
-        // Step 2: Convert to 32-bit float (internal processing)
         "aformat=sample_fmts=flt:channel_layouts=mono",
-        // Step 3: High-pass filter — REMOVE sub-bass that cracks small speakers
         "highpass=f=120:dB=24",
-        // Step 4: Low-pass filter — smooth harsh highs above 12kHz  
         "lowpass=f=12000:dB=12",
-        // Step 5: Volume with headroom (0.92 = safe, no clipping)
         "volume=0.92",
-        // Step 6: Gentle dynamic normalization (prevents pumping)
         "dynaudnorm=f=150:g=25:p=0.95",
-        // Step 7: Voice clarity boost at 3.5kHz (human speech fundamental)
         "equalizer=f=3500:t=h:width=800:g=2",
-        // Step 8: Air/presence boost for intelligibility
         "equalizer=f=8000:t=h:width=2000:g=1",
-        // Step 9: Final format — 32-bit integer output
         "aformat=sample_fmts=s32:channel_layouts=mono"
       ])
       .audioCodec("pcm_s32le")
