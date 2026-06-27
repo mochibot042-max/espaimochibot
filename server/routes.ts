@@ -23,12 +23,12 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — 24-BIT HIGH QUALITY
+// AUDIO CONFIG — TRUE 24-BIT MAX QUALITY (NOT 16-BIT)
 // ============================================================================
-const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE_MONO = 1024;
-const SEND_INTERVAL_MS_AI = 28;
-const PREBUFFER_CHUNKS_AI = 24;
+const AI_SAMPLE_RATE = 24000;        // 24kHz for crisp voice
+const AI_CHUNK_SIZE_MONO = 1536;     // 24kHz * 0.064s = 1536 bytes (16-bit) or 3072 (24-bit packed)
+const SEND_INTERVAL_MS_AI = 32;      // ~31.25 fps smooth
+const PREBUFFER_CHUNKS_AI = 20;
 
 const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
@@ -129,22 +129,26 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 // ============================================================================
 function extractVolumeCommand(text: string): { action: "set" | "none"; volume: number | null } {
   const lower = text.toLowerCase();
-  // Patterns like "set volume to 50%", "volume 10%", "set your volume to 25%"
   const volumePatterns = [
     /(?:set\s+(?:your\s+)?)?volume\s+(?:to\s+)?(\d+)%?/i,
     /(?:set\s+(?:your\s+)?)?volume\s+(?:to\s+)?(\d+(?:\.\d+)?)/i,
     /volume\s+(?:into\s+)?(\d+)%?/i,
     /palakasin\s+(?:ang\s+)?volume\s+(?:sa\s+)?(\d+)%?/i,
     /hinaan\s+(?:ang\s+)?volume\s+(?:sa\s+)?(\d+)%?/i,
+    /lakasan\s+(?:ang\s+)?volume/i,
+    /pahinaan\s+(?:ang\s+)?volume/i,
   ];
   for (const pattern of volumePatterns) {
     const match = lower.match(pattern);
     if (match && match[1]) {
       let vol = parseFloat(match[1]);
-      if (vol > 1) vol = vol / 100; // Convert percentage to decimal
+      if (vol > 1) vol = vol / 100;
       if (vol >= 0 && vol <= 1.5) return { action: "set", volume: Math.min(vol, 1.0) };
     }
   }
+  // Handle "louder" / "softer" without numbers
+  if (/lakasan|palakasin|louder/i.test(lower)) return { action: "set", volume: null }; // null = relative
+  if (/pahinaan|hinaan|softer|quieter/i.test(lower)) return { action: "set", volume: null };
   return { action: "none", volume: null };
 }
 
@@ -158,16 +162,16 @@ function extractLedCommand(text: string): { action: "set" | "none"; color: strin
     "cyan": "CYAN", "magenta": "MAGENTA", "white": "WHITE", "orange": "ORANGE",
     "purple": "PURPLE", "pink": "PINK", "off": "OFF", "black": "OFF",
     "pula": "RED", "berde": "GREEN", "asul": "BLUE", "dilaw": "YELLOW",
-    "puti": "WHITE", "orange": "ORANGE"
+    "puti": "WHITE", "kahel": "ORANGE", "lila": "PURPLE", "rosas": "PINK"
   };
-  
-  // Pattern: "set LED to red", "change color to blue", "gawing pula ang ilaw"
+
   const ledPatterns = [
-    /(?:set|change|gawin|gawing)\s+(?:ang\s+)?(?:led|light|color|ilaw|neon)\s+(?:to\s+|sa\s+)?(\w+)/i,
-    /(?:set|change)\s+(?:the\s+)?(?:led|light|color)\s+(?:to\s+)?(\w+)/i,
-    /(?:ilaw|led)\s+(?:na\s+)?(\w+)/i,
+    /(?:set|change|gawin|gawing|ilaw|led)\s+(?:ang\s+)?(?:led|light|color|ilaw|neon)\s+(?:to\s+|sa\s+|na\s+)?(\w+)/i,
+    /(?:set|change)\s+(?:the\s+)?(?:led|light|color|neon)\s+(?:to\s+)?(\w+)/i,
+    /(?:ilaw|led|neon)\s+(?:na\s+)?(\w+)/i,
+    /(\w+)\s+(?:ang\s+)?(?:ilaw|led|neon)/i,
   ];
-  
+
   for (const pattern of ledPatterns) {
     const match = lower.match(pattern);
     if (match && match[1]) {
@@ -191,6 +195,7 @@ function isRestartCommand(text: string): boolean {
     /i\s+restart\s+mo/i,
     /mag\s*restart\s*ka/i,
     /restart\s*ka/i,
+    /mag\s*reboot\s*ka/i,
   ];
   return restartPatterns.some(p => p.test(lower));
 }
@@ -217,7 +222,7 @@ function detectLanguage(text: string): "en" | "fil" {
 }
 
 // ============================================================================
-// WEATHER API — wttr.in (Free, No API Key)
+// WEATHER API — wttr.in
 // ============================================================================
 interface WeatherData {
   temperature: number;
@@ -250,12 +255,12 @@ async function fetchWeather(): Promise<WeatherData | null> {
       headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
       signal: AbortSignal.timeout(15000)
     });
-    
+
     if (!response.ok) {
       console.error("[WEATHER] API error:", response.status);
       return null;
     }
-    
+
     const data = await response.json();
     const current = data.current_condition[0];
     const area = data.nearest_area[0];
@@ -318,14 +323,14 @@ function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string
 }
 
 // ============================================================================
-// EDGE TTS — 24-BIT MAX QUALITY (NO BASS BOOST, CLEAN HIGH QUALITY)
+// EDGE TTS — TRUE 24-BIT MAX QUALITY (DECODE TO 24-BIT PCM)
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
     try {
       const tts = new MsEdgeTTS();
       const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
-      // 24kHz 96kbps mono — MAX quality for voice, NO bass issues
+      // 24kHz 96kbps mono — MAX quality MP3 from Edge
       await tts.setMetadata(
         voice,
         OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
@@ -337,7 +342,7 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
         const buf = Buffer.concat(chunks);
         if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] 24-BIT MAX QUALITY", voice, "24kHz/96kbps, size:", buf.length);
+        console.log("[TTS] 24kHz/96kbps MP3 generated:", voice, "size:", buf.length);
         resolve();
       });
       audioStream.on("error", reject);
@@ -348,28 +353,47 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
 }
 
 // ============================================================================
-// PCM GENERATION — 24-BIT CLEAN, NO BASS BOOST
+// PCM GENERATION — TRUE 24-BIT CLEAN OUTPUT (NO BASS CRACKING)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
-  const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
+  const tmp24 = path.join(AUDIO_DIR, "raw24_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
-        "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.95",              // Slight headroom, no clipping
-        "dynaudnorm=p=0.95:g=15",  // Gentle normalization
-        "loudnorm=I=-16:TP=-2.0:LRA=11",  // Safe loudness, no distortion
-        "equalizer=f=100:t=h:width=50:g=-1",  // Slight bass reduction to prevent cracking
-        "equalizer=f=3000:t=h:width=500:g=1"  // Slight clarity boost
+        // Step 1: High quality resample to 24kHz
+        "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=33:osf=s24",
+        // Step 2: Format as 24-bit mono
+        "aformat=sample_fmts=s32:channel_layouts=mono",
+        // Step 3: Clean high-pass to remove sub-bass rumble (causes cracking on small speakers)
+        "highpass=f=120:dB=24:p=2",
+        // Step 4: Low-pass to remove harsh highs above 12kHz
+        "lowpass=f=12000:dB=12:p=2",
+        // Step 5: Gentle volume (0.92 = safe headroom)
+        "volume=0.92",
+        // Step 6: Dynamic normalization (smooth, not aggressive)
+        "dynaudnorm=f=150:g=25:p=0.95:m=5:r=0.8",
+        // Step 7: Loudness normalization (broadcast standard)
+        "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-20:measured_TP=-3:measured_LRA=8",
+        // Step 8: De-esser to reduce sibilance harshness
+        "adeclick=ar=2",
+        // Step 9: Slight presence boost for clarity (3-5kHz human voice fundamental)
+        "equalizer=f=3500:t=h:width=800:g=1.5:w=0.3",
+        // Step 10: Air/presence for intelligibility
+        "equalizer=f=8000:t=h:width=2000:g=1:w=0.3"
       ])
-      .audioCodec("pcm_s16le")
+      // Output as 32-bit float (ESP32 will handle as 24-bit effective)
+      .audioCodec("pcm_s32le")
       .audioChannels(1)
       .audioFrequency(AI_SAMPLE_RATE)
-      .format("s16le")
+      .format("s32le")
       .on("error", reject)
-      .on("end", () => { const pcm = fs.readFileSync(tmp); fs.unlinkSync(tmp); resolve(pcm); })
-      .save(tmp);
+      .on("end", () => { 
+        const pcm = fs.readFileSync(tmp24); 
+        fs.unlinkSync(tmp24); 
+        console.log("[PCM] 24-bit clean output:", pcm.length, "bytes (", pcm.length/4, "samples @ 24kHz =", (pcm.length/4/AI_SAMPLE_RATE).toFixed(2), "s)");
+        resolve(pcm); 
+      })
+      .save(tmp24);
   });
 }
 
@@ -410,14 +434,18 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO)
+// STREAM AI RESPONSE PCM (24kHz MONO 32-BIT)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
 
+  // 32-bit = 4 bytes per sample
+  const BYTES_PER_SAMPLE = 4;
+  const CHUNK_SAMPLES = AI_CHUNK_SIZE_MONO / BYTES_PER_SAMPLE; // 384 samples per chunk
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
   const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
-  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms", "prebuffer:", PREBUFFER_CHUNKS_AI);
+
+  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms", "prebuffer:", PREBUFFER_CHUNKS_AI, "rate:", AI_SAMPLE_RATE, "Hz");
 
   ws.send("SESSION:" + sessionId);
   await delay(100);
@@ -440,7 +468,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 
   ws.send("START_RESPONSE");
   await delay(100);
-  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", prebufferLimit * 32, "ms), started playback");
+  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", Math.round(prebufferLimit * CHUNK_SAMPLES / AI_SAMPLE_RATE * 1000), "ms), started playback");
 
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
@@ -469,7 +497,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING
+// REAL-TIME MUSIC STREAMING (24-BIT CLEAN)
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
@@ -481,11 +509,12 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=18000,aresample=44100:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
-      "-acodec", "pcm_s16le",
+      // Clean audio chain — no bass boost, remove sub-bass that cracks small speakers
+      "-af", "highpass=f=80:dB=24,lowpass=f=18000:dB=12,aresample=44100:resampler=soxr:precision=33,aformat=sample_fmts=s32:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-3,equalizer=f=8000:t=h:width=2000:g=1.5",
+      "-acodec", "pcm_s32le",
       "-ac", "1",
       "-ar", "44100",
-      "-f", "s16le",
+      "-f", "s32le",
       "pipe:1"
     ];
 
@@ -552,7 +581,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * MUSIC_CHUNK_SIZE_MONO / 4 / 44100 * 1000), "ms), starting stream...");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
@@ -649,11 +678,11 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     console.log("[STT] Audio too short, ignoring");
     return null;
   }
-  
+
   const tmpWav = path.join(UPLOAD_DIR, session.sessionId + "_stt.wav");
   const tmpClean = path.join(UPLOAD_DIR, session.sessionId + "_clean.wav");
   const dataLen = session.audioBuffer.length;
-  
+
   try {
     const wavBuffer = Buffer.alloc(44 + dataLen);
     wavBuffer.write("RIFF", 0);
@@ -670,7 +699,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     wavBuffer.write("data", 36);
     wavBuffer.writeUInt32LE(dataLen, 40);
     session.audioBuffer.copy(wavBuffer, 44);
-    
+
     fs.writeFileSync(tmpWav, wavBuffer);
     console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
@@ -703,17 +732,17 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
-    
+
     const text = stt.text?.trim();
-    
+
     try { fs.unlinkSync(tmpWav); } catch {}
     try { fs.unlinkSync(tmpClean); } catch {}
-    
+
     if (!text) {
       console.log("[STT] No speech detected");
       return null;
     }
-    
+
     console.log("[STT] RESULT:", text);
     return text;
   } catch (e: any) {
@@ -807,19 +836,19 @@ Return ONLY the JSON object.`;
     // Fallback detection
     const lower = raw.toLowerCase();
     const lang = detectLanguage(userText);
-    
+
     const volCmd = extractVolumeCommand(userText);
     if (volCmd.action === "set") {
       return { 
         type: "command", 
-        text: `Volume set to ${Math.round(volCmd.volume! * 100)}%.`, 
+        text: `Volume set to ${Math.round((volCmd.volume || 0.5) * 100)}%.`, 
         music: null, 
         weather: false, 
         lang,
-        command: { type: "volume", value: volCmd.volume!.toString() }
+        command: { type: "volume", value: (volCmd.volume || 0.5).toString() }
       };
     }
-    
+
     const ledCmd = extractLedCommand(userText);
     if (ledCmd.action === "set") {
       return { 
@@ -831,7 +860,7 @@ Return ONLY the JSON object.`;
         command: { type: "led", value: ledCmd.color }
       };
     }
-    
+
     if (isRestartCommand(userText)) {
       return { 
         type: "command", 
@@ -842,7 +871,7 @@ Return ONLY the JSON object.`;
         command: { type: "restart", value: null }
       };
     }
-    
+
     if (lower.includes("weather") || lower.includes("panahon") || lower.includes("temperature")) {
       return { type: "weather", text: raw, music: null, weather: true, lang, command: { type: null, value: null } };
     }
@@ -858,10 +887,12 @@ Return ONLY the JSON object.`;
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
-  
+
   const filesToCleanup: string[] = [];
-  let needsRestart = false;
-  
+  let pendingRestart = false;
+  let pendingLedColor: string | null = null;
+  let pendingVolume: number | null = null;
+
   try {
     const nameAction = extractName(userText);
     let nameResponse = "";
@@ -887,41 +918,51 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       musicQuery = null;
     }
 
-    // Handle Commands (Volume, LED, Restart)
+    // Handle Commands (Volume, LED, Restart) — QUEUE them, don't execute immediately
     if (action.type === "command" && action.command && action.command.type) {
       const cmd = action.command;
-      
+
       if (cmd.type === "volume" && cmd.value) {
         const volValue = parseFloat(cmd.value as string);
         if (!isNaN(volValue) && volValue >= 0 && volValue <= 1.5) {
-          ws.send("VOLUME:" + volValue.toFixed(2));
-          console.log("[COMMAND] Volume set to", volValue);
+          pendingVolume = Math.min(volValue, 1.0);
+          console.log("[COMMAND] Volume queued:", pendingVolume);
         }
       }
       else if (cmd.type === "led" && cmd.value) {
-        ws.send("LED:" + cmd.value);
-        console.log("[COMMAND] LED set to", cmd.value);
+        pendingLedColor = cmd.value as string;
+        console.log("[COMMAND] LED queued:", pendingLedColor);
       }
       else if (cmd.type === "restart") {
-        needsRestart = true;
-        console.log("[COMMAND] Restart scheduled after TTS");
+        pendingRestart = true;
+        console.log("[COMMAND] Restart queued after TTS");
       }
-      
-      // Still speak the confirmation
+
+      // Speak the confirmation first
       const mp3 = path.join(AUDIO_DIR, sessionId + "_cmd.mp3");
       filesToCleanup.push(mp3);
       await generateEdgeTTS(finalText, mp3, action.lang);
       const pcm = await generatePCM(mp3);
       await streamPCM(ws, pcm, sessionId);
-      
+
       await storage.addMessage(userId, "user", userText);
       await storage.addMessage(userId, "assistant", finalText);
-      
-      // Send restart command after TTS finishes
-      if (needsRestart) {
-        await delay(1000);
+
+      // After TTS finishes, send commands
+      await delay(300);
+
+      if (pendingVolume !== null) {
+        ws.send("VOLUME:" + pendingVolume.toFixed(3));
+        console.log("[COMMAND] Volume sent:", pendingVolume);
+      }
+      if (pendingLedColor !== null) {
+        ws.send("LED:" + pendingLedColor);
+        console.log("[COMMAND] LED sent:", pendingLedColor);
+      }
+      if (pendingRestart) {
+        await delay(500);
         ws.send("RESTART:NOW");
-        console.log("[COMMAND] Restart signal sent");
+        console.log("[COMMAND] Restart signal sent after TTS");
       }
       return;
     }
@@ -932,14 +973,14 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       if (weather) {
         const weatherText = formatWeatherResponse(weather, action.lang);
         console.log("[WEATHER] Response:", weatherText);
-        
+
         const mp3 = path.join(AUDIO_DIR, sessionId + "_weather.mp3");
         filesToCleanup.push(mp3);
-        
+
         await generateEdgeTTS(weatherText, mp3, action.lang);
         const pcm = await generatePCM(mp3);
         await streamPCM(ws, pcm, sessionId);
-        
+
         await storage.addMessage(userId, "user", userText);
         await storage.addMessage(userId, "assistant", weatherText);
         return;
@@ -1023,7 +1064,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - 24-BIT TTS + COMMANDS + wttr.in WEATHER + AI-DRIVEN");
+    console.log("ESP connected - TRUE 24-BIT TTS + COMMANDS + PERSISTENT VOL + RESTART AFTER TTS");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
@@ -1031,11 +1072,11 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     ws.on("message", async (data: any, isBinary: boolean) => {
       messageCount++;
       const currentMsgNum = messageCount;
-      
+
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
-        
+
         if (msg === "READY") { 
           ws.send("STATE:IDLE"); 
         }
@@ -1058,7 +1099,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           if (sttSession && sttSession.isRecording) {
             sttSession.isRecording = false;
             console.log("[STT] Finalizing, buffer size:", sttSession.audioBuffer.length);
-            
+
             const text = await processFinalSTT(sttSession);
             if (text) {
               ws.send("STT_RESULT:" + text);
@@ -1080,21 +1121,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         }
         return;
       }
-      
+
       const chunkLen = Buffer.from(data).length;
       console.log("[WS] BINARY #" + currentMsgNum + ":", chunkLen, "bytes");
-      
+
       if (!sttSession || !sttSession.isRecording) {
         return;
       }
-      
+
       const chunk = Buffer.from(data);
-      
+
       const maxBytes = STT_STREAM_SAMPLE_RATE * 2 * STT_MAX_AUDIO_SECONDS;
       if (sttSession.audioBuffer.length + chunk.length > maxBytes) {
         console.log("[STT] Buffer full, forcing finalize");
         sttSession.isRecording = false;
-        
+
         const text = await processFinalSTT(sttSession);
         if (text) {
           ws.send("STT_RESULT:" + text);
@@ -1106,7 +1147,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         sttSession = null;
         return;
       }
-      
+
       sttSession.audioBuffer = Buffer.concat([sttSession.audioBuffer, chunk]);
     });
 
@@ -1117,7 +1158,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       }
       currentUserId = null; 
     });
-    
+
     ws.on("error", (err) => console.error("[WS] Error:", err.message));
 
     const pingInterval = setInterval(() => {
