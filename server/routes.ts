@@ -353,44 +353,44 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
 }
 
 // ============================================================================
-// PCM GENERATION — TRUE 24-BIT CLEAN OUTPUT (NO BASS CRACKING)
+// PCM GENERATION — FIXED FILTER CHAIN (Compatible with all FFmpeg versions)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp24 = path.join(AUDIO_DIR, "raw24_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        // Step 1: High quality resample to 24kHz
-        "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=33:osf=s24",
-        // Step 2: Format as 24-bit mono
-        "aformat=sample_fmts=s32:channel_layouts=mono",
-        // Step 3: Clean high-pass to remove sub-bass rumble (causes cracking on small speakers)
-        "highpass=f=120:dB=24:p=2",
-        // Step 4: Low-pass to remove harsh highs above 12kHz
-        "lowpass=f=12000:dB=12:p=2",
-        // Step 5: Gentle volume (0.92 = safe headroom)
+        // Step 1: Resample to 24kHz using soxr (best quality resampler)
+        "aresample=24000:resampler=soxr:precision=33",
+        // Step 2: Convert to 32-bit float (internal processing)
+        "aformat=sample_fmts=flt:channel_layouts=mono",
+        // Step 3: High-pass filter — REMOVE sub-bass that cracks small speakers
+        "highpass=f=120:dB=24",
+        // Step 4: Low-pass filter — smooth harsh highs above 12kHz  
+        "lowpass=f=12000:dB=12",
+        // Step 5: Volume with headroom (0.92 = safe, no clipping)
         "volume=0.92",
-        // Step 6: Dynamic normalization (smooth, not aggressive)
-        "dynaudnorm=f=150:g=25:p=0.95:m=5:r=0.8",
-        // Step 7: Loudness normalization (broadcast standard)
-        "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-20:measured_TP=-3:measured_LRA=8",
-        // Step 8: De-esser to reduce sibilance harshness
-        "adeclick=ar=2",
-        // Step 9: Slight presence boost for clarity (3-5kHz human voice fundamental)
-        "equalizer=f=3500:t=h:width=800:g=1.5:w=0.3",
-        // Step 10: Air/presence for intelligibility
-        "equalizer=f=8000:t=h:width=2000:g=1:w=0.3"
+        // Step 6: Gentle dynamic normalization (prevents pumping)
+        "dynaudnorm=f=150:g=25:p=0.95",
+        // Step 7: Voice clarity boost at 3.5kHz (human speech fundamental)
+        "equalizer=f=3500:t=h:width=800:g=2",
+        // Step 8: Air/presence boost for intelligibility
+        "equalizer=f=8000:t=h:width=2000:g=1",
+        // Step 9: Final format — 32-bit integer output
+        "aformat=sample_fmts=s32:channel_layouts=mono"
       ])
-      // Output as 32-bit float (ESP32 will handle as 24-bit effective)
       .audioCodec("pcm_s32le")
       .audioChannels(1)
-      .audioFrequency(AI_SAMPLE_RATE)
+      .audioFrequency(24000)
       .format("s32le")
-      .on("error", reject)
+      .on("error", (err) => {
+        console.error("[PCM] FFmpeg error:", err.message);
+        reject(err);
+      })
       .on("end", () => { 
         const pcm = fs.readFileSync(tmp24); 
         fs.unlinkSync(tmp24); 
-        console.log("[PCM] 24-bit clean output:", pcm.length, "bytes (", pcm.length/4, "samples @ 24kHz =", (pcm.length/4/AI_SAMPLE_RATE).toFixed(2), "s)");
+        console.log("[PCM] 32-bit clean output:", pcm.length, "bytes (", pcm.length/4, "samples @ 24kHz =", (pcm.length/4/24000).toFixed(2), "s)");
         resolve(pcm); 
       })
       .save(tmp24);
