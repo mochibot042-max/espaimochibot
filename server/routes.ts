@@ -23,19 +23,16 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — MAX QUALITY (24kHz for TTS, 48kHz for music)
+// AUDIO CONFIG — MAX QUALITY AI RESPONSE (16kHz MONO for ESP32 compatibility)
 // ============================================================================
-// NOTE: msedge-tts library supports WEBM_24KHZ_16BIT_MONO_OPUS as max reliable format
-// We resample to 48kHz after TTS for cleaner output on ESP32
-const AI_SAMPLE_RATE = 48000;      // Output to ESP32 at 48kHz
-const TTS_SAMPLE_RATE = 24000;     // TTS generates at 24kHz
-const AI_CHUNK_SIZE_MONO = 2048;   // 48kHz chunk size
-const SEND_INTERVAL_MS_AI = 21;    // ~48 chunks/sec for 48kHz
+const AI_SAMPLE_RATE = 16000;
+const AI_CHUNK_SIZE_MONO = 1024;
+const SEND_INTERVAL_MS_AI = 28;
 const PREBUFFER_CHUNKS_AI = 24;
 
-const MUSIC_SAMPLE_RATE = 48000;
+const MUSIC_SAMPLE_RATE = 44100;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
-const SEND_INTERVAL_MS_MUSIC = 21;
+const SEND_INTERVAL_MS_MUSIC = 20;
 const PREBUFFER_CHUNKS_MUSIC = 32;
 
 // ============================================================================
@@ -128,78 +125,6 @@ function extractName(text: string): { action: "save" | "delete" | "none"; name: 
 }
 
 // ============================================================================
-// VOLUME COMMAND DETECTION
-// ============================================================================
-function extractVolumeCommand(text: string): { action: "set" | "none"; volume: number | null } {
-  const lower = text.toLowerCase();
-  const volumePatterns = [
-    /(?:set\s+(?:your\s+)?)?volume\s+(?:to\s+)?(\d+)%?/i,
-    /(?:set\s+(?:your\s+)?)?volume\s+(?:to\s+)?(\d+(?:\.\d+)?)/i,
-    /volume\s+(?:into\s+)?(\d+)%?/i,
-    /palakasin\s+(?:ang\s+)?volume\s+(?:sa\s+)?(\d+)%?/i,
-    /hinaan\s+(?:ang\s+)?volume\s+(?:sa\s+)?(\d+)%?/i,
-  ];
-  for (const pattern of volumePatterns) {
-    const match = lower.match(pattern);
-    if (match && match[1]) {
-      let vol = parseFloat(match[1]);
-      if (vol > 1) vol = vol / 100;
-      if (vol >= 0 && vol <= 1.5) return { action: "set", volume: Math.min(vol, 1.0) };
-    }
-  }
-  return { action: "none", volume: null };
-}
-
-// ============================================================================
-// LED COLOR COMMAND DETECTION
-// ============================================================================
-function extractLedCommand(text: string): { action: "set" | "none"; color: string | null } {
-  const lower = text.toLowerCase();
-  const colorMap: Record<string, string> = {
-    "red": "RED", "green": "GREEN", "blue": "BLUE", "yellow": "YELLOW",
-    "cyan": "CYAN", "magenta": "MAGENTA", "white": "WHITE", "orange": "ORANGE",
-    "purple": "PURPLE", "pink": "PINK", "off": "OFF", "black": "OFF",
-    "pula": "RED", "berde": "GREEN", "asul": "BLUE", "dilaw": "YELLOW",
-    "puti": "WHITE"
-  };
-
-  const ledPatterns = [
-    /(?:set|change|gawin|gawing)\s+(?:ang\s+)?(?:led|light|color|ilaw|neonpixel|neon)\s+(?:to\s+|sa\s+)?(\w+)/i,
-    /(?:set|change)\s+(?:the\s+)?(?:led|light|color|neonpixel|neon)\s+(?:to\s+)?(\w+)/i,
-    /(?:ilaw|led|neonpixel|neon)\s+(?:na\s+)?(\w+)/i,
-    /(?:gawing|set)\s+(\w+)\s+(?:ang\s+)?(?:ilaw|led|neonpixel|neon)/i,
-  ];
-
-  for (const pattern of ledPatterns) {
-    const match = lower.match(pattern);
-    if (match && match[1]) {
-      const colorKey = match[1].toLowerCase();
-      if (colorMap[colorKey]) {
-        return { action: "set", color: colorMap[colorKey] };
-      }
-    }
-  }
-  return { action: "none", color: null };
-}
-
-// ============================================================================
-// RESTART COMMAND DETECTION
-// ============================================================================
-function isRestartCommand(text: string): boolean {
-  const lower = text.toLowerCase();
-  const restartPatterns = [
-    /restart\s+(?:the\s+)?(?:system|device|robot|esp)/i,
-    /reboot\s+(?:the\s+)?(?:system|device|robot|esp)/i,
-    /i\s+restart\s+mo/i,
-    /mag\s*restart\s*ka/i,
-    /restart\s*ka/i,
-    /restart\s+now/i,
-    /mag\s*reboot\s*ka/i,
-  ];
-  return restartPatterns.some(p => p.test(lower));
-}
-
-// ============================================================================
 // LANGUAGE DETECTION
 // ============================================================================
 function detectLanguage(text: string): "en" | "fil" {
@@ -254,12 +179,12 @@ async function fetchWeather(): Promise<WeatherData | null> {
       headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
       signal: AbortSignal.timeout(15000)
     });
-
+    
     if (!response.ok) {
       console.error("[WEATHER] API error:", response.status);
       return null;
     }
-
+    
     const data = await response.json();
     const current = data.current_condition[0];
     const area = data.nearest_area[0];
@@ -322,87 +247,52 @@ function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string
 }
 
 // ============================================================================
-// EDGE TTS — WITH FALLBACK + RETRY (FIXED)
+// EDGE TTS — MAX QUALITY (24kHz 96kbps — best balance for voice)
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
-    let attempts = 0;
-    const maxAttempts = 3;
-
-    while (attempts < maxAttempts) {
-      attempts++;
-      try {
-        const tts = new MsEdgeTTS();
-        const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
-
-        // Use WEBM Opus format — most reliable and highest quality for msedge-tts
-        await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-
-        const { audioStream } = tts.toStream(text);
-        const chunks: Buffer[] = [];
-
-        audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
-
-        audioStream.on("end", () => {
-          const buf = Buffer.concat(chunks);
-          if (buf.length < 100) {
-            console.log(`[TTS] Attempt ${attempts}: Empty audio received, retrying...`);
-            if (attempts >= maxAttempts) {
-              return reject(new Error("Edge TTS returned empty audio after all retries"));
-            }
-            // Will retry in next loop iteration
-            return;
-          }
-          fs.writeFileSync(outputPath, buf);
-          console.log("[TTS] SUCCESS", voice, "WEBM/Opus 24kHz, size:", buf.length, "bytes, attempts:", attempts);
-          resolve();
-        });
-
-        audioStream.on("error", (err: Error) => {
-          console.log(`[TTS] Attempt ${attempts}: Stream error:`, err.message);
-          if (attempts >= maxAttempts) {
-            reject(err);
-          }
-          // Will retry
-        });
-
-        // Wait for this attempt to finish before retrying
-        return;
-
-      } catch (err: any) {
-        console.log(`[TTS] Attempt ${attempts}: Error:`, err.message);
-        if (attempts >= maxAttempts) {
-          reject(err);
-        }
-      }
-
-      // Small delay before retry
-      await new Promise(r => setTimeout(r, 500));
+    try {
+      const tts = new MsEdgeTTS();
+      const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
+      // MAX QUALITY: 24kHz 96kbps mono MP3 (best for voice streaming)
+      await tts.setMetadata(
+        voice,
+        OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
+      );
+      const { audioStream } = tts.toStream(text);
+      const chunks: Buffer[] = [];
+      audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      audioStream.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
+        fs.writeFileSync(outputPath, buf);
+        console.log("[TTS] MAX QUALITY", voice, "24kHz/96kbps, size:", buf.length);
+        resolve();
+      });
+      audioStream.on("error", reject);
+    } catch (err: any) {
+      reject(err);
     }
   });
 }
 
 // ============================================================================
-// PCM GENERATION — 48kHz CLEAN, NO BASS BOOST, MAX QUALITY
+// PCM GENERATION — ENHANCED FOR CLARITY
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
+        "highpass=f=60",           // Lower cutoff for more bass
+        "lowpass=f=8500",          // Slightly higher for clarity
         "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=0.95",
-        "dynaudnorm=p=0.95:g=15",
-        "loudnorm=I=-16:TP=-2.0:LRA=11",
-        "highpass=f=60",                    // Remove sub-bass rumble
-        "equalizer=f=100:t=h:width=50:g=-2",  // Reduce low bass to prevent cracking
-        "equalizer=f=3000:t=h:width=500:g=2",   // Boost clarity/voice
-        "equalizer=f=8000:t=h:width=1000:g=1"   // Slight high-end sparkle
+        "volume=1.0",              // Full volume (was 0.85)
+        "dynaudnorm=p=0.95:g=15",  // Dynamic normalization
+        "loudnorm=I=-14:TP=-1.0:LRA=11"  // Broadcast loudness
       ])
-      .audioCodec("pcm_s16le")
-      .audioChannels(1)
-      .audioFrequency(AI_SAMPLE_RATE)
+      .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(AI_SAMPLE_RATE)
       .format("s16le")
       .on("error", reject)
       .on("end", () => { const pcm = fs.readFileSync(tmp); fs.unlinkSync(tmp); resolve(pcm); })
@@ -447,14 +337,14 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (48kHz MONO MAX QUALITY)
+// STREAM AI RESPONSE PCM (16kHz MONO)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
 
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE_MONO) * AI_CHUNK_SIZE_MONO;
   const totalChunks = alignedLen / AI_CHUNK_SIZE_MONO;
-  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms", "prebuffer:", PREBUFFER_CHUNKS_AI, "rate:", AI_SAMPLE_RATE, "Hz");
+  console.log("[STREAM] AI:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_AI, "ms", "prebuffer:", PREBUFFER_CHUNKS_AI);
 
   ws.send("SESSION:" + sessionId);
   await delay(100);
@@ -477,7 +367,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 
   ws.send("START_RESPONSE");
   await delay(100);
-  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", Math.round(prebufferLimit * AI_CHUNK_SIZE_MONO / 2 / AI_SAMPLE_RATE * 1000), "ms), started playback");
+  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", prebufferLimit * 32, "ms), started playback");
 
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE_MONO; i < alignedLen; i += AI_CHUNK_SIZE_MONO) {
@@ -506,22 +396,22 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING (48kHz MAX QUALITY)
+// REAL-TIME MUSIC STREAMING
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC, "rate:", MUSIC_SAMPLE_RATE, "Hz");
+  console.log("[MUSIC] Starting stream:", sessionId, "chunkSize:", MUSIC_CHUNK_SIZE_MONO, "interval:", SEND_INTERVAL_MS_MUSIC, "ms", "prebuffer:", PREBUFFER_CHUNKS_MUSIC);
 
   return new Promise<void>((resolve, reject) => {
     const ffmpegArgs = [
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
+      "-af", "highpass=f=60,lowpass=f=18000,aresample=44100:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "48000",
+      "-ar", "44100",
       "-f", "s16le",
       "pipe:1"
     ];
@@ -589,7 +479,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * MUSIC_CHUNK_SIZE_MONO / 2 / MUSIC_SAMPLE_RATE * 1000), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 23.2), "ms), starting stream...");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
@@ -686,11 +576,11 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     console.log("[STT] Audio too short, ignoring");
     return null;
   }
-
+  
   const tmpWav = path.join(UPLOAD_DIR, session.sessionId + "_stt.wav");
   const tmpClean = path.join(UPLOAD_DIR, session.sessionId + "_clean.wav");
   const dataLen = session.audioBuffer.length;
-
+  
   try {
     const wavBuffer = Buffer.alloc(44 + dataLen);
     wavBuffer.write("RIFF", 0);
@@ -707,7 +597,7 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
     wavBuffer.write("data", 36);
     wavBuffer.writeUInt32LE(dataLen, 40);
     session.audioBuffer.copy(wavBuffer, 44);
-
+    
     fs.writeFileSync(tmpWav, wavBuffer);
     console.log("[STT] WAV saved:", dataLen, "bytes (~", (dataLen/2/16000).toFixed(2), "seconds)");
 
@@ -740,17 +630,17 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
       }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("STT_TIMEOUT")), 15000))
     ]);
-
+    
     const text = stt.text?.trim();
-
+    
     try { fs.unlinkSync(tmpWav); } catch {}
     try { fs.unlinkSync(tmpClean); } catch {}
-
+    
     if (!text) {
       console.log("[STT] No speech detected");
       return null;
     }
-
+    
     console.log("[STT] RESULT:", text);
     return text;
   } catch (e: any) {
@@ -765,15 +655,11 @@ async function processFinalSTT(session: StreamingSTTSession): Promise<string | n
 // AI-DRIVEN PROCESSOR — LLM DECIDES EVERYTHING
 // ============================================================================
 interface AIAction {
-  type: "chat" | "weather" | "music" | "command";
+  type: "chat" | "weather" | "music";
   text: string;
   music?: string | null;
   weather?: boolean;
   lang: "en" | "fil";
-  command?: {
-    type: "volume" | "led" | "restart" | null;
-    value: string | number | null;
-  };
 }
 
 async function getAIDecision(userText: string, history: any[], savedName: string | null): Promise<AIAction> {
@@ -784,32 +670,26 @@ CRITICAL RULES:
 2. Detect the user's language (English or Filipino/Tagalog) and respond in that same language.
 3. If the user asks about weather, temperature, rain, forecast, or anything related to current conditions, set "type": "weather" and "weather": true.
 4. If the user wants to play music or a song, set "type": "music" and provide the "music" search query.
-5. If the user asks to set volume, change LED color, or restart the system, set "type": "command" with "command" details.
-6. For normal conversation, set "type": "chat".
-7. Keep responses natural, concise, and conversational (1-2 sentences max for voice).
+5. For normal conversation, set "type": "chat".
+6. Keep responses natural, concise, and conversational (1-2 sentences max for voice).
+7. If the user says something vague like "play music" without specifying a song, ask what song they want.
 
 JSON FORMAT:
 {
-  "type": "chat" | "weather" | "music" | "command",
+  "type": "chat" | "weather" | "music",
   "text": "your response text",
   "music": "song search query or null",
   "weather": true or false,
-  "lang": "en" or "fil",
-  "command": {
-    "type": "volume" | "led" | "restart" | null,
-    "value": "command value or null"
-  }
+  "lang": "en" or "fil"
 }
 
 Examples:
-- "What's the weather?" -> {"type":"weather","text":"Let me check the weather for you.","weather":true,"music":null,"lang":"en","command":null}
-- "Set volume to 50%" -> {"type":"command","text":"Volume set to 50%.","weather":false,"music":null,"lang":"en","command":{"type":"volume","value":"0.5"}}
-- "Set LED to red" -> {"type":"command","text":"LED color set to red.","weather":false,"music":null,"lang":"en","command":{"type":"led","value":"RED"}}
-- "Gawing pula ang ilaw" -> {"type":"command","text":"Ginawang pula ang ilaw.","weather":false,"music":null,"lang":"fil","command":{"type":"led","value":"RED"}}
-- "Restart the system" -> {"type":"command","text":"Restarting the system now.","weather":false,"music":null,"lang":"en","command":{"type":"restart","value":null}}
-- "Mag restart ka" -> {"type":"command","text":"Magrerestart na ako.","weather":false,"music":null,"lang":"fil","command":{"type":"restart","value":null}}
-- "Play Tibok" -> {"type":"music","text":"Playing Tibok by Earl Agustin","music":"Tibok by Earl Agustin","weather":false,"lang":"en","command":null}
-- "Hello" -> {"type":"chat","text":"Hello! How can I help you today?","music":null,"weather":false,"lang":"en","command":null}
+- "What's the weather?" -> {"type":"weather","text":"Let me check the weather for you.","weather":true,"music":null,"lang":"en"}
+- "Kumusta ang panahon?" -> {"type":"weather","text":"Tingnan ko ang panahon ngayon.","weather":true,"music":null,"lang":"fil"}
+- "Play Tibok" -> {"type":"music","text":"Playing Tibok by Earl Agustin","music":"Tibok by Earl Agustin","weather":false,"lang":"en"}
+- "Tumugtog ka ng music" -> {"type":"music","text":"Anong kanta gusto mo?","music":null,"weather":false,"lang":"fil"}
+- "Hello" -> {"type":"chat","text":"Hello! How can I help you today?","music":null,"weather":false,"lang":"en"}
+- "Kumusta" -> {"type":"chat","text":"Mabuti naman! Paano kita matutulungan?","music":null,"weather":false,"lang":"fil"}
 
 Return ONLY the JSON object.`;
 
@@ -823,7 +703,7 @@ Return ONLY the JSON object.`;
     llmClient.chat.completions.create({ 
       model: "llama-3.3-70b-versatile", 
       messages, 
-      max_tokens: 250, 
+      max_tokens: 200, 
       temperature: 0.3 
     }),
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("LLM_TIMEOUT")), 10000))
@@ -839,56 +719,19 @@ Return ONLY the JSON object.`;
       text: parsed.text || "Sorry, I didn't understand.",
       music: parsed.music || null,
       weather: parsed.weather === true,
-      lang: parsed.lang || detectLanguage(userText),
-      command: parsed.command || { type: null, value: null }
+      lang: parsed.lang || detectLanguage(userText)
     };
   } catch {
-    // Fallback detection
     const lower = raw.toLowerCase();
     const lang = detectLanguage(userText);
-
-    const volCmd = extractVolumeCommand(userText);
-    if (volCmd.action === "set") {
-      return { 
-        type: "command", 
-        text: `Volume set to ${Math.round(volCmd.volume! * 100)}%.`, 
-        music: null, 
-        weather: false, 
-        lang,
-        command: { type: "volume", value: volCmd.volume!.toString() }
-      };
-    }
-
-    const ledCmd = extractLedCommand(userText);
-    if (ledCmd.action === "set") {
-      return { 
-        type: "command", 
-        text: `LED color set to ${ledCmd.color}.`, 
-        music: null, 
-        weather: false, 
-        lang,
-        command: { type: "led", value: ledCmd.color }
-      };
-    }
-
-    if (isRestartCommand(userText)) {
-      return { 
-        type: "command", 
-        text: "Restarting the system now.", 
-        music: null, 
-        weather: false, 
-        lang,
-        command: { type: "restart", value: null }
-      };
-    }
-
+    
     if (lower.includes("weather") || lower.includes("panahon") || lower.includes("temperature")) {
-      return { type: "weather", text: raw, music: null, weather: true, lang, command: { type: null, value: null } };
+      return { type: "weather", text: raw, music: null, weather: true, lang };
     }
     if (lower.includes("music") || lower.includes("song") || lower.includes("kanta") || lower.includes("tumugtog")) {
-      return { type: "music", text: raw, music: null, weather: false, lang, command: { type: null, value: null } };
+      return { type: "music", text: raw, music: null, weather: false, lang };
     }
-    return { type: "chat", text: raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(), music: null, weather: false, lang, command: { type: null, value: null } };
+    return { type: "chat", text: raw.replace(/[{}"]/g, "").replace(/text:/g, "").trim(), music: null, weather: false, lang };
   }
 }
 
@@ -897,10 +740,9 @@ Return ONLY the JSON object.`;
 // ============================================================================
 async function processAIResponse(ws: WebSocket, userText: string, userId: number, sessionId: string) {
   if (isDuplicate(userId)) { ws.send("ERROR:PROCESSING_BUSY"); return; }
-
+  
   const filesToCleanup: string[] = [];
-  let needsRestart = false;
-
+  
   try {
     const nameAction = extractName(userText);
     let nameResponse = "";
@@ -916,7 +758,7 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
     const savedName = await storage.getSavedName(userId);
 
     const action = await getAIDecision(userText, history, savedName);
-    console.log("[AI DECISION]", action.type, "lang:", action.lang, "weather:", action.weather, "music:", action.music, "command:", action.command);
+    console.log("[AI DECISION]", action.type, "lang:", action.lang, "weather:", action.weather, "music:", action.music);
 
     let finalText = action.text;
     let musicQuery = action.music;
@@ -926,59 +768,20 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
       musicQuery = null;
     }
 
-    // Handle Commands (Volume, LED, Restart)
-    if (action.type === "command" && action.command && action.command.type) {
-      const cmd = action.command;
-
-      if (cmd.type === "volume" && cmd.value) {
-        const volValue = parseFloat(cmd.value as string);
-        if (!isNaN(volValue) && volValue >= 0 && volValue <= 1.5) {
-          ws.send("VOLUME:" + volValue.toFixed(2));
-          console.log("[COMMAND] Volume set to", volValue);
-        }
-      }
-      else if (cmd.type === "led" && cmd.value) {
-        ws.send("LED:" + cmd.value);
-        console.log("[COMMAND] LED set to", cmd.value);
-      }
-      else if (cmd.type === "restart") {
-        needsRestart = true;
-        console.log("[COMMAND] Restart scheduled after TTS");
-      }
-
-      // Still speak the confirmation
-      const mp3 = path.join(AUDIO_DIR, sessionId + "_cmd.mp3");
-      filesToCleanup.push(mp3);
-      await generateEdgeTTS(finalText, mp3, action.lang);
-      const pcm = await generatePCM(mp3);
-      await streamPCM(ws, pcm, sessionId);
-
-      await storage.addMessage(userId, "user", userText);
-      await storage.addMessage(userId, "assistant", finalText);
-
-      // Send restart command AFTER TTS finishes
-      if (needsRestart) {
-        await delay(800);
-        ws.send("RESTART:NOW");
-        console.log("[COMMAND] Restart signal sent after TTS");
-      }
-      return;
-    }
-
     // Handle Weather (AI decided)
     if (action.type === "weather" || action.weather) {
       const weather = await fetchWeather();
       if (weather) {
         const weatherText = formatWeatherResponse(weather, action.lang);
         console.log("[WEATHER] Response:", weatherText);
-
+        
         const mp3 = path.join(AUDIO_DIR, sessionId + "_weather.mp3");
         filesToCleanup.push(mp3);
-
+        
         await generateEdgeTTS(weatherText, mp3, action.lang);
         const pcm = await generatePCM(mp3);
         await streamPCM(ws, pcm, sessionId);
-
+        
         await storage.addMessage(userId, "user", userText);
         await storage.addMessage(userId, "assistant", weatherText);
         return;
@@ -1062,7 +865,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected - 48kHz MAX TTS + COMMANDS + wttr.in WEATHER + AI-DRIVEN");
+    console.log("ESP connected - MAX QUALITY TTS + wttr.in WEATHER + AI-DRIVEN");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
@@ -1070,11 +873,11 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     ws.on("message", async (data: any, isBinary: boolean) => {
       messageCount++;
       const currentMsgNum = messageCount;
-
+      
       if (!isBinary) {
         const msg = data.toString();
         console.log("[WS] TEXT #" + currentMsgNum + ":", msg);
-
+        
         if (msg === "READY") { 
           ws.send("STATE:IDLE"); 
         }
@@ -1097,7 +900,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           if (sttSession && sttSession.isRecording) {
             sttSession.isRecording = false;
             console.log("[STT] Finalizing, buffer size:", sttSession.audioBuffer.length);
-
+            
             const text = await processFinalSTT(sttSession);
             if (text) {
               ws.send("STT_RESULT:" + text);
@@ -1119,21 +922,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         }
         return;
       }
-
+      
       const chunkLen = Buffer.from(data).length;
       console.log("[WS] BINARY #" + currentMsgNum + ":", chunkLen, "bytes");
-
+      
       if (!sttSession || !sttSession.isRecording) {
         return;
       }
-
+      
       const chunk = Buffer.from(data);
-
+      
       const maxBytes = STT_STREAM_SAMPLE_RATE * 2 * STT_MAX_AUDIO_SECONDS;
       if (sttSession.audioBuffer.length + chunk.length > maxBytes) {
         console.log("[STT] Buffer full, forcing finalize");
         sttSession.isRecording = false;
-
+        
         const text = await processFinalSTT(sttSession);
         if (text) {
           ws.send("STT_RESULT:" + text);
@@ -1145,7 +948,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         sttSession = null;
         return;
       }
-
+      
       sttSession.audioBuffer = Buffer.concat([sttSession.audioBuffer, chunk]);
     });
 
@@ -1156,7 +959,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       }
       currentUserId = null; 
     });
-
+    
     ws.on("error", (err) => console.error("[WS] Error:", err.message));
 
     const pingInterval = setInterval(() => {
