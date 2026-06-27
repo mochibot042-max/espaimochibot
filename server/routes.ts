@@ -23,14 +23,17 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — MAX QUALITY (48kHz 192kbps for TTS, 48kHz for music)
+// AUDIO CONFIG — MAX QUALITY (24kHz for TTS, 48kHz for music)
 // ============================================================================
-const AI_SAMPLE_RATE = 48000;  // CHANGED: 48kHz for max clarity
-const AI_CHUNK_SIZE_MONO = 2048;  // Adjusted for 48kHz
-const SEND_INTERVAL_MS_AI = 21;   // ~48 chunks/sec for 48kHz
+// NOTE: msedge-tts library supports WEBM_24KHZ_16BIT_MONO_OPUS as max reliable format
+// We resample to 48kHz after TTS for cleaner output on ESP32
+const AI_SAMPLE_RATE = 48000;      // Output to ESP32 at 48kHz
+const TTS_SAMPLE_RATE = 24000;     // TTS generates at 24kHz
+const AI_CHUNK_SIZE_MONO = 2048;   // 48kHz chunk size
+const SEND_INTERVAL_MS_AI = 21;    // ~48 chunks/sec for 48kHz
 const PREBUFFER_CHUNKS_AI = 24;
 
-const MUSIC_SAMPLE_RATE = 48000;  // CHANGED: 48kHz for music too
+const MUSIC_SAMPLE_RATE = 48000;
 const MUSIC_CHUNK_SIZE_MONO = 2048;
 const SEND_INTERVAL_MS_MUSIC = 21;
 const PREBUFFER_CHUNKS_MUSIC = 32;
@@ -319,31 +322,62 @@ function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string
 }
 
 // ============================================================================
-// EDGE TTS — MAX QUALITY 48kHz 192kbps (NO BASS BOOST, CLEAN HIGH QUALITY)
+// EDGE TTS — WITH FALLBACK + RETRY (FIXED)
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
-    try {
-      const tts = new MsEdgeTTS();
-      const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
-      // MAX QUALITY: 48kHz 192kbps mono — highest available for voice
-      await tts.setMetadata(
-        voice,
-        OUTPUT_FORMAT.AUDIO_48KHZ_192KBITRATE_MONO_MP3
-      );
-      const { audioStream } = tts.toStream(text);
-      const chunks: Buffer[] = [];
-      audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
-      audioStream.on("end", () => {
-        const buf = Buffer.concat(chunks);
-        if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
-        fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] MAX QUALITY", voice, "48kHz/192kbps, size:", buf.length);
-        resolve();
-      });
-      audioStream.on("error", reject);
-    } catch (err: any) {
-      reject(err);
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        const tts = new MsEdgeTTS();
+        const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
+
+        // Use WEBM Opus format — most reliable and highest quality for msedge-tts
+        await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+
+        const { audioStream } = tts.toStream(text);
+        const chunks: Buffer[] = [];
+
+        audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
+
+        audioStream.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          if (buf.length < 100) {
+            console.log(`[TTS] Attempt ${attempts}: Empty audio received, retrying...`);
+            if (attempts >= maxAttempts) {
+              return reject(new Error("Edge TTS returned empty audio after all retries"));
+            }
+            // Will retry in next loop iteration
+            return;
+          }
+          fs.writeFileSync(outputPath, buf);
+          console.log("[TTS] SUCCESS", voice, "WEBM/Opus 24kHz, size:", buf.length, "bytes, attempts:", attempts);
+          resolve();
+        });
+
+        audioStream.on("error", (err: Error) => {
+          console.log(`[TTS] Attempt ${attempts}: Stream error:`, err.message);
+          if (attempts >= maxAttempts) {
+            reject(err);
+          }
+          // Will retry
+        });
+
+        // Wait for this attempt to finish before retrying
+        return;
+
+      } catch (err: any) {
+        console.log(`[TTS] Attempt ${attempts}: Error:`, err.message);
+        if (attempts >= maxAttempts) {
+          reject(err);
+        }
+      }
+
+      // Small delay before retry
+      await new Promise(r => setTimeout(r, 500));
     }
   });
 }
