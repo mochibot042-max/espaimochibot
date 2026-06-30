@@ -23,16 +23,16 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — MAX QUALITY AI RESPONSE (16kHz MONO for ESP32 compatibility)
+// AUDIO CONFIG — MAX QUALITY AI RESPONSE (48kHz MONO for PCM5100A)
 // ============================================================================
-const AI_SAMPLE_RATE = 16000;
-const AI_CHUNK_SIZE_MONO = 1024;
-const SEND_INTERVAL_MS_AI = 28;
-const PREBUFFER_CHUNKS_AI = 24;
+const AI_SAMPLE_RATE = 48000;        // ← WAS 16000, NOW 48000 to match ESP32
+const AI_CHUNK_SIZE_MONO = 2048;     // ← WAS 1024, adjusted for 48kHz
+const SEND_INTERVAL_MS_AI = 21;      // ← WAS 28, adjusted: 2048/(48000*2) * 1000 ≈ 21ms
+const PREBUFFER_CHUNKS_AI = 32;      // ← WAS 24, more prebuffer for 48kHz
 
-const MUSIC_SAMPLE_RATE = 44100;
+const MUSIC_SAMPLE_RATE = 48000;     // ← WAS 44100, match everything to 48kHz
 const MUSIC_CHUNK_SIZE_MONO = 2048;
-const SEND_INTERVAL_MS_MUSIC = 20;
+const SEND_INTERVAL_MS_MUSIC = 21;
 const PREBUFFER_CHUNKS_MUSIC = 32;
 
 // ============================================================================
@@ -277,20 +277,20 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
 }
 
 // ============================================================================
-// PCM GENERATION — ENHANCED FOR CLARITY
+// PCM GENERATION — FIXED: 48kHz output, reduced volume, no clipping
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .audioFilters([
-        "highpass=f=60",           // Lower cutoff for more bass
-        "lowpass=f=8500",          // Slightly higher for clarity
+        "highpass=f=80",              // ← WAS 60, remove more rumble
+        "lowpass=f=14000",            // ← WAS 8500, allow more highs at 48kHz
         "aresample=" + AI_SAMPLE_RATE + ":resampler=soxr:precision=28",
         "aformat=sample_fmts=s16:channel_layouts=mono",
-        "volume=1.0",              // Full volume (was 0.85)
-        "dynaudnorm=p=0.95:g=15",  // Dynamic normalization
-        "loudnorm=I=-14:TP=-1.0:LRA=11"  // Broadcast loudness
+        "volume=0.55",                // ← WAS 1.0, REDUCED to prevent clipping!
+        "dynaudnorm=p=0.90:g=10",     // ← WAS p=0.95:g=15, gentler normalization
+        "alimiter=level=false:limit=-3dB:release=100"  // ← NEW! Hard limiter prevents any clipping
       ])
       .audioCodec("pcm_s16le").audioChannels(1).audioFrequency(AI_SAMPLE_RATE)
       .format("s16le")
@@ -299,7 +299,6 @@ async function generatePCM(input: string): Promise<Buffer> {
       .save(tmp);
   });
 }
-
 // ============================================================================
 // MOSTAKIM MUSIC API
 // ============================================================================
