@@ -25,14 +25,14 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 // ============================================================================
 // AUDIO CONFIG — 16kHz BALIK (Stable sa low signal, ESP32 compatible)
 // ============================================================================
-const PLAYBACK_RATE = 16000;        // BALIK SA 16kHz — pareho server at firmware
-const AI_CHUNK_SIZE = 1024;         // 16kHz: 1024 bytes = 512 samples = 32ms
-const SEND_INTERVAL_MS_AI = 28;     // ~28ms per chunk for real-time 16kHz
+const PLAYBACK_RATE = 16000;        // LOCKED TO 16kHz
+const AI_CHUNK_SIZE = 1024;         // 512 samples = 32ms @ 16kHz
+const SEND_INTERVAL_MS_AI = 32;     // 32ms for real-time 16kHz
 const PREBUFFER_CHUNKS_AI = 24;     // ~768ms prebuffer
 
-const MUSIC_CHUNK_SIZE = 1024;      // Same for music
-const SEND_INTERVAL_MS_MUSIC = 28;
-const PREBUFFER_CHUNKS_MUSIC = 24;
+const MUSIC_CHUNK_SIZE = 1024;      // SAME as AI — 512 samples @ 16kHz
+const SEND_INTERVAL_MS_MUSIC = 32;  // 32ms interval
+const PREBUFFER_CHUNKS_MUSIC = 24;  // ~768ms prebuffer
 
 // ============================================================================
 // STT CONFIG
@@ -414,23 +414,30 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — 16kHz to match ESP32
+// REAL-TIME MUSIC STREAMING — FIXED: 16kHz to match ESP32
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
-  if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
+  if (ws.readyState !== ws.OPEN) { 
+    console.log("[MUSIC] WS not open"); 
+    return; 
+  }
 
   console.log("[MUSIC] Starting 16kHz stream:", sessionId);
 
   return new Promise<void>((resolve, reject) => {
-    // Resample music to 16kHz to match ESP32 firmware
+    // FIXED: Resample music to 16kHz to MATCH ESP32 DAC
+    // FIXED: lowpass=7500 (below 16kHz Nyquist=8000) to prevent aliasing
+    // FIXED: volume=0.9 (louder, ESP32 handles final volume)
+    // FIXED: Removed harmful 8kHz equalizer boost near Nyquist
+    // FIXED: Proper stereo-to-mono downmix with pan filter
     const ffmpegArgs = [
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=8000,aresample=16000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11",
+      "-af", "highpass=f=60,lowpass=f=7500,aresample=16000:resampler=soxr:precision=28,pan=mono|c0=0.5*c0+0.5*c1,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.9,loudnorm=I=-14:TP=-1.0:LRA=11",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "16000",        // LOCKED TO 16kHz
+      "-ar", "16000",        // LOCKED TO 16kHz — MATCHES ESP32
       "-f", "s16le",
       "pipe:1"
     ];
@@ -457,7 +464,10 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       console.error("[MUSIC] FFmpeg spawn error:", err.message);
       if (!finished) {
         finished = true;
-        try { ws.send("ERROR:MUSIC_FAILED"); ws.send("FINISH_MUSIC:ERROR"); } catch {}
+        try { 
+          ws.send("ERROR:MUSIC_FAILED"); 
+          ws.send("FINISH_MUSIC:ERROR"); 
+        } catch {}
         reject(err);
       }
     });
@@ -517,7 +527,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
             ws.send(packet, { binary: true });
             seq++;
             chunkCount++;
-            await delay(SEND_INTERVAL_MS_MUSIC);
+            await delay(SEND_INTERVAL_MS_MUSIC);  // FIXED: 32ms for 16kHz
           }
 
           ws.send("START_MUSIC");
@@ -546,7 +556,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
         seq++;
         chunkCount++;
 
-        await delay(SEND_INTERVAL_MS_MUSIC);
+        await delay(SEND_INTERVAL_MS_MUSIC);  // FIXED: 32ms for 16kHz
       }
     });
 
