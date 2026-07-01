@@ -23,17 +23,16 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ============================================================================
-// AUDIO CONFIG — FULL 48kHz FOR ESP32 (NO MORE CHIPMUNK VOICE)
+// AUDIO CONFIG — 16kHz BALIK (Stable sa low signal, ESP32 compatible)
 // ============================================================================
-// ESP32 DAC is LOCKED at 48kHz — server MUST send at 48kHz
-const PLAYBACK_RATE = 48000;        // ESP32 I2S rate — DO NOT CHANGE
-const AI_CHUNK_SIZE = 2048;         // 48kHz: 2048 bytes = 1024 samples = 21.3ms
-const SEND_INTERVAL_MS_AI = 21;     // ~21ms per chunk for real-time 48kHz
-const PREBUFFER_CHUNKS_AI = 32;     // ~680ms prebuffer
+const PLAYBACK_RATE = 16000;        // BALIK SA 16kHz — pareho server at firmware
+const AI_CHUNK_SIZE = 1024;         // 16kHz: 1024 bytes = 512 samples = 32ms
+const SEND_INTERVAL_MS_AI = 28;     // ~28ms per chunk for real-time 16kHz
+const PREBUFFER_CHUNKS_AI = 24;     // ~768ms prebuffer
 
-const MUSIC_CHUNK_SIZE = 2048;      // Same for music
-const SEND_INTERVAL_MS_MUSIC = 21;
-const PREBUFFER_CHUNKS_MUSIC = 32;
+const MUSIC_CHUNK_SIZE = 1024;      // Same for music
+const SEND_INTERVAL_MS_MUSIC = 28;
+const PREBUFFER_CHUNKS_MUSIC = 24;
 
 // ============================================================================
 // STT CONFIG
@@ -240,54 +239,56 @@ function formatWeatherResponse(weather: WeatherData, lang: "en" | "fil"): string
 }
 
 // ============================================================================
-// EDGE TTS — 48kHz OUTPUT (Server upsamples to match ESP32)
+// EDGE TTS — FIXED: Use supported 24kHz format, then resample to 16kHz
+// ============================================================================
+// BUG FIX: AUDIO_48KHZ_192KBITRATE_MONO_MP3 is NOT supported by msedge-tts
+// Only AUDIO_24KHZ_96KBITRATE_MONO_MP3 and AUDIO_24KHZ_48KBITRATE_MONO_MP3 work
+// We generate at 24kHz then ffmpeg resamples to 16kHz
 // ============================================================================
 async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "fil"): Promise<void> {
   return new Promise(async (resolve, reject) => {
     try {
       const tts = new MsEdgeTTS();
       const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
-      // Use 48kHz output if available, otherwise 24kHz and upsample in PCM generation
+      
+      // FIXED: Use SUPPORTED format — 24kHz 96kbps mono MP3
+      // 48kHz format causes "empty audio" error
       await tts.setMetadata(
         voice,
-        OUTPUT_FORMAT.AUDIO_48KHZ_192KBITRATE_MONO_MP3  // 48kHz if supported
+        OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
       );
+      
       const { audioStream } = tts.toStream(text);
       const chunks: Buffer[] = [];
-      audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      
+      audioStream.on("data", (chunk: Buffer) => {
+        if (chunk && chunk.length > 0) chunks.push(chunk);
+      });
+      
       audioStream.on("end", () => {
+        if (chunks.length === 0) {
+          return reject(new Error("Edge TTS returned empty audio — no chunks received"));
+        }
         const buf = Buffer.concat(chunks);
-        if (buf.length < 100) return reject(new Error("Edge TTS returned empty audio"));
+        if (buf.length < 100) {
+          return reject(new Error("Edge TTS returned empty audio — buffer too small: " + buf.length));
+        }
         fs.writeFileSync(outputPath, buf);
-        console.log("[TTS] 48kHz", voice, "size:", buf.length);
+        console.log("[TTS] SUCCESS", voice, "24kHz/96kbps, size:", buf.length, "bytes");
         resolve();
       });
-      audioStream.on("error", reject);
+      
+      audioStream.on("error", (err: any) => {
+        reject(new Error("Edge TTS stream error: " + err.message));
+      });
     } catch (err: any) {
-      // Fallback to 24kHz if 48kHz not available
-      try {
-        const tts = new MsEdgeTTS();
-        const voice = lang === "en" ? "en-US-AriaNeural" : "fil-PH-BlessicaNeural";
-        await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-        const { audioStream } = tts.toStream(text);
-        const chunks: Buffer[] = [];
-        audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
-        audioStream.on("end", () => {
-          const buf = Buffer.concat(chunks);
-          fs.writeFileSync(outputPath, buf);
-          console.log("[TTS] 24kHz (fallback)", voice, "size:", buf.length);
-          resolve();
-        });
-        audioStream.on("error", reject);
-      } catch (err2) {
-        reject(err2);
-      }
+      reject(new Error("Edge TTS setup error: " + err.message));
     }
   });
 }
 
 // ============================================================================
-// PCM GENERATION — UPSAMPLE TO 48kHz FOR ESP32
+// PCM GENERATION — 16kHz (matches ESP32 firmware)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -295,8 +296,8 @@ async function generatePCM(input: string): Promise<Buffer> {
     ffmpeg(input)
       .audioFilters([
         "highpass=f=60",
-        "lowpass=f=14000",         // 14kHz max for clean voice at 48kHz
-        "aresample=" + PLAYBACK_RATE + ":resampler=soxr:precision=28",  // UPSAMPLE TO 48kHz
+        "lowpass=f=8000",
+        "aresample=" + PLAYBACK_RATE + ":resampler=soxr:precision=28",  // Resample to 16kHz
         "aformat=sample_fmts=s16:channel_layouts=mono",
         "volume=1.0",
         "dynaudnorm=p=0.95:g=15",
@@ -304,9 +305,9 @@ async function generatePCM(input: string): Promise<Buffer> {
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(PLAYBACK_RATE)  // 48000
+      .audioFrequency(PLAYBACK_RATE)  // 16000
       .format("s16le")
-      .on("error", reject)
+      .on("error", (err) => reject(new Error("FFmpeg PCM error: " + err.message)))
       .on("end", () => { 
         const pcm = fs.readFileSync(tmp); 
         fs.unlinkSync(tmp); 
@@ -354,14 +355,14 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (48kHz MONO — MATCHES ESP32 DAC)
+// STREAM AI RESPONSE PCM (16kHz MONO — matches ESP32)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
 
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE) * AI_CHUNK_SIZE;
   const totalChunks = alignedLen / AI_CHUNK_SIZE;
-  console.log("[STREAM] AI 48kHz:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE, "interval:", SEND_INTERVAL_MS_AI, "ms");
+  console.log("[STREAM] AI 16kHz:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE, "interval:", SEND_INTERVAL_MS_AI, "ms");
 
   ws.send("SESSION:" + sessionId);
   await delay(100);
@@ -384,7 +385,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 
   ws.send("START_RESPONSE");
   await delay(100);
-  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", Math.round(prebufferLimit * 21.3), "ms), started playback");
+  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", Math.round(prebufferLimit * 32), "ms), started playback");
 
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE; i < alignedLen; i += AI_CHUNK_SIZE) {
@@ -405,7 +406,7 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
         await delay(200); 
       }
     }
-    console.log("[STREAM] AI done:", seq, "chunks at 48kHz");
+    console.log("[STREAM] AI done:", seq, "chunks at 16kHz");
   } catch (e: any) {
     console.error("[STREAM] Error:", e.message);
     try { ws.send("FINISH_RESPONSE:ERROR"); } catch {}
@@ -413,23 +414,23 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
 }
 
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — RESAMPLED TO 48kHz
+// REAL-TIME MUSIC STREAMING — 16kHz to match ESP32
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
   if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting 48kHz stream:", sessionId);
+  console.log("[MUSIC] Starting 16kHz stream:", sessionId);
 
   return new Promise<void>((resolve, reject) => {
-    // Force resample to 48kHz to match ESP32 DAC
+    // Resample music to 16kHz to match ESP32 firmware
     const ffmpegArgs = [
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=18000,aresample=48000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=100:t=h:width=200:g=-2,equalizer=f=8000:t=h:width=2000:g=2",
+      "-af", "highpass=f=60,lowpass=f=8000,aresample=16000:resampler=soxr:precision=28,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.65,loudnorm=I=-16:TP=-1.5:LRA=11",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "48000",        // LOCKED TO 48kHz
+      "-ar", "16000",        // LOCKED TO 16kHz
       "-f", "s16le",
       "pipe:1"
     ];
@@ -480,7 +481,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
             try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
           }
         }
-        console.log("[MUSIC] Stream done:", chunkCount, "chunks at 48kHz");
+        console.log("[MUSIC] Stream done:", chunkCount, "chunks at 16kHz");
         resolve();
       }
     });
@@ -497,7 +498,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 21.3), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 32), "ms), starting stream...");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
@@ -521,7 +522,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
           ws.send("START_MUSIC");
           await delay(100);
-          console.log("[MUSIC] Playback started after prebuffer at 48kHz");
+          console.log("[MUSIC] Playback started after prebuffer at 16kHz");
         }
         return;
       }
@@ -797,7 +798,7 @@ async function processAIResponse(ws: WebSocket, userText: string, userId: number
         filesToCleanup.push(mp3);
         
         await generateEdgeTTS(weatherText, mp3, action.lang);
-        const pcm = await generatePCM(mp3);  // Now upsamples to 48kHz
+        const pcm = await generatePCM(mp3);
         await streamPCM(ws, pcm, sessionId);
         
         await storage.addMessage(userId, "user", userText);
@@ -883,7 +884,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   wss.on("connection", (ws: WebSocket) => {
-    console.log("ESP connected — 48kHz FULL RATE MODE");
+    console.log("ESP connected — 16kHz BALIK MODE + BOOSTER FIX");
     let currentUserId: number | null = null;
     let messageCount = 0;
     let sttSession: StreamingSTTSession | null = null;
@@ -963,7 +964,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
           ws.send("ERROR:AUDIO_TOO_LONG");
           ws.send("STATE:IDLE");
         }
-        stTSession = null;
+        sttSession = null;
         return;
       }
       
