@@ -25,14 +25,18 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 // ============================================================================
 // AUDIO CONFIG — 16kHz BALIK (Stable sa low signal, ESP32 compatible)
 // ============================================================================
-const PLAYBACK_RATE = 16000;        // LOCKED TO 16kHz
-const AI_CHUNK_SIZE = 1024;         // 512 samples = 32ms @ 16kHz
-const SEND_INTERVAL_MS_AI = 32;     // 32ms for real-time 16kHz
-const PREBUFFER_CHUNKS_AI = 24;     // ~768ms prebuffer
+const VOICE_RATE = 16000;        // AI voice: 16kHz (enough for speech)
+const MUSIC_RATE = 32000;        // Music: 32kHz (FM radio quality)
 
-const MUSIC_CHUNK_SIZE = 1024;      // SAME as AI — 512 samples @ 16kHz
-const SEND_INTERVAL_MS_MUSIC = 32;  // 32ms interval
-const PREBUFFER_CHUNKS_MUSIC = 24;  // ~768ms prebuffer
+// AI Voice chunks
+const AI_CHUNK_SIZE = 1024;         // 512 samples @ 16kHz = 32ms
+const SEND_INTERVAL_MS_AI = 32;
+const PREBUFFER_CHUNKS_AI = 24;
+
+// Music chunks  
+const MUSIC_CHUNK_SIZE = 1024;      // 512 samples @ 32kHz = 16ms
+const SEND_INTERVAL_MS_MUSIC = 16;
+const PREBUFFER_CHUNKS_MUSIC = 24;
 
 // ============================================================================
 // STT CONFIG
@@ -288,7 +292,7 @@ async function generateEdgeTTS(text: string, outputPath: string, lang: "en" | "f
 }
 
 // ============================================================================
-// PCM GENERATION — 16kHz (matches ESP32 firmware)
+// PCM GENERATION — 16kHz (matches ESP32 firmware voice mode)
 // ============================================================================
 async function generatePCM(input: string): Promise<Buffer> {
   const tmp = path.join(AUDIO_DIR, "raw_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".pcm");
@@ -297,7 +301,7 @@ async function generatePCM(input: string): Promise<Buffer> {
       .audioFilters([
         "highpass=f=60",
         "lowpass=f=8000",
-        "aresample=" + PLAYBACK_RATE + ":resampler=soxr:precision=28",  // Resample to 16kHz
+        "aresample=" + VOICE_RATE + ":resampler=soxr:precision=28",  // Resample to 16kHz
         "aformat=sample_fmts=s16:channel_layouts=mono",
         "volume=1.0",
         "dynaudnorm=p=0.95:g=15",
@@ -305,19 +309,18 @@ async function generatePCM(input: string): Promise<Buffer> {
       ])
       .audioCodec("pcm_s16le")
       .audioChannels(1)
-      .audioFrequency(PLAYBACK_RATE)  // 16000
+      .audioFrequency(VOICE_RATE)  // 16000
       .format("s16le")
       .on("error", (err) => reject(new Error("FFmpeg PCM error: " + err.message)))
       .on("end", () => { 
         const pcm = fs.readFileSync(tmp); 
         fs.unlinkSync(tmp); 
-        console.log("[PCM] Generated", pcm.length, "bytes at", PLAYBACK_RATE, "Hz");
+        console.log("[PCM] Generated", pcm.length, "bytes at", VOICE_RATE, "Hz");
         resolve(pcm); 
       })
       .save(tmp);
   });
 }
-
 // ============================================================================
 // MOSTAKIM MUSIC API
 // ============================================================================
@@ -355,23 +358,21 @@ async function fetchMusicUrl(query: string): Promise<string | null> {
 }
 
 // ============================================================================
-// STREAM AI RESPONSE PCM (16kHz MONO — matches ESP32)
+// STREAM AI RESPONSE PCM (16kHz — VOICE)
 // ============================================================================
 async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
   if (ws.readyState !== ws.OPEN) return;
-
   const alignedLen = Math.floor(pcm.length / AI_CHUNK_SIZE) * AI_CHUNK_SIZE;
   const totalChunks = alignedLen / AI_CHUNK_SIZE;
-  console.log("[STREAM] AI 16kHz:", sessionId, "chunks:", totalChunks, "chunkSize:", AI_CHUNK_SIZE, "interval:", SEND_INTERVAL_MS_AI, "ms");
+  console.log("[STREAM] AI 16kHz:", sessionId, "chunks:", totalChunks);
 
   ws.send("SESSION:" + sessionId);
   await delay(100);
-  ws.send("PREPARE_RESPONSE:" + totalChunks);
+  ws.send("PREPARE_RESPONSE:" + totalChunks);  // Firmware switches to 16kHz
   await delay(300);
 
   let seq = 0;
   const prebufferLimit = Math.min(PREBUFFER_CHUNKS_AI, totalChunks);
-
   for (let i = 0; i < prebufferLimit * AI_CHUNK_SIZE; i += AI_CHUNK_SIZE) {
     if (ws.readyState !== ws.OPEN) return;
     const chunk = pcm.subarray(i, i + AI_CHUNK_SIZE);
@@ -380,12 +381,12 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     packet.set(chunk, 2);
     ws.send(packet, { binary: true });
     seq++;
-    await delay(SEND_INTERVAL_MS_AI);
+    await delay(SEND_INTERVAL_MS_AI);  // 32ms
   }
 
   ws.send("START_RESPONSE");
   await delay(100);
-  console.log("[STREAM] AI prebuffer done (", prebufferLimit, "chunks = ~", Math.round(prebufferLimit * 32), "ms), started playback");
+  console.log("[STREAM] AI prebuffer done, started playback at 16kHz");
 
   try {
     for (let i = prebufferLimit * AI_CHUNK_SIZE; i < alignedLen; i += AI_CHUNK_SIZE) {
@@ -396,9 +397,8 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
       packet.set(chunk, 2);
       ws.send(packet, { binary: true });
       seq++;
-      await delay(SEND_INTERVAL_MS_AI);
+      await delay(SEND_INTERVAL_MS_AI);  // 32ms
     }
-
     await delay(500);
     for (let retry = 0; retry < 3; retry++) {
       if (ws.readyState === ws.OPEN) { 
@@ -412,32 +412,24 @@ async function streamPCM(ws: WebSocket, pcm: Buffer, sessionId: string) {
     try { ws.send("FINISH_RESPONSE:ERROR"); } catch {}
   }
 }
-
 // ============================================================================
-// REAL-TIME MUSIC STREAMING — FIXED: 16kHz to match ESP32
+// REAL-TIME MUSIC STREAMING (32kHz — MUSIC)
 // ============================================================================
 async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: string) {
-  if (ws.readyState !== ws.OPEN) { 
-    console.log("[MUSIC] WS not open"); 
-    return; 
-  }
+  if (ws.readyState !== ws.OPEN) { console.log("[MUSIC] WS not open"); return; }
 
-  console.log("[MUSIC] Starting 16kHz stream:", sessionId);
+  console.log("[MUSIC] Starting 32kHz stream:", sessionId);
 
   return new Promise<void>((resolve, reject) => {
-    // FIXED: Resample music to 16kHz to MATCH ESP32 DAC
-    // FIXED: lowpass=7500 (below 16kHz Nyquist=8000) to prevent aliasing
-    // FIXED: volume=0.9 (louder, ESP32 handles final volume)
-    // FIXED: Removed harmful 8kHz equalizer boost near Nyquist
-    // FIXED: Proper stereo-to-mono downmix with pan filter
     const ffmpegArgs = [
       "-re",
       "-i", musicUrl,
       "-vn",
-      "-af", "highpass=f=60,lowpass=f=7500,aresample=16000:resampler=soxr:precision=28,pan=mono|c0=0.5*c0+0.5*c1,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.9,loudnorm=I=-14:TP=-1.0:LRA=11",
+      // 32kHz: lowpass=15000 (below 16kHz Nyquist), no high-freq boost
+      "-af", "highpass=f=60,lowpass=f=15000,aresample=32000:resampler=soxr:precision=28,pan=mono|c0=0.5*c0+0.5*c1,aformat=sample_fmts=s16:channel_layouts=mono,volume=0.85,loudnorm=I=-14:TP=-1.0:LRA=11",
       "-acodec", "pcm_s16le",
       "-ac", "1",
-      "-ar", "16000",        // LOCKED TO 16kHz — MATCHES ESP32
+      "-ar", "32000",        // 32kHz for music quality
       "-f", "s16le",
       "pipe:1"
     ];
@@ -464,10 +456,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
       console.error("[MUSIC] FFmpeg spawn error:", err.message);
       if (!finished) {
         finished = true;
-        try { 
-          ws.send("ERROR:MUSIC_FAILED"); 
-          ws.send("FINISH_MUSIC:ERROR"); 
-        } catch {}
+        try { ws.send("ERROR:MUSIC_FAILED"); ws.send("FINISH_MUSIC:ERROR"); } catch {}
         reject(err);
       }
     });
@@ -491,7 +480,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
             try { ws.send("FINISH_MUSIC:" + sessionId); } catch {}
           }
         }
-        console.log("[MUSIC] Stream done:", chunkCount, "chunks at 16kHz");
+        console.log("[MUSIC] Stream done:", chunkCount, "chunks at 32kHz");
         resolve();
       }
     });
@@ -508,11 +497,11 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
 
         if (prebufferChunks.length >= PREBUFFER_CHUNKS_MUSIC) {
           started = true;
-          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 32), "ms), starting stream...");
+          console.log("[MUSIC] Prebuffer ready (", prebufferChunks.length, "chunks = ~", Math.round(prebufferChunks.length * 16), "ms)");
 
           ws.send("SESSION:" + sessionId);
           await delay(100);
-          ws.send("PREPARE_MUSIC:0");
+          ws.send("PREPARE_MUSIC:0");  // Firmware switches to 32kHz
           await delay(300);
 
           for (const chunk of prebufferChunks) {
@@ -527,12 +516,12 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
             ws.send(packet, { binary: true });
             seq++;
             chunkCount++;
-            await delay(SEND_INTERVAL_MS_MUSIC);  // FIXED: 32ms for 16kHz
+            await delay(SEND_INTERVAL_MS_MUSIC);  // 16ms for 32kHz
           }
 
           ws.send("START_MUSIC");
           await delay(100);
-          console.log("[MUSIC] Playback started after prebuffer at 16kHz");
+          console.log("[MUSIC] Playback started at 32kHz");
         }
         return;
       }
@@ -556,7 +545,7 @@ async function streamMusicRealtime(ws: WebSocket, musicUrl: string, sessionId: s
         seq++;
         chunkCount++;
 
-        await delay(SEND_INTERVAL_MS_MUSIC);  // FIXED: 32ms for 16kHz
+        await delay(SEND_INTERVAL_MS_MUSIC);  // 16ms
       }
     });
 
